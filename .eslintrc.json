@@ -1,0 +1,39 @@
+{
+  "extends": ["../.eslintrc.json"],
+  "env": {
+    "node": true,
+    "es2022": true
+  },
+  "overrides": [
+    {
+      "files": ["assets/**/*.js"],
+      "env": {
+        "browser": true,
+        "node": false
+      },
+      "globals": {
+        "AddonManagerUI": "readonly",
+        "ArenaCoachRenderer": "readonly",
+        "AssetManager": "readonly",
+        "AuthUI": "readonly",
+        "HeaderStatusUI": "readonly",
+        "MatchUI": "readonly",
+        "NavigationManager": "readonly",
+        "NotificationManager": "readonly",
+        "SceneUI": "readonly",
+        "SettingsUI": "readonly",
+        "SkillCappedVerifyUI": "readonly",
+        "UpdateNotificationManager": "readonly",
+        "VideoPlayer": "readonly",
+        "WindowControls": "readonly",
+        "WoWPathUI": "readonly"
+      },
+      "rules": {
+        "no-unused-vars": ["error", {
+          "varsIgnorePattern": "^(AddonManagerUI|AuthUI|HeaderStatusUI|MatchUI|NavigationManager|NotificationManager|SceneUI|SettingsUI|SkillCappedVerifyUI|UpdateNotificationManager|WindowControls|WoWPathUI)$",
+          "argsIgnorePattern": "^_"
+        }]
+      }
+    }
+  ]
+}

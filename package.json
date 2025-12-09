@@ -1,0 +1,56 @@
+{
+  "name": "arenacoach-desktop",
+  "version": "0.1.7",
+  "description": "ArenaCoach Desktop App - Official desktop companion app for ArenaCoach",
+  "main": "dist/main.js",
+  "engines": {
+    "node": "20.x",
+    "npm": ">=8.0.0"
+  },
+  "homepage": "https://arenacoach.gg",
+  "author": "ArenaCoach Team",
+  "license": "GPL-2.0-or-later",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit false",
+    "check": "tsc --noEmit",
+    "lint": "eslint src/**/*.ts assets/**/*.js",
+    "lint:fix": "eslint src/**/*.ts assets/**/*.js --fix",
+    "dev:desktop": "npm run build && ./launch-windows.sh",
+    "dev:setup": "powershell.exe -ExecutionPolicy Bypass -File ./dev-windows.ps1 -Setup",
+    "dev:sync": "npm run build && powershell.exe -ExecutionPolicy Bypass -File ./sync-only.ps1",
+    "dist": "npm run build && electron-builder --publish never",
+    "audit": "node audit-dist.js",
+    "combatlog": "PRODUCTION_MODE=true npx ts-node tests/helpers/CombatLogSimulator.ts",
+    "test": "vitest --run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@electron/asar": "^3.4.1",
+    "@types/node": "^20.19.9",
+    "@types/pg": "^8.10.0",
+    "concurrently": "^8.0.0",
+    "electron": "36.8.1",
+    "electron-builder": "25.1.8",
+    "pg": "^8.11.0",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.8.2",
+    "vitest": "^4.0.15"
+  },
+  "dependencies": {
+    "async-mutex": "^0.5.0",
+    "axios": "^1.6.0",
+    "check-disk-space": "^3.4.0",
+    "chokidar": "^3.5.0",
+    "dotenv": "^17.2.0",
+    "electron-log": "^5.2.0",
+    "electron-squirrel-startup": "^1.0.1",
+    "electron-store": "^8.0.0",
+    "electron-updater": "^6.6.2",
+    "ffmpeg-static": "^5.2.0",
+    "obs-studio-node": "https://updates.arenacoach.gg/osn-0.25.34-release-win64.tar.gz"
+  },
+  "build": {
+    "extends": "./electron-builder.yml"
+  }
+}

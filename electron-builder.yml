@@ -1,0 +1,73 @@
+# ArenaCoach Desktop App - Windows Build Configuration
+
+appId: gg.arenacoach.desktop
+productName: ArenaCoach
+copyright: 'Copyright © 2025 ArenaCoach Team'
+
+directories:
+  output: release
+  buildResources: assets
+
+# Files to include in the app bundle
+files:
+  - dist/**/*
+  - '!dist/**/test/**'
+  - '!dist/**/*.map'
+  - '!dist/**/*.d.ts'
+  - assets/**/*
+  - addon/**/*
+  - node_modules/**/*
+  - '!node_modules/**/README.md'
+  - '!node_modules/**/*.md'
+  - '!node_modules/**/*.ts'
+  - '!node_modules/**/test/**'
+  - '!node_modules/**/tests/**'
+  - '!node_modules/**/__tests__/**'
+
+# Unpack addon files and OBS binaries from .asar archive for file system access
+asarUnpack:
+  - 'addon/**/*'
+  - 'node_modules/obs-studio-node/**/*'
+  - '**/osn-data/**/*'
+
+# Windows Configuration
+win:
+  icon: favicon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+  publisherName: ArenaCoach Team
+  verifyUpdateCodeSignature: false
+  requestedExecutionLevel: asInvoker
+  artifactName: ArenaCoach-Setup-${version}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: "ArenaCoach Desktop App"
+  menuCategory: Games
+  displayLanguageSelector: false
+  installerIcon: favicon.ico
+  uninstallerIcon: favicon.ico
+
+# Auto-updater configuration (Cloudflare R2)
+publish:
+  provider: generic
+  # Custom domain for R2 bucket hosting latest.yml and installers
+  url: https://updates.arenacoach.gg/
+
+# Compression settings
+compression: maximum
+removePackageScripts: true
+removePackageKeywords: true
+
+# Security settings
+artifactBuildCompleted: null
+beforeBuild: null
+afterPack: null
+afterSign: null
+afterAllArtifactBuild: null

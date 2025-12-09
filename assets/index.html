@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; media-src 'self' file: blob:;">
+    <title>ArenaCoach Desktop App</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="videoPlayer.css">
+</head>
+
+<body>
+    <div id="app">
+        <!-- Custom Header Bar - Insights Capture Style -->
+        <div class="custom-header-bar">
+            <div class="header-content">
+                <!-- Left: App Branding -->
+                <div class="header-left">
+                    <div class="app-branding">
+                        <img class="app-logo" src="favicon.ico" alt="ArenaCoach" width="20" height="20">
+                        <span class="app-title">SKILL CAPPED | ArenaCoach.gg</span>
+                    </div>
+                </div>
+
+                <!-- Center: Status Information -->
+                <div class="header-center title-bar-drag-area">
+                    <div class="status-indicators">
+                        <!-- Service Status Indicator -->
+                        <div class="status-item service-status">
+                            <div class="status-indicator" id="statusIndicator" title="Service Status" role="status"
+                                aria-live="polite">
+                                <div class="status-dot" id="statusDot"></div>
+                            </div>
+                            <span class="status-text">Service Status</span>
+                        </div>
+
+                        <div class="status-item match-status" id="header-match-status" role="status" aria-live="polite">
+                            <div class="status-indicator" id="header-match-indicator" title="Match Status"
+                                role="status">
+                                <div class="status-dot" id="header-match-dot"></div>
+                            </div>
+                            <span class="status-text" id="header-match-text">Idle</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Window Controls -->
+                <div class="header-right">
+                    <div class="window-controls">
+                        <button class="window-control minimize-btn" id="minimize-btn" aria-label="Minimize">
+                            <svg width="10" height="10" viewBox="0 0 12 12">
+                                <path fill="currentColor" d="M0 6h12v1H0z" />
+                            </svg>
+                        </button>
+                        <button class="window-control maximize-btn" id="maximize-btn" aria-label="Maximize">
+                            <svg width="10" height="10" viewBox="0 0 12 12">
+                                <path fill="currentColor" d="M1 1v10h10V1H1zm1 1h8v8H2V2z" />
+                            </svg>
+                        </button>
+                        <button class="window-control restore-btn hidden" id="restore-btn" aria-label="Restore">
+                            <svg width="10" height="10" viewBox="0 0 12 12">
+                                <path fill="currentColor" d="M1 3v8h8V3H1zm1 1h6v6H2V4zM3 1h8v8h-1V2H3V1z" />
+                            </svg>
+                        </button>
+                        <button class="window-control close-btn" id="close-btn" aria-label="Close">
+                            <svg width="10" height="10" viewBox="0 0 12 12">
+                                <path fill="currentColor"
+                                    d="M6 4.586L10.293.293l1.414 1.414L7.414 6l4.293 4.293-1.414 1.414L6 7.414l-4.293 4.293L.293 10.293 4.586 6 .293 1.707 1.707.293 6 4.586z" />
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Application Interface -->
+        <main class="app-main">
+            <div class="main-container">
+                <div class="navigation-sidebar">
+                    <!-- Filter Buttons Section -->
+                    <div class="filter-section">
+                        <div class="filter-buttons">
+                            <button class="filter-btn active" id="all-brackets-btn" data-bracket="all">
+                                <svg class="filter-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <path
+                                        d="M3 13h2v-2H3v2zm0 4h2v-2H3v2zm0-8h2V7H3v2zm4 4h14v-2H7v2zm0 4h14v-2H7v2zM7 7v2h14V7H7z" />
+                                </svg>
+                                <span class="filter-label">All Brackets</span>
+                            </button>
+                            <button class="filter-btn" id="bracket-solo-btn" data-bracket="Solo Shuffle">
+                                <img class="filter-icon-img" src="images/crossed-swords.svg" alt="Solo Shuffle">
+                                <span class="filter-label">Solo Shuffle</span>
+                            </button>
+                            <button class="filter-btn" id="bracket-3v3-btn" data-bracket="3v3">
+                                <img class="filter-icon-img" src="images/crossed-swords.svg" alt="3v3">
+                                <span class="filter-label">3v3</span>
+                            </button>
+                            <button class="filter-btn" id="bracket-2v2-btn" data-bracket="2v2">
+                                <img class="filter-icon-img" src="images/crossed-swords.svg" alt="2v2">
+                                <span class="filter-label">2v2</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Settings and Login Buttons (pinned to bottom) -->
+                    <div class="settings-section">
+                        <button class="filter-btn" id="settings-nav-tab" data-tab="settings">
+                            <svg class="filter-icon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path
+                                    d="M12 15.5A3.5 3.5 0 0 1 8.5 12A3.5 3.5 0 0 1 12 8.5a3.5 3.5 0 0 1 3.5 3.5a3.5 3.5 0 0 1-3.5 3.5m7.43-2.53c.04-.32.07-.64.07-.97c0-.33-.03-.66-.07-1l2.11-1.63c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.31-.61-.22l-2.49 1c-.52-.39-1.06-.73-1.69-.98l-.37-2.65A.506.506 0 0 0 14 2h-4c-.25 0-.46.18-.5.42l-.37 2.65c-.63.25-1.17.59-1.69.98l-2.49-1c-.22-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64L4.57 11c-.04.34-.07.67-.07 1c0 .33.03.65.07.97l-2.11 1.66c-.19.15-.25.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1.01c.52.4 1.06.74 1.69.99l.37 2.65c.04.24.25.42.5.42h4c.25 0 .46-.18.5-.42l.37-2.65c.63-.26 1.17-.59 1.69-.99l2.49 1.01c.22.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.66Z" />
+                            </svg>
+                            <span class="filter-label">Settings</span>
+                        </button>
+                        <button class="filter-btn" id="scene-nav-tab" data-tab="scene">
+                            <svg class="filter-icon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path
+                                    d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
+                            </svg>
+                            <span class="filter-label">Scene</span>
+                        </button>
+                        <button class="filter-btn" id="skillcapped-verify-btn" title="Verify Skill Capped Account">
+                            <img class="filter-icon" src="favicon.ico" width="20" height="20" alt="Skill Capped">
+                            <span class="filter-label">Verify Skill Capped</span>
+                        </button>
+                        <button class="filter-btn" id="auth-action-btn">
+                            <svg class="filter-icon" width="20" height="20" viewBox="0 0 32 32" fill="currentColor">
+                                <path
+                                    d="M 26.578125 14.339844 C 26.578125 14.339844 28.882813 14.457031 28.882813 13.101563 C 28.882813 11.332031 25.8125 9.738281 25.8125 9.738281 C 25.8125 9.738281 26.292969 8.71875 26.59375 8.148438 C 26.894531 7.578125 27.738281 5.359375 27.8125 4.851563 C 27.90625 4.210938 27.761719 4.011719 27.761719 4.011719 C 27.554688 5.378906 25.328125 9.316406 25.148438 9.449219 C 22.976563 8.433594 19.992188 8.148438 19.992188 8.148438 C 19.992188 8.148438 17.070313 2 14.320313 2 C 11.59375 2 11.609375 7.265625 11.609375 7.265625 C 11.609375 7.265625 10.839844 5.773438 9.871094 5.773438 C 8.457031 5.773438 7.992188 7.90625 7.992188 10.222656 C 5.203125 10.222656 2.855469 10.847656 2.644531 10.90625 C 2.4375 10.964844 1.777344 11.445313 2.074219 11.386719 C 2.6875 11.191406 5.554688 10.746094 8.0625 10.964844 C 8.203125 13.164063 9.488281 16.03125 9.488281 16.03125 C 9.488281 16.03125 6.730469 20.023438 6.730469 22.871094 C 6.730469 23.621094 7.058594 24.992188 9.035156 24.992188 C 10.695313 24.992188 12.558594 23.996094 12.90625 23.796875 C 12.601563 24.230469 12.375 25.0625 12.375 25.445313 C 12.375 25.757813 12.5625 26.644531 13.839844 26.644531 C 15.480469 26.644531 17.316406 25.386719 17.316406 25.386719 C 17.316406 25.386719 19.050781 28.261719 20.53125 29.578125 C 20.929688 29.933594 21.3125 30 21.3125 30 C 21.3125 30 19.839844 28.585938 17.902344 24.9375 C 19.703125 23.828125 21.578125 21.203125 21.578125 21.203125 C 21.578125 21.203125 21.800781 21.210938 23.511719 21.210938 C 26.191406 21.210938 29.996094 20.648438 29.996094 18.519531 C 30 16.324219 26.578125 14.339844 26.578125 14.339844 Z M 26.875 13.015625 C 26.875 13.792969 26.136719 13.785156 26.136719 13.785156 L 25.574219 13.820313 C 25.574219 13.820313 24.507813 13.261719 23.859375 12.996094 C 23.859375 12.996094 24.863281 11.453125 25.097656 11.023438 C 25.273438 11.128906 26.875 12.128906 26.875 13.015625 Z M 15.660156 5.097656 C 16.921875 5.097656 18.71875 8.066406 18.71875 8.066406 C 18.71875 8.066406 15.914063 7.816406 13.605469 9.171875 C 13.667969 7.035156 14.386719 5.097656 15.660156 5.097656 Z M 10.671875 7.503906 C 11.070313 7.503906 11.460938 7.992188 11.625 8.402344 C 11.625 8.675781 11.765625 10.269531 11.765625 10.269531 L 9.453125 10.179688 C 9.453125 8.097656 10.269531 7.503906 10.671875 7.503906 Z M 10.429688 21.976563 C 9.164063 21.976563 8.90625 21.273438 8.90625 20.640625 C 8.90625 19.207031 10.050781 17.199219 10.050781 17.199219 C 10.050781 17.199219 11.335938 19.898438 13.574219 21.035156 C 12.464844 21.6875 11.546875 21.976563 10.429688 21.976563 Z M 14.535156 24.800781 C 13.648438 24.800781 13.539063 24.226563 13.539063 24.09375 C 13.539063 23.683594 13.863281 23.195313 13.863281 23.195313 C 13.863281 23.195313 15.351563 22.191406 15.445313 22.082031 L 16.546875 24.136719 C 16.546875 24.136719 15.421875 24.800781 14.535156 24.800781 Z M 17.300781 23.683594 C 16.761719 22.742188 16.363281 21.757813 16.363281 21.757813 C 16.363281 21.757813 18.578125 21.898438 19.769531 20.671875 C 19.027344 21.003906 17.84375 21.425781 16.46875 21.296875 C 19.34375 18.765625 21.023438 16.929688 22.441406 15.035156 C 22.320313 14.886719 21.671875 14.433594 21.511719 14.359375 C 20.65625 15.390625 17.324219 18.949219 14.238281 20.710938 C 10.332031 18.582031 9.511719 12.320313 9.429688 11.019531 L 11.5625 11.222656 C 11.5625 11.222656 10.761719 12.644531 10.761719 13.691406 C 10.761719 14.734375 10.886719 14.789063 10.886719 14.789063 C 10.886719 14.789063 10.859375 12.96875 11.984375 11.5625 C 12.84375 16.125 13.738281 18.460938 14.433594 19.855469 C 14.789063 19.707031 15.449219 19.414063 15.449219 19.414063 C 15.449219 19.414063 13.480469 13.738281 13.589844 9.898438 C 14.484375 9.421875 15.808594 8.929688 17.300781 8.929688 C 21.230469 8.929688 24.390625 10.617188 24.390625 10.617188 L 23.15625 12.34375 C 23.15625 12.34375 22.054688 10.351563 20.496094 9.996094 C 21.316406 10.605469 22.238281 11.414063 22.714844 12.574219 C 19.457031 11.304688 15.527344 10.632813 14.265625 10.484375 C 14.15625 10.949219 14.171875 11.613281 14.171875 11.613281 C 14.171875 11.613281 19.441406 12.585938 23.277344 14.777344 C 23.25 19.574219 18.023438 23.257813 17.300781 23.683594 Z M 22.292969 20.097656 C 22.292969 20.097656 23.929688 17.953125 23.902344 15.109375 C 23.902344 15.109375 26.546875 16.746094 26.546875 18.34375 C 26.546875 20.125 22.292969 20.097656 22.292969 20.097656 Z" />
+                            </svg>
+                            <span class="filter-label">Battle.net Login</span>
+                        </button>
+                        <span id="app-version" class="sidebar-version"></span>
+                    </div>
+                </div>
+
+                <div id="main-content-area" class="main-content">
+                    <!-- Matches Content -->
+                    <div id="recent-matches-list">
+                        <div class="empty-state">
+                            <p>No matches detected yet</p>
+                            <p class="hint">Arena matches will appear here when detected</p>
+                        </div>
+                    </div>
+
+                    <!-- Scene Content -->
+                    <div id="scene-content" class="hidden">
+                        <div class="scene-container">
+                            <!-- Preview area placeholder -->
+                            <div class="scene-preview-wrapper">
+                                <div id="scene-preview-box" class="scene-preview">
+                                    <div class="preview-placeholder">
+                                        <p>Recording Disabled</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Recording controls -->
+                            <div class="scene-controls">
+                                <!-- Tab navigation -->
+                                <div class="scene-tabs">
+                                    <button class="scene-tab active" data-tab="source">Source</button>
+                                    <button class="scene-tab" data-tab="video">Video</button>
+                                    <button class="scene-tab" data-tab="audio">Audio</button>
+                                </div>
+
+                                <!-- Tab content panels -->
+                                <div class="scene-tab-content">
+                                    <!-- Source Tab -->
+                                    <div class="scene-panel active" data-panel="source">
+                                        <div class="scene-settings-row">
+                                            <!-- Capture Mode -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Capture Mode</label>
+                                                <div class="button-group" id="capture-mode-group">
+                                                    <button class="button-option active"
+                                                        data-value="game_capture">Game</button>
+                                                    <button class="button-option"
+                                                        data-value="window_capture">Window</button>
+                                                    <button class="button-option"
+                                                        data-value="monitor_capture">Monitor</button>
+                                                </div>
+                                            </div>
+
+                                            <!-- Monitor Selection (only shown for monitor capture) -->
+                                            <div class="scene-setting-group hidden" id="monitor-selection-group">
+                                                <label class="scene-setting-label">Monitor</label>
+                                                <select id="monitor-device" class="scene-setting scene-select">
+                                                    <option value="">Primary Monitor</option>
+                                                </select>
+                                            </div>
+
+                                            <!-- Capture Cursor -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Capture Cursor</label>
+                                                <div class="scene-toggle-wrapper">
+                                                    <label class="toggle-switch">
+                                                        <input type="checkbox" id="capture-cursor"
+                                                            class="scene-setting">
+                                                        <span class="toggle-slider"></span>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Video Tab -->
+                                    <div class="scene-panel" data-panel="video">
+                                        <div class="scene-settings-row">
+                                            <!-- FPS -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Frame Rate</label>
+                                                <div class="button-group" id="fps-group">
+                                                    <button class="button-option" data-value="30">30 FPS</button>
+                                                    <button class="button-option active" data-value="60">60 FPS</button>
+                                                </div>
+                                            </div>
+
+                                            <!-- Resolution -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Resolution</label>
+                                                <select id="resolution" class="scene-setting scene-select">
+                                                    <option value="1280x720">1280x720</option>
+                                                    <option value="1920x1080">1920x1080</option>
+                                                    <option value="2560x1440">2560x1440</option>
+                                                    <option value="3440x1440">3440x1440</option>
+                                                </select>
+                                            </div>
+
+                                            <!-- Quality -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Quality</label>
+                                                <select id="quality" class="scene-setting scene-select">
+                                                    <option value="low">Low</option>
+                                                    <option value="medium">Medium</option>
+                                                    <option value="high">High</option>
+                                                    <option value="ultra">Ultra</option>
+                                                </select>
+                                            </div>
+
+                                            <!-- Encoder -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Encoder</label>
+                                                <select id="encoder" class="scene-setting scene-select">
+                                                    <option value="x264">x264 (CPU)</option>
+                                                    <option value="nvenc">NVIDIA NVENC</option>
+                                                    <option value="amd">AMD AMF</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Audio Tab -->
+                                    <div class="scene-panel" data-panel="audio">
+                                        <div class="scene-settings-row">
+                                            <!-- Desktop Audio -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Desktop Audio</label>
+                                                <div class="scene-audio-control">
+                                                    <label class="toggle-switch">
+                                                        <input type="checkbox" id="desktop-audio" class="scene-setting">
+                                                        <span class="toggle-slider"></span>
+                                                    </label>
+                                                    <select id="desktop-audio-device"
+                                                        class="scene-setting scene-select audio-device-select">
+                                                        <option value="default">Default</option>
+                                                    </select>
+                                                </div>
+                                            </div>
+
+                                            <!-- Microphone -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">Microphone</label>
+                                                <div class="scene-audio-control">
+                                                    <label class="toggle-switch">
+                                                        <input type="checkbox" id="microphone" class="scene-setting">
+                                                        <span class="toggle-slider"></span>
+                                                    </label>
+                                                    <select id="microphone-device"
+                                                        class="scene-setting scene-select audio-device-select">
+                                                        <option value="default">Default</option>
+                                                    </select>
+                                                </div>
+                                            </div>
+                                            <!-- Audio Suppression -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">AUDIO SUPPRESSION</label>
+                                                <div class="scene-audio-control">
+                                                    <label class="toggle-switch">
+                                                        <input type="checkbox" id="microphone-suppression"
+                                                            class="scene-setting">
+                                                        <span class="toggle-slider"></span>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                            <!-- Mono Input -->
+                                            <div class="scene-setting-group">
+                                                <label class="scene-setting-label">MONO INPUT</label>
+                                                <div class="scene-audio-control">
+                                                    <label class="toggle-switch">
+                                                        <input type="checkbox" id="microphone-force-mono"
+                                                            class="scene-setting">
+                                                        <span class="toggle-slider"></span>
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Settings Content (shown when Settings tab is active) -->
+                    <div id="settings-content" class="hidden">
+                        <div class="settings-container">
+                            <!-- Settings tabs -->
+                            <div class="settings-tabs">
+                                <button class="settings-tab active" data-tab="storage">Storage</button>
+                                <button class="settings-tab" data-tab="detection">Detection</button>
+                            </div>
+
+                            <!-- Tab content panels -->
+                            <div class="settings-tab-content">
+                                <!-- Storage Tab -->
+                                <div class="settings-panel active" data-panel="storage">
+                                    <!-- Recording Location Setting -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="recording-location">Recording Location</label>
+                                            <div class="setting-description">Directory where arena match recordings are
+                                                saved</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="setting-path-display">
+                                                <span id="recording-location" class="path-value">Loading...</span>
+                                                <button type="button" id="browse-recording-location-btn"
+                                                    class="btn secondary small">Browse</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Max Disk Storage Setting -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="max-disk-storage">Maximum Disk Storage</label>
+                                            <div class="setting-description">Maximum disk space for recordings in GB (0
+                                                for unlimited)</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <input type="number" id="max-disk-storage" name="maxDiskStorage" min="0"
+                                                max="1000">
+                                            <button type="button" id="reset-disk-storage-btn"
+                                                class="btn secondary small">Reset</button>
+                                        </div>
+                                    </div>
+
+                                    <!-- Disk Usage Display -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label>Current Disk Usage</label>
+                                            <div class="setting-description">Space used by recordings</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="disk-usage-display">
+                                                <div class="disk-usage-bar">
+                                                    <div id="disk-usage-fill" class="disk-usage-fill"></div>
+                                                </div>
+                                                <span id="disk-usage-text" class="disk-usage-text">Loading...</span>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Max Match Files Setting -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="max-match-files">Maximum Match Files</label>
+                                            <div class="setting-description">Maximum number of match files to keep (0
+                                                for unlimited, max: 100,000)</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <input type="number" id="max-match-files" name="maxMatchFiles" min="0"
+                                                max="100000">
+                                            <button type="button" id="reset-max-files-btn"
+                                                class="btn secondary small">Reset</button>
+                                        </div>
+                                    </div>
+
+                                </div>
+
+                                <!-- Detection Tab -->
+                                <div class="settings-panel" data-panel="detection">
+                                    <!-- Recording Control -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label>Match Recording</label>
+                                            <div class="setting-description">Automatically record arena matches</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="recording-status-inline">
+                                                <span class="status-indicator" id="recording-indicator"></span>
+                                                <span class="status-text" id="recording-status">Recording
+                                                    disabled</span>
+                                            </div>
+                                            <button id="toggle-recording" class="btn secondary">Enable
+                                                Recording</button>
+                                        </div>
+                                    </div>
+
+                                    <!-- Match Detection Control -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label>Match Detection</label>
+                                            <div class="setting-description">Automatically detect arena matches</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="detection-status-inline">
+                                                <span class="status-indicator" id="match-indicator"></span>
+                                                <span class="status-text" id="match-status">Idle</span>
+                                            </div>
+                                            <button id="toggle-detection" class="btn secondary">Start Detection</button>
+                                        </div>
+                                    </div>
+
+                                    <!-- WoW Installation Path -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="browse-wow">WoW Installation</label>
+                                            <div class="setting-description">Path to your World of Warcraft installation
+                                                folder</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="setting-path-display">
+                                                <span id="wow-path" class="path-value">Detecting...</span>
+                                                <button id="browse-wow" class="btn secondary small">Browse</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- ArenaCoach Addon -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="addon-install">ArenaCoach Addon</label>
+                                            <div class="setting-description">Combat logging addon for enhanced arena
+                                                match detection</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <div class="setting-path-display">
+                                                <span id="addon-status" class="path-value">Checking...</span>
+                                                <button id="addon-install" class="btn secondary small">Install
+                                                    Addon</button>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Run at Startup Control -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="auto-startup">Run at startup</label>
+                                            <div class="setting-description">Launch ArenaCoach automatically when you
+                                                sign in to Windows</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <label class="toggle-switch">
+                                                <input type="checkbox" id="auto-startup">
+                                                <span class="toggle-slider"></span>
+                                            </label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+    </div>
+
+
+
+    <script src="MatchDataService.js"></script>
+    <script src="constants/assetMappings.js"></script>
+    <script src="VideoPlayer.js"></script>
+    <!-- Modules -->
+    <script src="modules/AssetManager.js"></script>
+    <script src="modules/NotificationManager.js"></script>
+    <script src="modules/UpdateNotificationManager.js"></script>
+    <script src="modules/AuthUI.js"></script>
+    <script src="modules/SkillCappedVerifyUI.js"></script>
+    <script src="modules/WoWPathUI.js"></script>
+    <script src="modules/AddonManagerUI.js"></script>
+    <script src="modules/SettingsUI.js"></script>
+    <script src="modules/MatchUI.js"></script>
+    <script src="modules/HeaderStatusUI.js"></script>
+    <script src="modules/WindowControls.js"></script>
+    <script src="modules/SceneUI.js"></script>
+    <script src="modules/NavigationManager.js"></script>
+    <script src="modules/ArenaCoachRenderer.js"></script>
+
+    <script src="renderer.js"></script>
+</body>
+
+</html>

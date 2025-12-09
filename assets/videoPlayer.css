@@ -1,0 +1,640 @@
+/* Video Player Styles - Matches Target Design */
+:root {
+    --player-surface-bg: #26222b; /* Rich charcoal to anchor controls */
+    --timeline-edge-inset: 9px; /* half of playhead (18px) so circle edge meets container edge */
+    --events-lane-height: 30px; /* slightly more space above icon */
+    --cluster-icon-size: 30px; /* Cluster icon container size */
+    --cluster-icon-inner-size: 20px; /* Inner SVG/image size */
+    --cluster-ring-hover-alpha: 0.16; /* Hover background opacity */
+    --event-tick-height: 12px; /* Vertical tick height on timeline */
+    --event-tick-opacity: 0.88; /* Tick visibility */
+}
+
+.video-player-container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    position: relative;
+}
+
+/* Video element - flexes to fill space above footer */
+.video-player-element {
+    flex: 1;
+    width: 100%;
+    max-width: 100%;
+    min-height: 0;
+    object-fit: contain;
+    object-position: center;
+    background: #000;
+}
+
+/* Player Footer - Fixed height stack at bottom */
+.player-footer {
+    flex: 0 0 auto;
+    background: var(--player-surface-bg);
+}
+
+/* Prevent text selection throughout player footer */
+.player-footer,
+.player-footer * {
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+}
+
+/* Events Lane - Space for event markers */
+.events-lane {
+    height: var(--events-lane-height);
+    position: relative;
+    background: var(--player-surface-bg);
+}
+
+
+/* Timeline Row - Larger clickable area with gap */
+.timeline-row {
+    height: 28px;
+    position: relative;
+    background: var(--player-surface-bg);
+    padding: 0; /* Full-bleed timeline without side gaps */
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+}
+
+/* Timeline Track - Colored with gradient for rounds */
+.timeline-track {
+    position: relative;
+    height: 6px;
+    width: 100%;
+    border-radius: 3px; /* Subtle rounded edges */
+    background: rgba(255, 255, 255, 0.18); /* base track stays light */
+    top: 50%;
+    transform: translateY(-50%);
+    z-index: 2;
+    /* Inset the visual rail by the playhead radius so the circle can touch the container edge */
+    margin-left: var(--timeline-edge-inset);
+    margin-right: var(--timeline-edge-inset);
+}
+
+/* Played overlay: sits above track to show actual color/gradient for the played portion */
+.timeline-played {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    height: 6px;
+    left: 0;
+    background: transparent; /* default: let base track show; gradient applied when available */
+    pointer-events: none;
+    z-index: 3;
+}
+
+/* Keep timeline track stable on hover - do not change its color/gradient */
+.timeline-track:hover {
+    filter: none;
+}
+
+/* Timeline Hitbox - Invisible clickable area covers full row */
+.timeline-hitbox {
+    position: absolute;
+    inset: 0;
+    background: transparent;
+    cursor: pointer;
+    z-index: 5;
+}
+
+/* Playhead - Larger colored circle indicator with glow */
+.timeline-playhead {
+    position: absolute;
+    top: 50%;
+    width: 18px;
+    height: 18px;
+    background: var(--primary-accent);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    cursor: pointer;
+    pointer-events: auto;
+    z-index: 6;
+}
+
+.timeline-playhead:hover {
+    /* Prominent multi-layer glow */
+    box-shadow:
+        0 0 0 6px rgba(79, 70, 229, 0.18),
+        0 0 18px rgba(79, 70, 229, 0.75),
+        0 0 28px rgba(79, 70, 229, 0.45);
+}
+
+/* Keep glow while dragging */
+.timeline-playhead.is-dragging {
+    box-shadow:
+        0 0 0 6px rgba(79, 70, 229, 0.18),
+        0 0 18px rgba(79, 70, 229, 0.75),
+        0 0 28px rgba(79, 70, 229, 0.45);
+}
+
+/* Controls Bar - Bottom of footer */
+.controls-bar {
+    height: 56px;
+    background: var(--player-surface-bg);
+    border-top: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+}
+
+.controls-left,
+.controls-right {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+}
+
+/* Control Buttons */
+.control-btn {
+    background: none;
+    border: none;
+    color: #ffffff;
+    cursor: pointer;
+    padding: 0.5rem;
+    border-radius: 4px;
+    transition: background-color 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 40px;
+    height: 40px;
+}
+
+/* Subtle glow instead of background darkening */
+.control-btn:hover {
+    background: transparent;
+}
+
+.control-btn:hover svg {
+    filter: drop-shadow(0 0 6px rgba(255, 255, 255, 0.25));
+}
+
+/* Suppress focus outlines completely */
+.video-player-container .control-btn:focus,
+.video-player-container .control-btn:focus-visible,
+.video-player-container .volume-slider:focus,
+.video-player-container .volume-slider:focus-visible {
+    outline: none;
+    box-shadow: none;
+}
+
+/* Play/pause icon visibility */
+.play-pause-btn .pause-icon {
+    display: none;
+}
+
+.play-pause-btn.is-playing .play-icon {
+    display: none;
+}
+
+.play-pause-btn.is-playing .pause-icon {
+    display: inline;
+}
+
+/* Volume icon visibility */
+.mute-btn .volume-off-icon {
+    display: none;
+}
+
+.mute-btn.is-muted .volume-on-icon {
+    display: none;
+}
+
+.mute-btn.is-muted .volume-off-icon {
+    display: inline;
+}
+
+/* Time Display - Tight inline layout, non-selectable */
+.time-display {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-family: inherit;
+    font-size: 0.9rem;
+    color: #ffffff;
+    min-width: 0;
+    white-space: nowrap;
+}
+
+/* Volume Controls */
+.volume-container {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* Custom volume bar baseline */
+.volume-bar {
+    position: relative;
+    width: 80px;
+    height: 16px;
+    cursor: pointer;
+    /* Reserve space on the right so the thumb doesn't visually reduce the inter-item gap */
+    padding-right: 12px;
+}
+
+/* Reduce track width to account for the reserved right padding so the thumb stays inside */
+.volume-track {
+    width: calc(100% - 12px);
+}
+
+.volume-track {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 2px;
+    transform: translateY(-50%);
+}
+
+.volume-level {
+    height: 100%;
+    width: 0%;
+    background: var(--primary-accent);
+    border-radius: 2px;
+}
+
+.volume-thumb {
+    position: absolute;
+    top: 50%;
+    width: 12px;
+    height: 12px;
+    background: var(--primary-accent);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+}
+
+.volume-thumb:hover {
+    box-shadow: 0 0 8px rgba(79, 70, 229, 0.6);
+}
+
+/* Speed Button */
+.speed-btn {
+    min-width: 50px;
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+/* Filter Button */
+.filter-btn {
+    opacity: 0.7;
+    transition: opacity 0.2s ease;
+}
+
+.filter-btn:hover:not(:disabled) {
+    opacity: 1;
+}
+
+.filter-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+/* Events Filter Panel */
+.events-filter-panel {
+    position: absolute;
+    background: var(--player-surface-bg);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+    box-shadow: 0 10px 24px rgba(0,0,0,0.35), 0 2px 8px rgba(0,0,0,0.35);
+    padding: 8px;
+    z-index: 1000;
+    font-size: 11px;
+    width: 160px;
+}
+
+.events-filter-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.events-filter-heading {
+    font-size: 11px;
+    opacity: 0.8;
+    margin: 6px 0 4px 0;
+}
+
+.events-filter-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    border-radius: 4px;
+}
+
+.events-filter-item:hover {
+    background: rgba(255,255,255,0.08);
+}
+
+.events-filter-item input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 2px solid rgba(120, 115, 255, 0.9);
+    background: transparent;
+    display: inline-block;
+    margin: 0;
+    flex-shrink: 0;
+}
+
+.events-filter-item input[type="checkbox"]:checked {
+    background: rgba(120, 115, 255, 1);
+    box-shadow: inset 0 0 0 2px rgba(38, 34, 43, 1);
+}
+
+.events-filter-text { 
+    color: #fff; 
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+
+/* Small spec icon next to names */
+.events-filter-spec,
+.event-tooltip-item .tooltip-spec {
+    width: 14px;
+    height: 14px;
+    display: inline-block;
+    border-radius: 2px;
+}
+
+
+/* Icon default transparency and hover brightness */
+.cluster-icon .cluster-icon-svg img,
+.cluster-icon .cluster-icon-svg svg {
+    opacity: 0.6;
+}
+.cluster-icon.is-active .cluster-icon-svg img,
+.cluster-icon:hover .cluster-icon-svg img,
+.cluster-icon.is-active .cluster-icon-svg svg,
+.cluster-icon:hover .cluster-icon-svg svg {
+    opacity: 1;
+    filter: brightness(1.2);
+}
+
+/* Responsive Adjustments */
+@media (max-width: 768px) {
+    .controls-bar {
+        gap: 0.5rem;
+        padding: 0.5rem;
+    }
+    
+    .controls-left,
+    .controls-right {
+        gap: 0.5rem;
+    }
+    
+    .volume-slider {
+        width: 60px;
+    }
+    
+    .time-display {
+        font-size: 0.8rem;
+        min-width: 80px;
+    }
+    
+    .events-lane {
+        height: 36px;
+    }
+    
+    .timeline-row {
+        height: 20px;
+    }
+    
+    .controls-bar {
+        height: 48px;
+    }
+}
+
+/* Fullscreen Adjustments */
+.video-player-container:fullscreen {
+    background: #000000;
+}
+
+.video-player-container:fullscreen .player-footer {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    background: rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(10px);
+}
+
+/* Remove gap between timeline and controls in fullscreen */
+.video-player-container:fullscreen .timeline-row {
+    margin-bottom: 0;
+}
+
+/* Cluster icon lane (icons float above timeline; positioned relative to events-lane) */
+.cluster-icon {
+    position: absolute;
+    bottom: -8px;
+    transform: translateX(-50%);
+    z-index: 10;
+    color: rgba(255, 255, 255, 0.8);
+    transition: background-color 0.15s ease, transform 0.15s ease;
+    width: var(--cluster-icon-size);
+    height: var(--cluster-icon-size);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+}
+
+.cluster-icon,
+.cluster-icon * {
+    cursor: pointer;
+}
+
+.cluster-icon .cluster-icon-svg { position: relative; z-index: 2; }
+.cluster-icon .cluster-icon-svg img {
+    width: var(--cluster-icon-inner-size);
+    height: var(--cluster-icon-inner-size);
+    display: block;
+    opacity: 0.6;
+    filter: none;
+}
+.cluster-icon .cluster-icon-svg svg { 
+    width: var(--cluster-icon-inner-size); 
+    height: var(--cluster-icon-inner-size); 
+    display: block; 
+    opacity: 0.6; 
+}
+
+/* Invisible but hoverable ring to keep tooltip active across small gaps */
+.cluster-hitbox {
+    position: absolute;
+    inset: -8px; /* expand by 8px around icon */
+    z-index: 1;
+}
+
+.cluster-icon.is-active { background: rgba(255, 255, 255, var(--cluster-ring-hover-alpha)); }
+.cluster-icon:hover { background: rgba(255, 255, 255, var(--cluster-ring-hover-alpha)); }
+.cluster-icon.is-active .cluster-icon-svg img,
+.cluster-icon:hover .cluster-icon-svg img {
+    opacity: 1;
+    filter: brightness(1.2);
+}
+.cluster-icon.is-active .cluster-icon-svg svg,
+.cluster-icon:hover .cluster-icon-svg svg { opacity: 1; filter: brightness(1.2); }
+
+/* One thin vertical tick per cluster, inside the track */
+.event-tick {
+    position: absolute;
+    bottom: 0;
+    transform: translateX(-50%);
+    width: 2px;
+    height: var(--event-tick-height);
+    background: rgba(255, 255, 255, var(--event-tick-opacity));
+    z-index: 4;
+}
+
+.event-tick.is-active,
+.timeline-track:hover .event-tick.is-active {
+    background: #ffffff;
+    box-shadow: 0 0 8px rgba(255, 255, 255, 0.6);
+}
+
+/* Event Tooltips */
+.event-tooltip {
+    position: absolute;
+    background: rgba(38, 34, 43, 0.95);
+    color: #ffffff;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    white-space: nowrap;
+    z-index: 1000;
+    pointer-events: auto;
+    transform: translateX(-50%);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.35), 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.event-tooltip-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.event-tooltip-item {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    align-items: center;
+    gap: 8px;
+}
+
+.tooltip-player {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+}
+
+.events-filter-name-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    overflow: hidden;
+}
+
+.event-tooltip,
+.event-tooltip * {
+    cursor: pointer;
+}
+
+.tooltip-time {
+    font-weight: 400;
+    color: #ffffff;
+    margin-bottom: 0;
+}
+
+.event-tooltip-item {
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: 4px;
+}
+
+.event-tooltip-item:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+/* Make rows span full tooltip width to the rounded edge */
+.event-tooltip-list { margin-left: -12px; margin-right: -12px; }
+
+.event-tooltip-item .tooltip-icon svg { width: 16px; height: 16px; }
+.event-tooltip-item .tooltip-icon img { width: 16px; height: 16px; display: block; }
+
+/* Video Enrichment Status Bar */
+.video-enrichment-status {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.7);
+}
+
+/* Use same purple theme for all in-progress states (matches status-badge gradient) */
+.video-enrichment-status.in-progress {
+    background: rgba(118, 75, 162, 0.15);
+    color: #c4b5fd;
+}
+
+.video-enrichment-status.completed {
+    background: rgba(34, 197, 94, 0.15);
+    color: #86efac;
+}
+
+.video-enrichment-status.failed {
+    background: rgba(239, 68, 68, 0.15);
+    color: #fca5a5;
+}
+
+.video-enrichment-status.quota-exhausted {
+    background: rgba(251, 191, 36, 0.15);
+    color: #fcd34d;
+}
+
+.video-enrichment-status-text {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    text-overflow: ellipsis;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+/* Override spinner margin when inside video status (flex handles spacing via gap) */
+.video-enrichment-status-text .loading-spinner {
+    margin-right: 0;
+    margin-top: 0;
+    flex-shrink: 0;
+}
+
+.video-enrichment-status-text .quota-signup-link {
+    color: inherit;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.video-enrichment-status-text .quota-signup-link:hover {
+    text-decoration: none;
+    opacity: 0.8;
+}

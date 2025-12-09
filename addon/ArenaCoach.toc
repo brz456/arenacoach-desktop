@@ -1,0 +1,10 @@
+## Interface: 110005
+## Title: ArenaCoach
+## Notes: Enables combat logging during arena matches for ArenaCoach desktop app
+## Author: ArenaCoach Team
+## Version: 1.0.0
+## IconTexture: Interface\AddOns\ArenaCoach\icon64
+## DefaultState: Enabled
+## LoadOnDemand: 0
+
+ArenaCoach.lua
