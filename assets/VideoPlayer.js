@@ -7,28 +7,41 @@ class VideoPlayer {
     static EVENT_CLUSTER_WINDOW_PERCENT = 0.02; // 2% of total duration
     static TOOLTIP_SPACING_PX = 6; // Gap between icon and tooltip
     static TOOLTIP_MARGIN_PX = 8; // Tooltip container margin
-    static FILTER_CLICK_BLOCK_MS = 50; // Prevent filter panel re-opening
     static EVENT_PRE_ROLL_SEC = 3; // Seconds to seek before an event
+
+    // Playback control constants
+    static PLAYBACK_SPEEDS = [0.25, 0.5, 1, 1.5, 2];
+    static DEFAULT_PLAYBACK_SPEED = 1;
     static ARROW_SEEK_STEP_SEC = 5; // Arrow key skip interval
+    static JL_SEEK_STEP_SEC = 10; // J/L key skip interval
+    static VOLUME_STEP = 0.05; // Volume adjustment per keypress
     
-    constructor({ videoElement, containerElement, metadata, shuffleRounds }) {
+    constructor({ videoElement, containerElement, metadata, shuffleRounds, defaultMistakeView = 'all' }) {
+        // Validate required elements
+        if (!videoElement || !(videoElement instanceof HTMLVideoElement)) {
+            throw new Error('VideoPlayer: videoElement is required and must be an HTMLVideoElement');
+        }
+        if (!containerElement || !(containerElement instanceof HTMLElement)) {
+            throw new Error('VideoPlayer: containerElement is required and must be an HTMLElement');
+        }
+
         this.video = videoElement;
         this.container = containerElement;
         this.metadata = metadata;
         this.shuffleRounds = shuffleRounds || [];
-        
-        // Load saved volume preferences
+        this.defaultMistakeView = defaultMistakeView === 'mine' ? 'mine' : 'all';
+
+        // Load and apply saved volume preferences (video element is canonical source)
         const savedVolume = this.loadSavedVolume();
-        
+        this.video.volume = savedVolume.volume;
+        this.video.muted = savedVolume.muted;
+        this.lastNonZeroVolume = savedVolume.volume > 0.01 ? savedVolume.volume : 1;
+
         // State management
         this.isPlaying = false;
         this.isDragging = false;
-        this.volume = savedVolume.volume;
-        this.muted = savedVolume.muted;
-        this.playbackRate = 1;
         this.duration = 0;
         this.currentTime = 0;
-        this.lastNonZeroVolume = savedVolume.volume > 0.01 ? savedVolume.volume : 1;
         
         // Events system
         this.events = this.processEventsData(metadata?.events || []);
@@ -48,9 +61,6 @@ class VideoPlayer {
         
         // DOM references
         this.controlsBar = null;
-        this.timelineContainer = null;
-        this.progressBar = null;
-        this.scrubber = null;
         this.currentTimeDisplay = null;
         this.durationDisplay = null;
         
@@ -67,23 +77,31 @@ class VideoPlayer {
         this._onFullscreen = null;
         this._resizeObserver = null;
         this._footerResizeObserver = null;
-        
+
+        // Active drag cleanup (for mid-drag destroy)
+        this._activeDragCleanup = null;
+
         this.init();
     }
     
     /**
-     * Get accent color with alpha from CSS variable
+     * Get accent color with alpha from CSS variable.
+     * Expects --primary-accent to be rgb(), rgba(), or #RRGGBB format.
      */
     getAccentColor(alpha = 1) {
         const root = document.documentElement;
         const accent = getComputedStyle(root).getPropertyValue('--primary-accent').trim();
-        // Accept rgb(), rgba(), or hex. If parsing fails, fall back to current value.
+
+        // Parse rgb() / rgba()
         if (accent.startsWith('rgb')) {
             const parts = accent.replace(/rgba?\(|\)|\s/g, '').split(',');
             const [r, g, b] = parts.slice(0, 3).map(Number);
-            return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+            if ([r, g, b].every(Number.isFinite)) {
+                return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+            }
         }
-        // Hex fallback (#RRGGBB)
+
+        // Parse hex (#RRGGBB)
         const m = accent.match(/^#([0-9a-fA-F]{6})$/);
         if (m) {
             const r = parseInt(m[1].slice(0, 2), 16);
@@ -91,27 +109,49 @@ class VideoPlayer {
             const b = parseInt(m[1].slice(4, 6), 16);
             return `rgba(${r}, ${g}, ${b}, ${alpha})`;
         }
-        // Final fallback to current hard-coded purple
-        return `rgba(79, 70, 229, ${alpha})`;
+
+        // Unparseable format - warn and return empty to clear inline style (CSS is SSoT)
+        console.warn('VideoPlayer: Could not parse --primary-accent for alpha adjustment:', accent);
+        return '';
     }
     
     /**
      * Process events data from metadata into a flat array with positioning info
      */
     processEventsData(eventsData) {
+        if (!Array.isArray(eventsData)) {
+            throw new Error('VideoPlayer: eventsData must be an array');
+        }
         const processedEvents = [];
-        
-        eventsData.forEach(category => {
-            if (category.items && Array.isArray(category.items)) {
-                category.items.forEach(event => {
-                    processedEvents.push({
-                        category: category.category,
-                        timestamp: event.timestamp,
-                        description: event.description,
-                        data: event.data
-                    });
-                });
+
+        eventsData.forEach((category, index) => {
+            if (!category || typeof category !== 'object') {
+                throw new Error(`VideoPlayer: Event category at index ${index} must be an object`);
             }
+            if (!category.category || typeof category.category !== 'string') {
+                throw new Error('VideoPlayer: Event category must have a non-empty string category');
+            }
+            // Skip categories with no items, but throw if items exists and isn't an array
+            if (category.items === undefined || category.items === null) {
+                return;
+            }
+            if (!Array.isArray(category.items)) {
+                throw new Error(`VideoPlayer: category.items must be an array, got: ${typeof category.items}`);
+            }
+            category.items.forEach((event, eventIndex) => {
+                if (!event || typeof event !== 'object') {
+                    throw new Error(`VideoPlayer: Event at index ${eventIndex} in category "${category.category}" must be an object`);
+                }
+                if (!Number.isFinite(event.timestamp)) {
+                    throw new Error(`VideoPlayer: Event timestamp must be a finite number, got: ${event.timestamp}`);
+                }
+                processedEvents.push({
+                    category: category.category,
+                    timestamp: event.timestamp,
+                    description: event.description,
+                    data: event.data
+                });
+            });
         });
         
         // Sort by timestamp for consistent rendering order
@@ -129,12 +169,14 @@ class VideoPlayer {
             'dispel': { icon: 'magic-swirl.svg', label: 'Dispel' },
             'defensive': { icon: 'shield-disabled.svg', label: 'Defensive' },
             'offensive': { icon: 'stopwatch.svg', label: 'Offensive' },
+            'cooldown': { icon: 'hourglass.svg', label: 'Cooldown' },
         };
         const cfg = iconMap[category];
         if (cfg && cfg.icon) {
             return `<img src="images/events/${cfg.icon}" alt="${cfg.label}" />`;
         }
-        // Fallback neutral dot
+        // Unknown category - warn and return neutral dot
+        console.warn('VideoPlayer: Unknown event category, using neutral icon:', category);
         return `
             <svg viewBox="0 0 24 24" fill="currentColor">
                 <circle cx="12" cy="12" r="8"/>
@@ -146,22 +188,36 @@ class VideoPlayer {
      * Get player spec ID from metadata
      */
     getPlayerSpecId(playerId) {
-        if (!playerId || !this.metadata?.players) return null;
+        if (!playerId || !this.metadata || !Array.isArray(this.metadata.players)) return null;
         const player = this.metadata.players.find(p => p.id === playerId);
-        return player?.specId || null;
+        return player?.specId ?? null;
+    }
+
+    normalizePlayerName(name) {
+        if (!name) return null;
+        const raw = String(name).trim();
+        if (!raw) return null;
+        const base = raw.split('-')[0].trim();
+        return base || null;
     }
     
     
     init() {
-        // Apply saved volume settings to video element
-        this.video.volume = this.volume;
-        this.video.muted = this.muted;
-        
-        this.bindVideoEvents();
-        this.bindKeyboardShortcuts();
+        // Set default playback rate (volume already applied in constructor)
+        this.video.playbackRate = VideoPlayer.DEFAULT_PLAYBACK_SPEED;
+
+        // Render controls first so update* methods have valid DOM references
         this.renderControls();
         this.renderTimeline();
-        
+
+        // Bind events after controls exist
+        this.bindVideoEvents();
+        this.bindKeyboardShortcuts();
+
+        // Sync control states with video element
+        this.updateSpeedButton();
+        this.updateVolumeControls();
+
         // Wait for video metadata before initializing timeline
         if (this.video.duration) {
             this.onLoadedMetadata();
@@ -184,13 +240,16 @@ class VideoPlayer {
         };
         
         const volumeChangeHandler = () => {
-            this.volume = this.video.volume;
-            this.muted = this.video.muted;
             this.updateVolumeControls();
         };
         
         const rateChangeHandler = () => {
-            this.playbackRate = this.video.playbackRate;
+            // Enforce invariant: playback rate must be in PLAYBACK_SPEEDS
+            if (!VideoPlayer.PLAYBACK_SPEEDS.includes(this.video.playbackRate)) {
+                console.warn('VideoPlayer: Unsupported playback rate', this.video.playbackRate, '- normalizing to default');
+                this.video.playbackRate = VideoPlayer.DEFAULT_PLAYBACK_SPEED;
+                return; // Will trigger another ratechange event
+            }
             this.updateSpeedButton();
         };
         
@@ -230,26 +289,120 @@ class VideoPlayer {
     
     bindKeyboardShortcuts() {
         this._onKeyDown = (e) => {
+            // Ignore if typing in input fields
             const activeElement = document.activeElement;
             const isTyping = activeElement && (
                 activeElement.tagName === 'INPUT' ||
                 activeElement.tagName === 'TEXTAREA' ||
                 activeElement.isContentEditable
             );
+            if (isTyping) return;
 
-            if (e.code === 'Space' && !isTyping) {
-                e.preventDefault();
-                this.togglePlayPause();
+            // Scope to player context: only handle if focus is on body/container/video
+            const inPlayerContext = !activeElement ||
+                activeElement === document.body ||
+                this.container.contains(activeElement);
+            if (!inPlayerContext) return;
+
+            // Ignore modifier keys (Ctrl/Alt/Meta) for all shortcuts
+            const hasModifier = e.ctrlKey || e.altKey || e.metaKey;
+            if (hasModifier) return;
+
+            const key = e.key;
+            const keyLower = key.toLowerCase();
+
+            // Character-based shortcuts (e.key for keyboard layout compatibility)
+            switch (keyLower) {
+                // Play/Pause: K (ignore repeat for toggle)
+                case 'k':
+                    if (e.repeat) return;
+                    e.preventDefault();
+                    this.togglePlayPause();
+                    return;
+
+                // Seek: J/L (10s) - allow repeat
+                case 'j':
+                    e.preventDefault();
+                    this.seek(this.video.currentTime - VideoPlayer.JL_SEEK_STEP_SEC);
+                    return;
+                case 'l':
+                    e.preventDefault();
+                    this.seek(this.video.currentTime + VideoPlayer.JL_SEEK_STEP_SEC);
+                    return;
+
+                // Mute: M (ignore repeat for toggle)
+                case 'm':
+                    if (e.repeat) return;
+                    e.preventDefault();
+                    this.toggleMute();
+                    return;
+
+                // Fullscreen: F (ignore repeat for toggle)
+                case 'f':
+                    if (e.repeat) return;
+                    e.preventDefault();
+                    this.toggleFullscreen();
+                    return;
             }
 
-            if (e.code === 'ArrowLeft' && !isTyping) {
+            // Number keys 0-9: seek to 0%-90% (e.key for layout compatibility)
+            if (key >= '0' && key <= '9') {
                 e.preventDefault();
-                this.seek(this.video.currentTime - VideoPlayer.ARROW_SEEK_STEP_SEC);
+                const digit = parseInt(key, 10);
+                this.seek((digit / 10) * this.duration);
+                return;
             }
 
-            if (e.code === 'ArrowRight' && !isTyping) {
+            // Playback speed: < / > (e.key for layout compatibility)
+            if (key === '<') {
                 e.preventDefault();
-                this.seek(this.video.currentTime + VideoPlayer.ARROW_SEEK_STEP_SEC);
+                this.decreasePlaybackSpeed();
+                return;
+            }
+            if (key === '>') {
+                e.preventDefault();
+                this.increasePlaybackSpeed();
+                return;
+            }
+
+            // Special keys (e.code for physical key position)
+            switch (e.code) {
+                // Play/Pause: Space (ignore repeat for toggle)
+                case 'Space':
+                    if (e.repeat) return;
+                    e.preventDefault();
+                    this.togglePlayPause();
+                    break;
+
+                // Seek: Arrow keys (5s) - allow repeat
+                case 'ArrowLeft':
+                    e.preventDefault();
+                    this.seek(this.video.currentTime - VideoPlayer.ARROW_SEEK_STEP_SEC);
+                    break;
+                case 'ArrowRight':
+                    e.preventDefault();
+                    this.seek(this.video.currentTime + VideoPlayer.ARROW_SEEK_STEP_SEC);
+                    break;
+
+                // Volume: Up/Down arrows - allow repeat
+                case 'ArrowUp':
+                    e.preventDefault();
+                    this.setVolume(Math.min(1, this.video.volume + VideoPlayer.VOLUME_STEP));
+                    break;
+                case 'ArrowDown':
+                    e.preventDefault();
+                    this.setVolume(Math.max(0, this.video.volume - VideoPlayer.VOLUME_STEP));
+                    break;
+
+                // Beginning/End: Home/End
+                case 'Home':
+                    e.preventDefault();
+                    this.seek(0);
+                    break;
+                case 'End':
+                    e.preventDefault();
+                    this.seek(this.duration);
+                    break;
             }
         };
 
@@ -278,7 +431,7 @@ class VideoPlayer {
         this.footer = document.createElement('div');
         this.footer.className = 'player-footer';
         
-        // Events lane (top of footer - for future markers)
+        // Events lane (top of footer - contains event cluster icons)
         this.eventsLane = document.createElement('div');
         this.eventsLane.className = 'events-lane';
         
@@ -347,26 +500,35 @@ class VideoPlayer {
         volumeBar.addEventListener('pointerdown', (e) => {
             e.preventDefault();
             const rect = volumeTrack.getBoundingClientRect();
+            if (rect.width <= 0) return; // Guard against zero-width element
+            // Clean up any existing drag before starting new one
+            if (this._activeDragCleanup) {
+                this._activeDragCleanup();
+            }
+            const pointerId = e.pointerId;
             const updateAt = (clientX) => {
                 const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
                 const v = x / rect.width;
-                this.setVolume(v, true); // Pass isUserDragging = true
-                this.updateVolumeUI(volumeTrack, volumeLevel, volumeThumb);
+                this.setVolume(v, true);
             };
             updateAt(e.clientX);
-            volumeBar.setPointerCapture?.(e.pointerId);
+            volumeBar.setPointerCapture?.(pointerId);
             const move = (ev) => updateAt(ev.clientX);
-            const up = () => {
-                volumeBar.releasePointerCapture?.(e.pointerId);
+            const cleanup = () => {
+                this._activeDragCleanup = null;
+                if (volumeBar.hasPointerCapture?.(pointerId)) {
+                    volumeBar.releasePointerCapture(pointerId);
+                }
                 window.removeEventListener('pointermove', move, true);
-                window.removeEventListener('pointerup', up, true);
-                window.removeEventListener('pointercancel', up, true);
-                window.removeEventListener('blur', up, true);
+                window.removeEventListener('pointerup', cleanup, true);
+                window.removeEventListener('pointercancel', cleanup, true);
+                window.removeEventListener('blur', cleanup, true);
             };
+            this._activeDragCleanup = cleanup;
             window.addEventListener('pointermove', move, true);
-            window.addEventListener('pointerup', up, true);
-            window.addEventListener('pointercancel', up, true);
-            window.addEventListener('blur', up, true);
+            window.addEventListener('pointerup', cleanup, true);
+            window.addEventListener('pointercancel', cleanup, true);
+            window.addEventListener('blur', cleanup, true);
         });
 
         // Store refs for UI updates
@@ -436,7 +598,7 @@ class VideoPlayer {
         // Speed control
         const speedBtn = document.createElement('button');
         speedBtn.className = 'control-btn speed-btn';
-        speedBtn.textContent = '1x';
+        speedBtn.textContent = `${VideoPlayer.DEFAULT_PLAYBACK_SPEED}x`;
         speedBtn.addEventListener('click', () => this.cyclePlaybackSpeed());
         speedBtn.tabIndex = -1; // Prevent tab focus to ensure spacebar works
         this.speedBtn = speedBtn;
@@ -457,7 +619,7 @@ class VideoPlayer {
         
         this.controlsBar.append(controlsLeft, controlsRight);
         
-        // Prevent focus highlights on all controls (except volume slider - handled separately)
+        // Prevent focus highlights on button controls
         [playPauseBtn, muteBtn, speedBtn, filterBtn, fullscreenBtn].forEach(btn => {
             btn.addEventListener('mousedown', e => e.preventDefault()); // Prevent focus ring
         });
@@ -485,30 +647,80 @@ class VideoPlayer {
         if (!playerId || !this.metadata || !Array.isArray(this.metadata.players)) return null;
         const p = this.metadata.players.find(pl => pl.id === playerId);
         if (!p) return null;
-        // Always show only the base character name (before first hyphen)
-        // Keep logic simple and deterministic per consistent naming convention
-        const raw = p.name ? String(p.name) : null;
-        if (!raw) return null;
-        const base = raw.split('-')[0];
-        return base || null;
+        return this.normalizePlayerName(p.name);
+    }
+
+    getFilterPlayers() {
+        const playersById = new Map();
+        const upsertPlayer = (playerId, playerName, hasEvent) => {
+            if (!playerId) return;
+            const existing = playersById.get(playerId);
+            const normalizedName = this.normalizePlayerName(playerName);
+            if (!existing) {
+                playersById.set(playerId, {
+                    playerId,
+                    playerName: normalizedName || playerId,
+                    eventCount: hasEvent === true ? 1 : 0
+                });
+                return;
+            }
+            if (hasEvent === true) {
+                existing.eventCount += 1;
+            }
+            if ((existing.playerName === existing.playerId || !existing.playerName) && normalizedName) {
+                existing.playerName = normalizedName;
+            }
+        };
+
+        if (Array.isArray(this.metadata?.players)) {
+            this.metadata.players.forEach(player => {
+                upsertPlayer(player?.id, player?.name, false);
+            });
+        }
+
+        this.events.forEach(event => {
+            upsertPlayer(event?.data?.playerId, event?.data?.playerName, true);
+        });
+
+        return [...playersById.values()].sort((a, b) => {
+            if (b.eventCount !== a.eventCount) {
+                return b.eventCount - a.eventCount;
+            }
+            const nameA = String(a.playerName || a.playerId || '').toLowerCase();
+            const nameB = String(b.playerName || b.playerId || '').toLowerCase();
+            const byName = nameA.localeCompare(nameB);
+            if (byName !== 0) return byName;
+            return String(a.playerId).localeCompare(String(b.playerId));
+        });
+    }
+
+    shouldEnableAllPlayersByDefault(recordingPlayerId) {
+        if (!recordingPlayerId) return true;
+        return this.defaultMistakeView === 'all';
     }
 
     initializeFilterState() {
         const categories = new Set(this.events.map(e => e.category));
         categories.forEach(cat => this.filterState.set(cat, true));
-        
-        // Initialize player filter to only show recording player events by default
-        const players = [...new Set(this.events.map(e => e.data?.playerId).filter(Boolean))];
+
+        // Initialize player filter from all known players, not only players with event items.
+        const players = this.getFilterPlayers();
         if (!this.playerFilterState) this.playerFilterState = new Map();
-        players.forEach(playerId => {
-            // Only enable the recording player by default
-            this.playerFilterState.set(playerId, playerId === this.metadata?.playerId);
+        const recordingPlayerId = this.metadata?.playerId;
+        const enableAllPlayersByDefault = this.shouldEnableAllPlayersByDefault(recordingPlayerId);
+        players.forEach(player => {
+            if (player.eventCount === 0) {
+                this.playerFilterState.set(player.playerId, false);
+                return;
+            }
+            this.playerFilterState.set(
+                player.playerId,
+                enableAllPlayersByDefault ? true : player.playerId === recordingPlayerId
+            );
         });
     }
 
     toggleFilterPanel() {
-        if (this._filterClickBlocked) return;
-        
         if (this.filterPanel) {
             this.closeFilterPanel();
             return;
@@ -552,40 +764,54 @@ class VideoPlayer {
         playerHead.className = 'events-filter-heading';
         playerHead.textContent = 'Players';
         filterList.appendChild(playerHead);
-        // Build players from event data
-        const players = [...new Map(this.events.map(e => [e.data?.playerId, e.data?.playerName]).filter(([id]) => !!id)).entries()];
-        players.forEach(([playerId, playerName]) => {
+        // Build players from match metadata first, with event-data fallback for names.
+        const players = this.getFilterPlayers();
+        players.forEach(({ playerId, playerName, eventCount }) => {
+            const hasEvents = eventCount > 0;
             const row = document.createElement('label');
             row.className = 'events-filter-item';
+            if (!hasEvents) {
+                row.classList.add('is-disabled');
+                row.title = 'No events for this player in this match';
+            }
             const checkbox = document.createElement('input');
             checkbox.type = 'checkbox';
+            checkbox.disabled = !hasEvents;
             const enabled = this.playerFilterState.get(playerId);
-            checkbox.checked = enabled !== false; // default on
+            checkbox.checked = hasEvents ? enabled !== false : false; // default on when available
             checkbox.addEventListener('change', () => {
+                // Defensive invariant in case this handler is ever invoked programmatically.
+                if (!hasEvents) return;
                 this.playerFilterState.set(playerId, checkbox.checked);
                 this.renderEventMarkers();
             });
             
-            const specIcon = document.createElement('img');
-            specIcon.className = 'events-filter-spec';
-            try {
-                const specId = this.getPlayerSpecId?.(playerId);
-                if (window.AssetManager?.getSpecIconPath && specId) {
-                    const p = window.AssetManager.getSpecIconPath(specId);
-                    if (p) specIcon.src = p;
-                }
-            } catch (e) {
-                // Silently ignore spec icon errors
-            }
-            
             const nameGroup = document.createElement('span');
             nameGroup.className = 'events-filter-name-group';
-            
+
+            // Only create spec icon if we have a valid path
+            const specId = this.getPlayerSpecId(playerId);
+            if (typeof window.AssetManager?.getSpecIconPath === 'function' && specId) {
+                const p = window.AssetManager.getSpecIconPath(specId);
+                if (p) {
+                    const specIcon = document.createElement('img');
+                    specIcon.className = 'events-filter-spec';
+                    specIcon.src = p;
+                    specIcon.alt = '';
+                    nameGroup.appendChild(specIcon);
+                }
+            }
+
             const text = document.createElement('span');
-            text.className = 'events-filter-text';
-            text.textContent = playerName || playerId;
-            
-            nameGroup.append(specIcon, text);
+            text.className = 'events-filter-text events-filter-player-name';
+            const displayName = playerName || playerId;
+            text.textContent = displayName;
+
+            const count = document.createElement('span');
+            count.className = 'events-filter-player-count';
+            count.textContent = `(${eventCount})`;
+
+            nameGroup.append(text, count);
             row.append(checkbox, nameGroup);
             filterList.appendChild(row);
         });
@@ -599,13 +825,20 @@ class VideoPlayer {
         this.container.appendChild(panel);
         this.filterPanel = panel;
         
-        // Close on outside click
-        this._onFilterOutsideClick = (ev) => {
-            if (!panel.contains(ev.target) && ev.target !== this.filterBtn) {
+        // Close on outside click (check button and its children like SVG/path)
+        const handler = (ev) => {
+            const clickedPanel = panel.contains(ev.target);
+            const clickedFilterBtn = this.filterBtn.contains(ev.target);
+            if (!clickedPanel && !clickedFilterBtn) {
                 this.closeFilterPanel();
             }
         };
-        setTimeout(() => document.addEventListener('click', this._onFilterOutsideClick, true), 0);
+        this._onFilterOutsideClick = handler;
+        // Defer listener to next microtask to avoid catching the opening click
+        queueMicrotask(() => {
+            if (this._onFilterOutsideClick !== handler) return;
+            document.addEventListener('click', handler, true);
+        });
     }
 
     closeFilterPanel() {
@@ -617,10 +850,6 @@ class VideoPlayer {
             document.removeEventListener('click', this._onFilterOutsideClick, true);
             this._onFilterOutsideClick = null;
         }
-        
-        // Prevent immediate reopening from same click event
-        this._filterClickBlocked = true;
-        setTimeout(() => { this._filterClickBlocked = false; }, VideoPlayer.FILTER_CLICK_BLOCK_MS);
     }
     
     renderTimeline() {
@@ -628,7 +857,7 @@ class VideoPlayer {
         this.track = document.createElement('div');
         this.track.className = 'timeline-track';
         
-        // Played overlay (left of playhead) - used only for shuffle gradient
+        // Played overlay (left of playhead) - shows progress with optional shuffle round colors
         this.played = document.createElement('div');
         this.played.className = 'timeline-played';
 
@@ -649,30 +878,43 @@ class VideoPlayer {
         const onPointerDown = (e) => {
             e.preventDefault();
             const rect = this.track.getBoundingClientRect();
+            if (rect.width <= 0) return; // Guard against zero-width element
+            // Clean up any existing drag before starting new one
+            if (this._activeDragCleanup) {
+                this._activeDragCleanup();
+            }
+            const captureEl = e.currentTarget; // Capture on element that received the event
+            const pointerId = e.pointerId;
             const updateAt = (clientX) => {
                 const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
                 this.seek((x / rect.width) * this.duration);
             };
             updateAt(e.clientX);
+            this.isDragging = true;
             if (this.playhead) {
                 this.playhead.classList.add('is-dragging');
             }
-            this.hitbox.setPointerCapture?.(e.pointerId);
+            captureEl.setPointerCapture?.(pointerId);
             const move = (ev) => updateAt(ev.clientX);
-            const up = () => {
-                this.hitbox.releasePointerCapture?.(e.pointerId);
+            const cleanup = () => {
+                this._activeDragCleanup = null;
+                this.isDragging = false;
+                if (captureEl.hasPointerCapture?.(pointerId)) {
+                    captureEl.releasePointerCapture(pointerId);
+                }
                 window.removeEventListener('pointermove', move, true);
-                window.removeEventListener('pointerup', up, true);
-                window.removeEventListener('pointercancel', up, true);
-                window.removeEventListener('blur', up, true);
+                window.removeEventListener('pointerup', cleanup, true);
+                window.removeEventListener('pointercancel', cleanup, true);
+                window.removeEventListener('blur', cleanup, true);
                 if (this.playhead) {
                     this.playhead.classList.remove('is-dragging');
                 }
             };
+            this._activeDragCleanup = cleanup;
             window.addEventListener('pointermove', move, true);
-            window.addEventListener('pointerup', up, true);
-            window.addEventListener('pointercancel', up, true);
-            window.addEventListener('blur', up, true);
+            window.addEventListener('pointerup', cleanup, true);
+            window.addEventListener('pointercancel', cleanup, true);
+            window.addEventListener('blur', cleanup, true);
         };
         this.hitbox.addEventListener('pointerdown', onPointerDown);
         this.playhead.addEventListener('pointerdown', onPointerDown);
@@ -710,6 +952,7 @@ class VideoPlayer {
             // Reset when not fullscreen
             this.video.style.height = '';
             this.video.style.maxHeight = '';
+            this.video.style.display = '';
         }
     }
     
@@ -720,44 +963,57 @@ class VideoPlayer {
         const stops = [];
         const toPct = (ms) => Math.max(0, Math.min(100, +(((ms / 1000) / totalSec) * 100).toFixed(3)));
         const transparent = 'rgba(0,0,0,0)';
-        
+
         // Start transparent
         stops.push(`${transparent} 0%`);
-        
+
         ordered.forEach(round => {
             const startPct = toPct(round.startTimestamp);
             const endPct = toPct(round.endTimestamp);
             if (!(endPct > startPct)) return;
-            const recordingPlayerWon = this.calculateRecordingPlayerWon(round);
-            const color = recordingPlayerWon
-                ? `rgba(74, 222, 128, ${alpha})`
-                : `rgba(248, 113, 113, ${alpha})`;
+
+            const result = this.calculateRecordingPlayerWon(round);
+            let color;
+            if (result === true) {
+                color = `rgba(74, 222, 128, ${alpha})`; // Win - green
+            } else if (result === false) {
+                color = `rgba(248, 113, 113, ${alpha})`; // Loss - red
+            } else {
+                // Unknown outcome is expected for early-ended/incomplete rounds.
+                // Skip this segment without noisy logs.
+                return;
+            }
             // Create hard stop by duplicating stops at exact boundaries
             stops.push(`${transparent} ${startPct}%`, `${color} ${startPct}%`, `${color} ${endPct}%`, `${transparent} ${endPct}%`);
         });
-        
+
         // Ensure end transparent
         stops.push(`${transparent} 100%`);
         return `linear-gradient(to right, ${stops.join(', ')})`;
     }
     
+    /**
+     * Determine if recording player won the round.
+     * Returns: true (won), false (lost), or null (unknown/missing data)
+     */
     calculateRecordingPlayerWon(round) {
-        // Check if we have the required data
+        // Missing required data - return null (unknown)
         if (!this.metadata?.playerId || round.winningTeamId === undefined) {
-            return false;
+            return null;
         }
-        
-        // Find which team the recording player is on for this round
+
+        // Find which team the recording player is on
         const isOnTeam0 = round.team0Players?.includes(this.metadata.playerId);
         const isOnTeam1 = round.team1Players?.includes(this.metadata.playerId);
-        
+
         if (isOnTeam0) {
             return round.winningTeamId === 0;
         } else if (isOnTeam1) {
             return round.winningTeamId === 1;
         }
-        
-        return false; // Player not found in either team
+
+        // Player not found in either team - return null (unknown)
+        return null;
     }
     
     renderShuffleSegments() {
@@ -824,19 +1080,21 @@ class VideoPlayer {
      * If duration is unavailable, do not group (each event forms its own cluster).
      */
     clusterEventsByTime(source) {
+        if (!Array.isArray(source)) {
+            throw new Error('VideoPlayer: clusterEventsByTime requires an array');
+        }
         const clusters = [];
-        const list = Array.isArray(source) ? source : [];
-        if (!list.length) return clusters;
+        if (!source.length) return clusters;
 
         const durationMs = (typeof this.duration === 'number' && isFinite(this.duration) ? this.duration : 0) * 1000;
         if (durationMs <= 0) {
             // Deterministic fail-out: no duration -> no grouping
-            return list.map(evt => ({ anchorMs: evt.timestamp, events: [evt] }));
+            return source.map(evt => ({ anchorMs: evt.timestamp, events: [evt] }));
         }
         const windowMs = Math.max(1, Math.floor(durationMs * VideoPlayer.EVENT_CLUSTER_WINDOW_PERCENT));
 
         let current = null;
-        for (const evt of list) {
+        for (const evt of source) {
             if (!current) {
                 current = { anchorMs: evt.timestamp, events: [evt] };
                 clusters.push(current);
@@ -960,7 +1218,10 @@ class VideoPlayer {
         this.hideEventTooltip();
         
         const iconEl = this.clusterIcons.find(i => i.dataset.clusterId === cluster.id);
-        if (!iconEl) return; // Robustness: skip if icon element not found
+        if (!iconEl) {
+            console.warn('VideoPlayer: Cluster icon not found for cluster', cluster.id);
+            return;
+        }
         
         const tooltip = document.createElement('div');
         tooltip.className = 'event-tooltip';
@@ -982,17 +1243,18 @@ class VideoPlayer {
 
             const playerInfo = document.createElement('span');
             playerInfo.className = 'tooltip-player';
-            
-            const spec = document.createElement('img');
-            spec.className = 'tooltip-spec';
-            try {
-                const specId = this.getPlayerSpecId(evt.data?.playerId);
-                if (window.AssetManager?.getSpecIconPath && specId) {
-                    const p = window.AssetManager.getSpecIconPath(specId);
-                    if (p) spec.src = p;
+
+            // Only create spec icon if we have a valid path
+            const specId = this.getPlayerSpecId(evt.data?.playerId);
+            if (typeof window.AssetManager?.getSpecIconPath === 'function' && specId) {
+                const p = window.AssetManager.getSpecIconPath(specId);
+                if (p) {
+                    const spec = document.createElement('img');
+                    spec.className = 'tooltip-spec';
+                    spec.src = p;
+                    spec.alt = '';
+                    playerInfo.appendChild(spec);
                 }
-            } catch (e) {
-                // Silently ignore spec icon errors
             }
 
             const nameEl = document.createElement('span');
@@ -1006,7 +1268,7 @@ class VideoPlayer {
             desc.className = 'tooltip-description';
             desc.textContent = evt.description;
 
-            playerInfo.append(spec, nameEl, desc);
+            playerInfo.append(nameEl, desc);
 
             // Click row to seek to the event exactly
             row.addEventListener('click', (e) => {
@@ -1132,10 +1394,10 @@ class VideoPlayer {
     }
     
     updateTimeline() {
-        if (!this.duration) return;
-        
+        if (!this.duration || !this.track) return;
+
         const progressPercent = (this.currentTime / this.duration) * 100;
-        
+
         if (this.playhead) {
             this.playhead.style.left = `${progressPercent}%`;
         }
@@ -1164,47 +1426,15 @@ class VideoPlayer {
             this.updateTimeline();
         });
     }
-    
-    seekAt(clientX) {
-        const rect = this.track.getBoundingClientRect();
-        const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
-        this.seek((x / rect.width) * this.duration);
-    }
-    
-    startDraggingAt(clientX) {
-        this.seekAt(clientX);
-        this.isDragging = true;
-        
-        // Industry-standard: use initial track position for horizontal calculations
-        const initialRect = this.track.getBoundingClientRect();
-        
-        const onMove = (e) => {
-            // Use original track position for consistent horizontal mapping
-            // This allows vertical mouse movement without breaking the drag
-            const x = Math.max(0, Math.min(e.clientX - initialRect.left, initialRect.width));
-            this.seek((x / initialRect.width) * this.duration);
-        };
-        
-        const onUp = () => {
-            this.isDragging = false;
-            window.removeEventListener('mousemove', onMove, true);
-            window.removeEventListener('mouseup', onUp, true);
-            window.removeEventListener('blur', onUp, true);
-            document.removeEventListener('mouseleave', onUp, true);
-        };
-        
-        window.addEventListener('mousemove', onMove, true);
-        window.addEventListener('mouseup', onUp, true);
-        window.addEventListener('blur', onUp, true);
-        document.addEventListener('mouseleave', onUp, true);
-    }
-    
+
     // Control methods
     togglePlayPause() {
         if (this.isPlaying) {
             this.video.pause();
         } else {
-            this.video.play();
+            this.video.play().catch(err => {
+                console.warn('VideoPlayer: Failed to play video:', err);
+            });
         }
     }
     
@@ -1221,13 +1451,13 @@ class VideoPlayer {
             // Unmuting: if volume is 0, restore to last non-zero (default max)
             this.video.muted = false;
             if (this.video.volume === 0) {
-                this.setVolume(this.lastNonZeroVolume || 1);
+                this.video.volume = this.lastNonZeroVolume || 1;
             }
         } else {
             // Muting: keep current volume, just mute
             this.video.muted = true;
         }
-        this.updateVolumeControls();
+        // UI updates via volumechange handler; persist explicitly
         this.saveVolume();
     }
     
@@ -1249,17 +1479,20 @@ class VideoPlayer {
     }
     
     setVolume(volume, isUserDragging = false) {
-        this.video.volume = volume;
-        this.video.muted = volume === 0;
-        // Track last meaningful volume (not micro-movements during drag)
-        // Only update if explicitly setting volume or if it's a significant value
-        if (!isUserDragging && volume > 0) {
-            this.lastNonZeroVolume = volume;
-        } else if (isUserDragging && volume > 0.1) {
-            // During drag, only update for values above 10%
-            this.lastNonZeroVolume = volume;
+        // Programmer contract: volume must be a finite number
+        if (!Number.isFinite(volume)) {
+            throw new Error(`VideoPlayer: setVolume called with invalid value: ${volume}`);
         }
-        this.updateVolumeControls();
+        const clampedVolume = Math.max(0, Math.min(1, volume));
+        this.video.volume = clampedVolume;
+        this.video.muted = clampedVolume === 0;
+        // Track last meaningful volume (not micro-movements during drag)
+        if (!isUserDragging && clampedVolume > 0) {
+            this.lastNonZeroVolume = clampedVolume;
+        } else if (isUserDragging && clampedVolume > 0.1) {
+            this.lastNonZeroVolume = clampedVolume;
+        }
+        // UI updates via volumechange handler; persist explicitly
         this.saveVolume();
     }
 
@@ -1271,24 +1504,56 @@ class VideoPlayer {
         thumbEl.style.left = `${percent * rect.width}px`;
     }
     
+    /**
+     * Get current speed index. Assumes invariant: playback rate is always in PLAYBACK_SPEEDS.
+     * Invariant enforced by rateChangeHandler.
+     */
+    getSpeedIndex() {
+        const speeds = VideoPlayer.PLAYBACK_SPEEDS;
+        const idx = speeds.indexOf(this.video.playbackRate);
+        if (idx === -1) {
+            throw new Error(`VideoPlayer: Invariant violation - playback rate ${this.video.playbackRate} not in PLAYBACK_SPEEDS`);
+        }
+        return idx;
+    }
+
     cyclePlaybackSpeed() {
-        const speeds = [0.25, 0.5, 1, 1.5, 2];
-        const currentIndex = speeds.indexOf(this.playbackRate);
+        const speeds = VideoPlayer.PLAYBACK_SPEEDS;
+        const currentIndex = this.getSpeedIndex();
         const nextIndex = (currentIndex + 1) % speeds.length;
-        
         this.video.playbackRate = speeds[nextIndex];
     }
-    
+
+    decreasePlaybackSpeed() {
+        const speeds = VideoPlayer.PLAYBACK_SPEEDS;
+        const currentIndex = this.getSpeedIndex();
+        if (currentIndex > 0) {
+            this.video.playbackRate = speeds[currentIndex - 1];
+        }
+    }
+
+    increasePlaybackSpeed() {
+        const speeds = VideoPlayer.PLAYBACK_SPEEDS;
+        const currentIndex = this.getSpeedIndex();
+        if (currentIndex < speeds.length - 1) {
+            this.video.playbackRate = speeds[currentIndex + 1];
+        }
+    }
+
     updateSpeedButton() {
-        this.speedBtn.textContent = `${this.playbackRate}x`;
+        this.speedBtn.textContent = `${this.video.playbackRate}x`;
     }
     
     
     toggleFullscreen() {
         if (document.fullscreenElement) {
-            document.exitFullscreen();
+            document.exitFullscreen().catch(err => {
+                console.warn('VideoPlayer: Failed to exit fullscreen:', err);
+            });
         } else {
-            this.container.requestFullscreen();
+            this.container.requestFullscreen().catch(err => {
+                console.warn('VideoPlayer: Failed to enter fullscreen:', err);
+            });
         }
     }
     
@@ -1322,17 +1587,22 @@ class VideoPlayer {
             const saved = localStorage.getItem('videoPlayerVolume');
             if (saved) {
                 const parsed = JSON.parse(saved);
-                return {
-                    volume: typeof parsed.volume === 'number' ? Math.max(0, Math.min(1, parsed.volume)) : 1,
-                    muted: typeof parsed.muted === 'boolean' ? parsed.muted : false
-                };
+                const volumeValid = Number.isFinite(parsed.volume);
+                const mutedValid = typeof parsed.muted === 'boolean';
+                // Warn if saved data has invalid fields
+                if (!volumeValid || !mutedValid) {
+                    console.warn('VideoPlayer: Invalid saved volume preferences, using defaults:', parsed);
+                }
+                const volume = volumeValid ? Math.max(0, Math.min(1, parsed.volume)) : 1;
+                const muted = mutedValid ? parsed.muted : false;
+                return { volume, muted };
             }
         } catch (e) {
-            // Ignore localStorage errors (e.g., private browsing)
+            console.warn('VideoPlayer: Failed to load volume preferences:', e);
         }
         return { volume: 1, muted: false };
     }
-    
+
     saveVolume() {
         try {
             localStorage.setItem('videoPlayerVolume', JSON.stringify({
@@ -1340,7 +1610,7 @@ class VideoPlayer {
                 muted: this.video.muted
             }));
         } catch (e) {
-            // Ignore localStorage errors (e.g., private browsing)
+            console.warn('VideoPlayer: Failed to save volume preferences:', e);
         }
     }
     
@@ -1352,17 +1622,20 @@ class VideoPlayer {
             window.removeEventListener('keydown', this._onKeyDown, true);
             this._onKeyDown = null;
         }
-        
-        // Pause video and release its resources
+
+        // Clean up any active drag (releases pointer capture and window listeners)
+        if (this._activeDragCleanup) {
+            this._activeDragCleanup();
+        }
+
+        // Pause video, remove listeners, and release resources
         if (this.video) {
             this.video.pause();
+            for (const [eventType, handler] of this.boundEventHandlers) {
+                this.video.removeEventListener(eventType, handler);
+            }
             this.video.removeAttribute('src');
             this.video.load();
-        }
-        
-        // Remove all video event listeners
-        for (const [eventType, handler] of this.boundEventHandlers) {
-            this.video.removeEventListener(eventType, handler);
         }
         this.boundEventHandlers.clear();
         
@@ -1370,22 +1643,30 @@ class VideoPlayer {
         this.clearEventMarkers();
         this.closeFilterPanel();
         if (this.eventsObserver) {
-            try { this.eventsObserver.disconnect(); } catch (_) {}
+            this.eventsObserver.disconnect();
             this.eventsObserver = null;
         }
         if (this._eventRepositionRafId) {
             cancelAnimationFrame(this._eventRepositionRafId);
             this._eventRepositionRafId = null;
         }
-        
+        if (this._timelineRafId) {
+            cancelAnimationFrame(this._timelineRafId);
+            this._timelineRafId = null;
+        }
+
         // Clean up DOM elements and their event listeners
         if (this.footer) {
             this.footer.remove();
             this.footer = null;
         }
         if (this._resizeObserver) {
-            try { this._resizeObserver.disconnect(); } catch (_) {}
+            this._resizeObserver.disconnect();
             this._resizeObserver = null;
+        }
+        if (this._footerResizeObserver) {
+            this._footerResizeObserver.disconnect();
+            this._footerResizeObserver = null;
         }
         if (this._onResize) {
             window.removeEventListener('resize', this._onResize, true);
@@ -1396,7 +1677,7 @@ class VideoPlayer {
             this._onFullscreen = null;
         }
         if (this._volumeObserver) {
-            try { this._volumeObserver.disconnect(); } catch (_) {}
+            this._volumeObserver.disconnect();
             this._volumeObserver = null;
         }
         
@@ -1405,13 +1686,19 @@ class VideoPlayer {
         this.timelineRow = null;
         this.controlsBar = null;
         this.track = null;
+        this.played = null;
         this.playhead = null;
+        this.hitbox = null;
         this.currentTimeDisplay = null;
         this.durationDisplay = null;
         this.playPauseBtn = null;
         this.muteBtn = null;
-        this.volumeSlider = null;
+        this._volumeTrack = null;
+        this._volumeLevel = null;
+        this._volumeThumb = null;
         this.speedBtn = null;
         this.filterBtn = null;
     }
 }
+
+window.VideoPlayer = VideoPlayer;

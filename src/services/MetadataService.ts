@@ -9,6 +9,7 @@ import { MatchMetadata } from '../match-detection/types/MatchMetadata';
 import { MetadataStorageService } from './MetadataStorageService';
 import { generateMatchHash } from '../match-detection/utils/MatchHashGenerator';
 import { EarlyEndTrigger, getTriggerMessage } from '../match-detection/types/EarlyEndTriggers';
+import { activeFlavor } from '../config/wowFlavor';
 
 /**
  * Service responsible for pure match metadata data operations.
@@ -58,6 +59,7 @@ export class MetadataService {
       lastUpdatedAt: now,
       bufferId: bufferId, // Store for correlation throughout lifecycle
       uploadStatus: UploadStatus.PENDING,
+      wowFlavor: activeFlavor.id,
     };
 
     // Save using bufferId filename (stable throughout lifecycle)
@@ -142,19 +144,31 @@ export class MetadataService {
 
   /**
    * Phase 2: Mark match as validation failed (structural issues).
-   * Always enriches with parsed metadata so invalid matches retain full data for inspection.
+   * If metadata is provided, enriches with parsed metadata so invalid matches retain full data for inspection.
+   * @returns true if status was persisted to disk, false if stored metadata not found
+   * @throws On catastrophic load failures (unreadable directory) or save failures (validation/IO)
    */
   public async markMatchValidationFailed(
     bufferId: string,
     trigger: string,
     reason: string,
     metadata?: MatchMetadata
-  ): Promise<void> {
-    let storedMetadata = await this.metadataStorageService.loadMatchByBufferId(bufferId);
-    if (!storedMetadata) {
-      console.warn(`[MetadataService] No metadata found for bufferId: ${bufferId}`);
-      return;
+  ): Promise<boolean> {
+    const { match: storedMetadataResult, scanErrors } =
+      await this.metadataStorageService.loadMatchByBufferIdWithDiagnostics(bufferId);
+
+    if (!storedMetadataResult) {
+      if (scanErrors.length > 0) {
+        console.error(`[MetadataService] Failed to load metadata for bufferId: ${bufferId}`, {
+          scanErrors,
+        });
+      } else {
+        console.warn(`[MetadataService] No metadata found for bufferId: ${bufferId}`);
+      }
+      return false;
     }
+
+    let storedMetadata = storedMetadataResult;
 
     console.info('[MetadataService] Status transition:', {
       operation: 'markMatchValidationFailed',
@@ -166,8 +180,7 @@ export class MetadataService {
       hasEnrichment: !!metadata,
     });
 
-    // CRITICAL: Enrich with full parsed metadata even for invalid matches
-    // This preserves players, shuffleRounds, etc. for inspection
+    // If metadata provided, enrich to preserve players, shuffleRounds, etc. for inspection
     if (metadata) {
       storedMetadata = await this.enrichMetadata(bufferId, metadata);
     }
@@ -186,6 +199,8 @@ export class MetadataService {
       playerCount: storedMetadata.matchData.players?.length || 0,
       shuffleRoundCount: storedMetadata.matchData.shuffleRounds?.length || 0,
     });
+
+    return true;
   }
 
   /**
@@ -282,6 +297,26 @@ export class MetadataService {
     videoData: VideoMetadataUpdate
   ): Promise<void> {
     await this.metadataStorageService.updateVideoMetadataByBufferId(bufferId, videoData);
+  }
+
+  /**
+   * Mark recording as deleted by quota enforcement using video file path.
+   * @returns Number of matches updated
+   */
+  public async markRecordingDeletedByQuotaByVideoPath(videoFilePath: string): Promise<number> {
+    return this.metadataStorageService.markRecordingDeletedByQuotaByVideoPath(videoFilePath);
+  }
+
+  /**
+   * List all favourite video paths with explicit error reporting.
+   * Used by RecordingService to build protected set for quota enforcement.
+   * @returns Object with normalized video paths Set and scanErrors array
+   */
+  public async listFavouriteVideoPathsWithDiagnostics(): Promise<{
+    paths: Set<string>;
+    scanErrors: Array<{ file: string; error: string }>;
+  }> {
+    return this.metadataStorageService.listFavouriteVideoPathsWithDiagnostics();
   }
 
   /**

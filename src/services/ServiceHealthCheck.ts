@@ -12,7 +12,7 @@ import { EventEmitter } from 'events';
 export class ServiceHealthCheck extends EventEmitter {
   // Configuration constants
   private static readonly HEALTH_CHECK_TIMEOUT_MS = 5000;
-  private static readonly HEALTH_CHECK_ID_PREFIX = 'health-check-';
+  private static readonly DEFAULT_HEALTH_ENDPOINT = '/health';
 
   private lastCheckResult: boolean = false;
   private lastCheckTime: number = 0;
@@ -20,7 +20,7 @@ export class ServiceHealthCheck extends EventEmitter {
   constructor(
     private apiBaseUrl: string,
     private headersProvider: ApiHeadersProvider,
-    private jobStatusEndpoint: string = '/api/upload/job-status'
+    private healthCheckEndpoint: string = ServiceHealthCheck.DEFAULT_HEALTH_ENDPOINT
   ) {
     super();
     console.info('[ServiceHealthCheck] Initialized with event-driven health tracking');
@@ -42,7 +42,8 @@ export class ServiceHealthCheck extends EventEmitter {
 
   /**
    * Report failed API call - service may be unavailable
-   * Only report down for network errors or 5xx responses
+   * Callers pass `true` when a failure should transition the service to unavailable.
+   * Some API callers still treat expected 4xx responses as non-health failures.
    */
   reportFailure(isNetworkOrServerError: boolean = true): void {
     if (!isNetworkOrServerError) {
@@ -90,30 +91,24 @@ export class ServiceHealthCheck extends EventEmitter {
    */
   async checkOnce(): Promise<boolean> {
     try {
-      // Generate a unique health check job ID
-      const healthCheckJobId = `${ServiceHealthCheck.HEALTH_CHECK_ID_PREFIX}${Date.now()}`;
-      
       const headers = this.headersProvider.getHeaders();
       await axios.get(
-        `${this.apiBaseUrl}${this.jobStatusEndpoint}/${healthCheckJobId}`,
+        `${this.apiBaseUrl}${this.healthCheckEndpoint}`,
         {
           headers,
           timeout: ServiceHealthCheck.HEALTH_CHECK_TIMEOUT_MS
         }
       );
       
-      // Even 404 means service is responding
       this.reportSuccess();
       return true;
     } catch (error) {
       if (axios.isAxiosError(error)) {
         if (error.response) {
-          // 4xx responses mean service is available
-          if (error.response.status >= 400 && error.response.status < 500) {
-            this.reportSuccess();
-            return true;
-          }
-          // 5xx responses mean service error
+          console.warn('[ServiceHealthCheck] Health endpoint returned unexpected status', {
+            status: error.response.status,
+            endpoint: this.healthCheckEndpoint,
+          });
           this.reportFailure(true);
           return false;
         }

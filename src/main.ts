@@ -1,4 +1,14 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, shell, Tray, powerMonitor } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  Menu,
+  shell,
+  Tray,
+  powerMonitor,
+  screen,
+} from 'electron';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
 import * as path from 'path';
@@ -36,7 +46,9 @@ import {
   AddonManager,
   AddonInstallationResult,
 } from './wowInstallation';
-import { AuthManager, AuthConfig, AuthToken, UserInfo } from './authManager';
+import { activeFlavor } from './config/wowFlavor';
+import { AuthManager, AuthConfig } from './authManager';
+import type { AuthToken, UserInfo } from './authTypes';
 import {
   MatchDetectionService,
   MatchDetectionServiceConfig,
@@ -49,7 +61,19 @@ import { MetadataService } from './services/MetadataService';
 import { MatchLifecycleService } from './services/MatchLifecycleService';
 import { RecordingService, RecordingServiceConfig } from './services/RecordingService';
 import { AnalysisEnrichmentService, AnalysisPayload } from './services/AnalysisEnrichmentService';
-import { SettingsService, AppSettings } from './services/SettingsService';
+import { LogExportService, LogExportResult } from './services/LogExportService';
+import {
+  SettingsService,
+  AppSettings,
+  WindowBounds,
+  MIN_WINDOW_WIDTH,
+  MIN_WINDOW_HEIGHT,
+} from './services/SettingsService';
+import { getEffectiveRecordingDirectory } from './utils/recordingPathUtils';
+import { AppError, isAppError, isNodeError } from './utils/errors';
+import { isValidBufferId } from './utils/bufferId';
+import { toSafeAxiosErrorLog } from './utils/errorRedaction';
+import type { RevealResult, RecordingInfoResult } from './ipc/ipcTypes';
 import {
   Resolution,
   RESOLUTION_DIMENSIONS,
@@ -70,7 +94,7 @@ import {
   CompletionPollingService,
   CompletionPollingConfig,
 } from './services/CompletionPollingService';
-import { UploadStatus, RecordingStatusType } from './match-detection/types/StoredMatchTypes';
+import { UploadStatus, StoredMatchMetadata } from './match-detection/types/StoredMatchTypes';
 import {
   MatchStartedEvent,
   MatchEndedEvent,
@@ -79,13 +103,16 @@ import {
 import type { MatchEndedIncompleteEvent } from './match-detection/types/MatchEvent';
 import { EarlyEndTrigger, getTriggerMessage } from './match-detection/types/EarlyEndTriggers';
 import { isCombatLogExpiredError } from './match-detection/types/PipelineErrors';
+import type { JobRetryPayload } from './match-detection/types/JobRetryPayload';
 import { MatchProcessedPayload } from './match-detection/MatchDetectionOrchestrator';
 import {
   WoWProcessMonitorError,
   getErrorDetails,
 } from './process-monitoring/WoWProcessMonitorErrors';
 import { ExpirationConfig } from './config/ExpirationConfig';
+import { ChunkRetentionConfig } from './config/ChunkRetentionConfig';
 import { FreemiumQuotaFields } from './Freemium';
+import { inferEncoderTypeFromId } from './services/obs/encoderResolver';
 
 // Event payload interfaces for improved type safety
 interface AnalysisJobCreatedPayload {
@@ -108,7 +135,7 @@ interface AnalysisCompletedPayload extends FreemiumQuotaFields {
   analysisId?: string; // Optional string - normalized at boundary, undefined for non-auth users
   matchHash: string;
   analysisPayload?: AnalysisPayload; // Optional - only present for entitled users (premium or freemium)
-  isSkillCappedViewer?: boolean;
+  isPremiumViewer?: boolean;
 }
 
 interface AnalysisFailedPayload {
@@ -127,13 +154,6 @@ interface AnalysisTimeoutPayload {
   attempts?: number;
 }
 
-interface JobRetryPayload {
-  matchHash: string;
-  attempt: number;
-  delayMs: number;
-  errorType: string;
-}
-
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (require('electron-squirrel-startup')) {
   app.quit();
@@ -142,6 +162,11 @@ if (require('electron-squirrel-startup')) {
 // Set the app name for userData directory (changes %APPDATA%/Electron to %APPDATA%/arenacoach-desktop)
 app.setName('arenacoach-desktop');
 
+/**
+ * Validates and normalizes a file path from IPC boundary.
+ * Checks: type, length, null bytes, absolute path.
+ * NOTE: Does NOT enforce containment - caller must verify path is within allowed directories.
+ */
 function validateFilePath(filePath: unknown): string {
   if (typeof filePath !== 'string') {
     throw new Error('Invalid input: file path must be a string');
@@ -151,13 +176,14 @@ function validateFilePath(filePath: unknown): string {
     throw new Error('Invalid input: file path must be 1-1000 characters');
   }
 
-  // Prevent path traversal attacks
-  const normalizedPath = path.normalize(filePath);
-  if (normalizedPath.includes('..') || normalizedPath.includes('\x00')) {
-    throw new Error('Invalid input: path traversal attempts detected');
+  // Reject null bytes (path injection)
+  if (filePath.includes('\x00')) {
+    throw new Error('Invalid input: path contains null bytes');
   }
 
-  // Ensure path is absolute (safer for file operations)
+  const normalizedPath = path.normalize(filePath);
+
+  // Ensure path is absolute (required for containment checks)
   if (!path.isAbsolute(normalizedPath)) {
     throw new Error('Invalid input: path must be absolute');
   }
@@ -173,11 +199,17 @@ class ArenaCoachDesktop {
   private static readonly POLLING_INTERVAL_MS = 5000; // 5 seconds for job polling
   private static readonly SERVICE_STATUS_INTERVAL_MS = 5000; // 5 seconds for service status updates
   private static readonly UPLOAD_ENDPOINT = '/api/upload';
-  private static readonly JOB_STATUS_ENDPOINT = '/api/upload/job-status';
   private static readonly IDLE_CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes for idle health checks
+  private static readonly RECORDING_RECOVERY_DELAY_MS = 2000;
+  private static readonly RECORDING_RECOVERY_MAX_ATTEMPTS = 3;
 
-  // Recording constants - matches OBS recorder default
-  private static readonly DEFAULT_RECORDING_SUBDIR = 'ArenaCoach/Recordings';
+  // Non-terminal upload statuses: matches in these states should not be deleted and may be expired
+  private static readonly NON_TERMINAL_UPLOAD_STATUSES = new Set([
+    UploadStatus.PENDING,
+    UploadStatus.UPLOADING,
+    UploadStatus.QUEUED,
+    UploadStatus.PROCESSING,
+  ]);
 
   private mainWindow: BrowserWindow | null = null;
   private tray: Tray | null = null;
@@ -193,6 +225,7 @@ class ArenaCoachDesktop {
   private analysisEnrichmentService!: AnalysisEnrichmentService;
   private settingsService: SettingsService;
   private chunkCleanupService: ChunkCleanupService;
+  private logExportService: LogExportService;
 
   // New decomposed services
   private apiHeadersProvider!: ApiHeadersProvider;
@@ -219,6 +252,10 @@ class ArenaCoachDesktop {
   // Recording recovery state
   private isRecoveringRecording: boolean = false;
   private lastRecordingRecoveryAt: number = 0;
+  private recordingRecoveryAttemptsThisSession: number = 0;
+  private recordingRecoveryDisabledForSession: boolean = false;
+  private pendingRecordingRecovery: { requestedAt: number; attempts: number } | null = null;
+  private recordingRecoveryTimeoutId: NodeJS.Timeout | null = null;
 
   // WoW installation status tracking for addon sync
   private latestWoWInstallations: WoWInstallation[] = [];
@@ -305,7 +342,6 @@ class ArenaCoachDesktop {
     // Initialize auth manager
     const authConfig: AuthConfig = {
       apiBaseUrl: this.apiBaseUrl,
-      clientId: 'arenacoach-desktop-app',
     };
     this.authManager = new AuthManager(authConfig);
 
@@ -316,6 +352,8 @@ class ArenaCoachDesktop {
     const matchDetectionConfig: MatchDetectionServiceConfig = {
       apiBaseUrl: this.apiBaseUrl,
       enableWoWProcessMonitoring: !this.isUIDevMode,
+      isSkirmishTrackingEnabled: () =>
+        this.settingsService.getSettings().enabledBrackets.skirmish !== false,
     };
     this.matchDetectionService = new MatchDetectionService(matchDetectionConfig);
 
@@ -328,6 +366,9 @@ class ArenaCoachDesktop {
 
     // Initialize chunk cleanup service for managing chunk files
     this.chunkCleanupService = new ChunkCleanupService();
+
+    // Initialize log export service for debug data export
+    this.logExportService = new LogExportService();
 
     // Setup non-async services immediately
     this.setupApp();
@@ -369,9 +410,14 @@ class ArenaCoachDesktop {
     if (!this.recordingService) return;
     if (this.isRecoveringRecording) return;
     if (this.isQuitting) return; // do nothing while quitting
+    if (this.settingsService.getSettings().recordingEnabled === false) return;
+    if (reason === 'error') {
+      if (this.matchDetectionService.getCurrentMatch()) return;
+      if (this.ongoingFinalizations.size > 0) return;
+    }
     // Debounce to once per 60s
     const now = Date.now();
-    if (now - this.lastRecordingRecoveryAt < 60000) return;
+    if (reason === 'resume' && now - this.lastRecordingRecoveryAt < 60000) return;
 
     this.isRecoveringRecording = true;
     this.lastRecordingRecoveryAt = now;
@@ -381,18 +427,32 @@ class ArenaCoachDesktop {
       const status = await this.recordingService.getStatus();
       // If actively recording, perform only a soft refresh to avoid disruption
       if (status.isRecording) {
-        await this.applyPersistedRecordingSettings();
-        console.info('[Main] Soft-refreshed recording settings during active recording');
+        const applyResult = await this.applyPersistedRecordingSettings();
+        if (applyResult.success) {
+          console.info('[Main] Soft-refreshed recording settings during active recording');
+        } else {
+          console.warn('[Main] Soft-refresh settings failed during recording:', applyResult.error);
+        }
       } else if (!status.isInitialized) {
         await this.recordingService.initialize();
         if (this.mainWindow) {
           this.recordingService.setMainWindow(this.mainWindow);
         }
-        await this.applyPersistedRecordingSettings();
-        console.info('[Main] Recording service reinitialized');
+        const applyResult = await this.applyPersistedRecordingSettings();
+        if (applyResult.success) {
+          console.info('[Main] Recording service reinitialized');
+        } else {
+          console.warn(
+            '[Main] Recording reinitialized but settings apply failed:',
+            applyResult.error
+          );
+        }
       } else {
         // Soft-refresh settings to ensure sources are valid after resume
-        await this.applyPersistedRecordingSettings();
+        const applyResult = await this.applyPersistedRecordingSettings();
+        if (!applyResult.success) {
+          console.warn('[Main] Soft-refresh settings failed:', applyResult.error);
+        }
       }
     } catch (e) {
       console.warn('[Main] Soft recovery failed, considering full restart...', e);
@@ -405,8 +465,15 @@ class ArenaCoachDesktop {
           if (this.mainWindow) {
             this.recordingService.setMainWindow(this.mainWindow);
           }
-          await this.applyPersistedRecordingSettings();
-          console.info('[Main] Recording service fully restarted');
+          const applyResult = await this.applyPersistedRecordingSettings();
+          if (applyResult.success) {
+            console.info('[Main] Recording service fully restarted');
+          } else {
+            console.warn(
+              '[Main] Recording restarted but settings apply failed:',
+              applyResult.error
+            );
+          }
         } else {
           console.info('[Main] Skipping restart while recording; will rely on soft refresh');
         }
@@ -415,7 +482,136 @@ class ArenaCoachDesktop {
       }
     } finally {
       this.isRecoveringRecording = false;
+      if (reason === 'resume') {
+        this.flushPendingRecordingRecovery('retry');
+      }
     }
+  }
+
+  private clearRecordingRecoveryState(): void {
+    if (this.recordingRecoveryTimeoutId) {
+      clearTimeout(this.recordingRecoveryTimeoutId);
+      this.recordingRecoveryTimeoutId = null;
+    }
+    this.pendingRecordingRecovery = null;
+  }
+
+  private requestRecordingRecoveryDueToFatalObsIpc(error: Error): void {
+    if (!this.recordingService) return;
+    if (this.settingsService.getSettings().recordingEnabled === false) return;
+    if (this.recordingRecoveryDisabledForSession) return;
+    if (
+      this.recordingRecoveryAttemptsThisSession >=
+      ArenaCoachDesktop.RECORDING_RECOVERY_MAX_ATTEMPTS
+    ) {
+      this.recordingRecoveryDisabledForSession = true;
+      this.clearRecordingRecoveryState();
+      return;
+    }
+
+    if (!this.pendingRecordingRecovery) {
+      this.pendingRecordingRecovery = { requestedAt: Date.now(), attempts: 0 };
+      console.warn('[Main] Fatal OBS IPC error detected; recording recovery requested', error);
+    }
+
+    this.flushPendingRecordingRecovery('obsError');
+  }
+
+  private flushPendingRecordingRecovery(
+    context: 'obsError' | 'matchEnded' | 'matchEndedIncomplete' | 'retry'
+  ): void {
+    if (!this.pendingRecordingRecovery) return;
+    if (!this.recordingService) {
+      this.clearRecordingRecoveryState();
+      return;
+    }
+    if (this.isQuitting) return;
+    if (this.settingsService.getSettings().recordingEnabled === false) {
+      this.clearRecordingRecoveryState();
+      return;
+    }
+    if (this.recordingRecoveryDisabledForSession) {
+      this.clearRecordingRecoveryState();
+      return;
+    }
+    if (this.matchDetectionService.getCurrentMatch()) return;
+    if (this.ongoingFinalizations.size > 0) return;
+    if (this.recordingRecoveryTimeoutId) {
+      if (context === 'matchEnded' || context === 'matchEndedIncomplete') {
+        clearTimeout(this.recordingRecoveryTimeoutId);
+        this.recordingRecoveryTimeoutId = null;
+      } else {
+        return;
+      }
+    }
+
+    if (
+      this.recordingRecoveryAttemptsThisSession >=
+      ArenaCoachDesktop.RECORDING_RECOVERY_MAX_ATTEMPTS
+    ) {
+      const pendingAgeMs = Date.now() - this.pendingRecordingRecovery.requestedAt;
+      console.warn('[Main] Recording recovery max attempts reached; leaving recording disabled', {
+        attempts: this.recordingRecoveryAttemptsThisSession,
+        pendingAttempts: this.pendingRecordingRecovery.attempts,
+        pendingAgeMs,
+      });
+      this.pendingRecordingRecovery = null;
+      this.recordingRecoveryDisabledForSession = true;
+      return;
+    }
+
+    const delayMs =
+      context === 'matchEnded' || context === 'matchEndedIncomplete'
+        ? 0
+        : ArenaCoachDesktop.RECORDING_RECOVERY_DELAY_MS;
+
+    this.recordingRecoveryTimeoutId = setTimeout(() => {
+      void (async () => {
+        this.recordingRecoveryTimeoutId = null;
+
+        if (!this.pendingRecordingRecovery) return;
+        if (!this.recordingService) {
+          this.pendingRecordingRecovery = null;
+          return;
+        }
+        if (this.isQuitting) return;
+        if (this.settingsService.getSettings().recordingEnabled === false) {
+          this.pendingRecordingRecovery = null;
+          return;
+        }
+        if (this.recordingRecoveryDisabledForSession) {
+          this.pendingRecordingRecovery = null;
+          return;
+        }
+        if (this.matchDetectionService.getCurrentMatch()) return;
+        if (this.ongoingFinalizations.size > 0) return;
+        if (this.isRecoveringRecording) return;
+
+        this.pendingRecordingRecovery.attempts += 1;
+        this.recordingRecoveryAttemptsThisSession += 1;
+        try {
+          await this.recoverRecordingService('error');
+        } catch (recoveryError) {
+          console.error('[Main] Recording recovery attempt failed:', recoveryError);
+        }
+
+        if (!this.recordingService) return;
+
+        try {
+          const status = await this.recordingService.getStatus();
+          if (status.isInitialized && status.isEnabled) {
+            this.pendingRecordingRecovery = null;
+            return;
+          }
+        } catch (statusError) {
+          console.warn('[Main] Recording recovery status check failed:', statusError);
+        }
+
+        this.flushPendingRecordingRecovery('retry');
+      })().catch(unexpectedError => {
+        console.error('[Main] Unexpected error in recording recovery scheduler:', unexpectedError);
+      });
+    }, delayMs);
   }
 
   private setupApp(): void {
@@ -509,14 +705,21 @@ class ArenaCoachDesktop {
         // Check for updates after main window is ready and services initialized
         this.waitForMainWindowReady().then(() => {
           // Check immediately for downloaded updates, then check for new ones
-          this.checkUpdateState();
+          this.checkUpdateState().catch(error => {
+            // Log only - autoUpdater.on('error') is the canonical emission path
+            console.error('Update check failed:', error);
+          });
         });
       });
 
       // Check for updates every 4 hours
       this.updateIntervalId = setInterval(
         () => {
-          autoUpdater.checkForUpdatesAndNotify();
+          // Use checkUpdateState for consistent error handling
+          // Errors are emitted via autoUpdater.on('error') - just prevent unhandled rejection here
+          this.checkUpdateState().catch(error => {
+            console.error('Periodic update check failed:', error);
+          });
         },
         4 * 60 * 60 * 1000
       );
@@ -574,34 +777,32 @@ class ArenaCoachDesktop {
   }
 
   private async checkUpdateState(): Promise<void> {
-    try {
-      // Check if update is already downloaded and ready
-      // If so, show banner immediately; otherwise check for new updates
-      const result = await autoUpdater.checkForUpdatesAndNotify();
+    // Check if update is already downloaded and ready
+    // If so, show banner immediately; otherwise check for new updates
+    const result = await autoUpdater.checkForUpdatesAndNotify();
 
-      // Note: autoUpdater.checkForUpdatesAndNotify() will trigger the appropriate events:
-      // - If update already downloaded: 'update-downloaded' event fires
-      // - If new update available: 'update-available' -> download -> 'update-downloaded'
-      // - If no updates: 'update-not-available' event fires
+    // Note: autoUpdater.checkForUpdatesAndNotify() will trigger the appropriate events:
+    // - If update already downloaded: 'update-downloaded' event fires
+    // - If new update available: 'update-available' -> download -> 'update-downloaded'
+    // - If no updates: 'update-not-available' event fires
+    // - On error: 'error' event fires (already wired to emit 'updater:error' to renderer)
 
-      console.info('Update check completed:', result);
-    } catch (error) {
-      console.error('Update check failed:', error);
-      // Silent failure - don't interrupt user experience
-    }
+    console.info('Update check completed:', result);
   }
 
   private createMainWindow(): void {
-    // Get saved window bounds
+    // Get saved window bounds (defaults to optimal first-run size from DEFAULT_SETTINGS)
     const savedBounds = this.settingsService.getWindowBounds();
+
+    // Normalize bounds to fit within OS work area
+    const safeBounds = this.getSafeWindowBounds(savedBounds);
 
     // Create the browser window (Windows frameless)
     this.mainWindow = new BrowserWindow({
-      ...savedBounds, // Use saved position and size
-      minWidth: 1400,
-      minHeight: 900, // Minimum height requirement
-      width: 1650, // Default width for 4-column layout
-      height: 1000, // Default height for optimal 4-row card layout
+      ...safeBounds, // Use normalized position and size
+      // Never set a minimum larger than the current safe window size (small displays)
+      minWidth: Math.min(MIN_WINDOW_WIDTH, safeBounds.width),
+      minHeight: Math.min(MIN_WINDOW_HEIGHT, safeBounds.height),
       frame: false, // Remove native Windows frame and title bar
       webPreferences: {
         nodeIntegration: false,
@@ -626,11 +827,18 @@ class ArenaCoachDesktop {
       this.debouncedSaveWindowBounds();
     });
 
-    // Handle window close - minimize to tray instead of quit
+    // Handle window close - minimize to tray or quit based on setting
     this.mainWindow.on('close', event => {
       if (!this.isQuitting) {
-        event.preventDefault();
-        this.mainWindow?.hide();
+        const settings = this.settingsService.getSettings();
+        if (settings.minimizeToTray) {
+          event.preventDefault();
+          this.mainWindow?.hide();
+        } else {
+          // Hide window immediately then quit (same behavior as tray Exit)
+          this.mainWindow?.hide();
+          app.quit();
+        }
       }
     });
 
@@ -793,49 +1001,205 @@ class ArenaCoachDesktop {
     });
   }
 
+  /**
+   * Normalize window bounds to fit within the OS work area.
+   * Prevents windows from landing behind taskbar or off-screen.
+   */
+  private getSafeWindowBounds(rawBounds: WindowBounds): Electron.Rectangle {
+    const minWidth = MIN_WINDOW_WIDTH;
+    const minHeight = MIN_WINDOW_HEIGHT;
+
+    // Determine target display using rawBounds position, fallback to primary
+    let display: Electron.Display;
+    if (rawBounds.x !== undefined && rawBounds.y !== undefined) {
+      display = screen.getDisplayMatching({
+        x: rawBounds.x,
+        y: rawBounds.y,
+        width: rawBounds.width,
+        height: rawBounds.height,
+      });
+    } else {
+      display = screen.getPrimaryDisplay();
+    }
+
+    const workArea = display.workArea;
+
+    // Clamp dimensions (never exceed work area; degrade gracefully on small displays)
+    const width = Math.min(workArea.width, Math.max(minWidth, rawBounds.width));
+    const height = Math.min(workArea.height, Math.max(minHeight, rawBounds.height));
+
+    // Clamp position if provided, otherwise center in work area
+    let x: number;
+    let y: number;
+    if (rawBounds.x !== undefined && rawBounds.y !== undefined) {
+      x = Math.max(workArea.x, Math.min(rawBounds.x, workArea.x + workArea.width - width));
+      y = Math.max(workArea.y, Math.min(rawBounds.y, workArea.y + workArea.height - height));
+    } else {
+      x = workArea.x + Math.floor((workArea.width - width) / 2);
+      y = workArea.y + Math.floor((workArea.height - height) / 2);
+    }
+
+    return { x, y, width, height };
+  }
+
   private saveWindowBounds(): void {
     if (!this.mainWindow || this.mainWindow.isDestroyed()) {
       return;
     }
 
-    const bounds = this.mainWindow.getBounds();
-    this.settingsService.saveWindowBounds(bounds);
+    // Use getNormalBounds() when maximized/fullscreen to avoid persisting maximized geometry
+    let bounds: Electron.Rectangle;
+    if (this.mainWindow.isMaximized() || this.mainWindow.isFullScreen()) {
+      bounds = this.mainWindow.getNormalBounds();
+    } else {
+      bounds = this.mainWindow.getBounds();
+    }
+
+    // Clamp to minimums to prevent schema validation errors
+    const clampedBounds = {
+      x: bounds.x,
+      y: bounds.y,
+      width: Math.max(MIN_WINDOW_WIDTH, bounds.width),
+      height: Math.max(MIN_WINDOW_HEIGHT, bounds.height),
+    };
+    this.settingsService.saveWindowBounds(clampedBounds);
+  }
+
+  /**
+   * Get the effective recording directory based on settings.
+   * Delegates to SSoT function from utils/recordingPathUtils.
+   */
+  private getRecordingDirectoryFromSettings(): string {
+    const settings = this.settingsService.getSettings();
+    return getEffectiveRecordingDirectory(settings.recordingLocation, app.getPath('videos'));
+  }
+
+  /**
+   * Reveal a file in the OS file manager (Explorer/Finder) with security validation.
+   * Only allows paths under userData/logs or downloads.
+   * Uses realpath to prevent symlink escape attacks.
+   * Accepts unknown for safe IPC boundary handling.
+   *
+   * NOTE: Recordings must use ID-based IPC handlers (recording:revealVideoInFolder,
+   * recording:revealThumbnailInFolder) which resolve paths from metadata in main process.
+   *
+   * Throws errors with structured codes:
+   * - INVALID_PATH: Input validation failed (type, length, null bytes, not absolute)
+   * - NOT_FOUND: File doesn't exist or is inaccessible
+   * - NOT_ALLOWED: Path is outside allowed directories
+   * - OPEN_FAILED: shell.showItemInFolder threw (rare)
+   *
+   * Note: Electron's shell.showItemInFolder returns void, so "success" means no exception
+   * was thrown, not a guarantee the file manager opened. This is an Electron API limitation.
+   */
+  private async revealFileInFolder(filePath: unknown): Promise<void> {
+    // Use shared validator for type, length, null bytes, and absolute path checks
+    let validatedPath: string;
+    try {
+      validatedPath = validateFilePath(filePath);
+    } catch (error) {
+      throw new AppError(error instanceof Error ? error.message : 'Invalid path', 'INVALID_PATH');
+    }
+
+    // Resolve symlinks to get canonical path (also verifies file exists)
+    let realPath: string;
+    try {
+      realPath = await fs.realpath(validatedPath);
+    } catch {
+      throw new AppError('File not found or inaccessible', 'NOT_FOUND');
+    }
+
+    // Build allowlist: userData/logs, downloads only
+    // Recordings use ID-based reveal handlers (recording:revealVideoInFolder, recording:revealThumbnailInFolder)
+    const userDataLogsPath = path.join(app.getPath('userData'), 'logs');
+    const downloadsPath = app.getPath('downloads');
+
+    const rootCandidates = [userDataLogsPath, downloadsPath];
+
+    // Safe "is under directory" check using path.relative
+    // On Windows, normalize case for comparison (paths are case-insensitive)
+    const isWindows = process.platform === 'win32';
+    const normCase = (p: string) => (isWindows ? p.toLowerCase() : p);
+
+    const isUnderRoot = (target: string, root: string): boolean => {
+      const relative = path.relative(normCase(root), normCase(target));
+      return !relative.startsWith('..') && !path.isAbsolute(relative);
+    };
+
+    // Resolve roots to canonical paths as well
+    // Only fall back to path.resolve for ENOENT (directory doesn't exist yet);
+    // fail closed on permission errors or other unexpected failures
+    const resolveRoot = async (p: string): Promise<string> => {
+      try {
+        return await fs.realpath(p);
+      } catch (error) {
+        if (isNodeError(error) && error.code === 'ENOENT') {
+          // Root may not exist yet (e.g., logs dir not created) - use resolved path
+          return path.resolve(p);
+        }
+        // Permission denied, invalid path, or other errors - fail closed
+        throw new AppError(`Cannot resolve allowed root: ${p}`, 'NOT_ALLOWED');
+      }
+    };
+
+    const allowedRoots = await Promise.all(rootCandidates.map(resolveRoot));
+    const isAllowed = allowedRoots.some(root => isUnderRoot(realPath, root));
+
+    if (!isAllowed) {
+      throw new AppError('Path not in allowed directory', 'NOT_ALLOWED');
+    }
+
+    // shell.showItemInFolder is sync and returns void; wrap for any unexpected throws
+    try {
+      shell.showItemInFolder(realPath);
+    } catch {
+      throw new AppError('Failed to open file explorer', 'OPEN_FAILED');
+    }
   }
 
   /**
    * Apply persisted recording settings to the recording service
    * Centralizes the logic for applying saved settings, avoiding code duplication
+   * @returns Explicit result so callers can handle failures deterministically
    */
-  private async applyPersistedRecordingSettings(): Promise<void> {
+  private async applyPersistedRecordingSettings(): Promise<{ success: boolean; error?: string }> {
     if (!this.recordingService) {
-      console.warn(
-        '[ArenaCoachDesktop] Cannot apply recording settings: RecordingService not initialized'
-      );
-      return;
+      const error = 'RecordingService not initialized';
+      console.warn('[ArenaCoachDesktop] Cannot apply recording settings:', error);
+      return { success: false, error };
+    }
+
+    const saved = this.settingsService.getSettings().recording;
+    const settings: Partial<RecordingSettings> = {
+      captureMode: saved.captureMode,
+      captureCursor: saved.captureCursor,
+      desktopAudioEnabled: saved.desktopAudioEnabled,
+      desktopAudioDevice: saved.desktopAudioDevice,
+      microphoneAudioEnabled: saved.microphoneAudioEnabled,
+      microphoneDevice: saved.microphoneDevice,
+      audioSuppressionEnabled: saved.audioSuppressionEnabled,
+      forceMonoInput: saved.forceMonoInput,
+    };
+
+    // Only include monitorId if it's defined
+    if (saved.monitorId !== undefined) {
+      settings.monitorId = saved.monitorId;
     }
 
     try {
-      const saved = this.settingsService.getSettings().recording;
-      const settings: Partial<RecordingSettings> = {
-        captureMode: saved.captureMode,
-        captureCursor: saved.captureCursor,
-        desktopAudioEnabled: saved.desktopAudioEnabled,
-        desktopAudioDevice: saved.desktopAudioDevice,
-        microphoneAudioEnabled: saved.microphoneAudioEnabled,
-        microphoneDevice: saved.microphoneDevice,
-        audioSuppressionEnabled: saved.audioSuppressionEnabled,
-        forceMonoInput: saved.forceMonoInput,
-      };
-
-      // Only include monitorId if it's defined
-      if (saved.monitorId !== undefined) {
-        settings.monitorId = saved.monitorId;
+      const success = await this.recordingService.applyRecordingSettings(settings);
+      if (success) {
+        console.info('[ArenaCoachDesktop] Applied persisted recording settings');
+        return { success: true };
+      } else {
+        const error = 'Recording service rejected settings (disabled or fatal error)';
+        console.warn('[ArenaCoachDesktop] Failed to apply persisted recording settings:', error);
+        return { success: false, error };
       }
-
-      await this.recordingService.applyRecordingSettings(settings);
-      console.info('[ArenaCoachDesktop] Applied persisted recording settings');
-    } catch (error) {
-      console.error('[ArenaCoachDesktop] Failed to apply persisted recording settings:', error);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : 'Unknown error applying settings';
+      console.error('[ArenaCoachDesktop] Failed to apply persisted recording settings:', err);
+      return { success: false, error };
     }
   }
 
@@ -928,6 +1292,14 @@ class ArenaCoachDesktop {
     return validated;
   }
 
+  private toRendererRecordingSettings(recording: AppSettings['recording']): RecordingSettings {
+    const rendererRecording = { ...recording } as AppSettings['recording'] & {
+      encoderMode?: 'auto' | 'manual';
+    };
+    delete rendererRecording.encoderMode;
+    return rendererRecording as RecordingSettings;
+  }
+
   /**
    * Setup IPC handlers that don't depend on async services
    * These can be registered immediately in the constructor
@@ -984,6 +1356,48 @@ class ArenaCoachDesktop {
       }
     });
 
+    // Show file in folder (explorer/finder)
+    ipcMain.handle(
+      'shell:showItemInFolder',
+      async (
+        _event,
+        filePath: unknown
+      ): Promise<
+        | { success: true }
+        | {
+            success: false;
+            error: string;
+            code: 'INVALID_PATH' | 'NOT_FOUND' | 'NOT_ALLOWED' | 'OPEN_FAILED' | 'UNKNOWN';
+          }
+      > => {
+        try {
+          await this.revealFileInFolder(filePath);
+          return { success: true };
+        } catch (error) {
+          console.error('Failed to show item in folder:', error);
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          // Use type guard to safely extract error code
+          type RevealErrorCode =
+            | 'INVALID_PATH'
+            | 'NOT_FOUND'
+            | 'NOT_ALLOWED'
+            | 'OPEN_FAILED'
+            | 'UNKNOWN';
+          const validCodes: readonly RevealErrorCode[] = [
+            'INVALID_PATH',
+            'NOT_FOUND',
+            'NOT_ALLOWED',
+            'OPEN_FAILED',
+          ];
+          let code: RevealErrorCode = 'UNKNOWN';
+          if (isAppError(error) && validCodes.includes(error.code as RevealErrorCode)) {
+            code = error.code as RevealErrorCode;
+          }
+          return { success: false, error: message, code };
+        }
+      }
+    );
+
     // App information handlers
     ipcMain.handle('app:getVersion', () => {
       return app.getVersion();
@@ -995,64 +1409,130 @@ class ArenaCoachDesktop {
       };
     });
 
-    // WoW installation handlers
-    ipcMain.handle('wow:detectInstallations', async (): Promise<WoWInstallation[]> => {
+    ipcMain.handle('billing:getEnabled', async () => {
       try {
-        // Return mock data in UI dev mode
-        if (this.isUIDevMode) {
-          const mockData = [
-            {
-              path: '/mock/world-of-warcraft',
-              version: 'retail' as const,
-              combatLogPath: '/mock/world-of-warcraft/Logs',
-              addonsPath: '/mock/world-of-warcraft/Interface/AddOns',
-              addonInstalled: true,
-              arenaCoachAddonPath: '/mock/world-of-warcraft/Interface/AddOns/ArenaCoach',
-            },
-          ];
-          this.latestWoWInstallations = mockData;
-          return mockData;
+        const response = await fetch(`${this.apiBaseUrl}/api/billing/enabled`, {
+          method: 'GET',
+        });
+        let data: unknown = null;
+        try {
+          data = await response.json();
+        } catch (parseError) {
+          console.warn('[Main] Failed to parse billing enabled response:', parseError);
         }
-        return await this.resolveWoWInstallations();
+
+        if (!response.ok) {
+          let errorMessage = `Billing enabled request failed (${response.status})`;
+          if (data && typeof data === 'object' && 'error' in data) {
+            const errorPayload = (data as { error?: { message?: string } }).error;
+            if (errorPayload && typeof errorPayload.message === 'string') {
+              errorMessage = errorPayload.message;
+            }
+          }
+          return { success: false, error: errorMessage };
+        }
+
+        if (
+          !data ||
+          typeof data !== 'object' ||
+          !('success' in data) ||
+          (data as { success?: boolean }).success !== true ||
+          !('data' in data) ||
+          typeof (data as { data?: { billingEnabled?: boolean } }).data?.billingEnabled !== 'boolean'
+        ) {
+          return { success: false, error: 'Invalid billing enabled response.' };
+        }
+
+        return {
+          success: true,
+          billingEnabled: (data as { data: { billingEnabled: boolean } }).data.billingEnabled,
+        };
       } catch (error) {
-        console.error('Error detecting WoW installations:', error);
-        return [];
+        console.warn('[Main] Failed to fetch billing enabled flag:', error);
+        return { success: false, error: 'Failed to fetch billing enabled flag.' };
       }
+    });
+
+    // Log export handler - returns zipPath; renderer calls shell:showItemInFolder to reveal
+    ipcMain.handle('logs:export', async (_event, bufferId?: unknown): Promise<LogExportResult> => {
+      // Runtime validation of untrusted IPC input
+      if (bufferId !== undefined) {
+        if (typeof bufferId !== 'string') {
+          return {
+            success: false,
+            error: 'Invalid bufferId: must be a string or undefined',
+          };
+        }
+        const trimmedId = bufferId.trim();
+        if (trimmedId.length === 0) {
+          return {
+            success: false,
+            error: 'Invalid bufferId: must be a non-empty string or undefined',
+          };
+        }
+        return this.logExportService.exportLogs({ bufferId: trimmedId });
+      }
+      return this.logExportService.exportLogs({});
+    });
+
+    // WoW installation handlers
+    // Note: Errors propagate to renderer (no silent fallback). Renderer must handle rejected promise.
+    ipcMain.handle('wow:detectInstallations', async (): Promise<WoWInstallation[]> => {
+      // Return mock data in UI dev mode
+      if (this.isUIDevMode) {
+        const mockData = [
+          {
+            path: '/mock/world-of-warcraft',
+            combatLogPath: '/mock/world-of-warcraft/Logs',
+            addonsPath: '/mock/world-of-warcraft/Interface/AddOns',
+            addonInstalled: true,
+            arenaCoachAddonPath: '/mock/world-of-warcraft/Interface/AddOns/ArenaCoach',
+          },
+        ];
+        this.latestWoWInstallations = mockData;
+        return mockData;
+      }
+      return await this.resolveWoWInstallations();
     });
 
     ipcMain.handle(
       'wow:validateInstallation',
       async (_event, installPath: unknown): Promise<WoWInstallation | null> => {
+        // Return mock data in UI dev mode (don't persist mock paths)
+        if (this.isUIDevMode) {
+          return {
+            path: '/mock/world-of-warcraft',
+            combatLogPath: '/mock/world-of-warcraft/Logs',
+            addonsPath: '/mock/world-of-warcraft/Interface/AddOns',
+            addonInstalled: true,
+            arenaCoachAddonPath: '/mock/world-of-warcraft/Interface/AddOns/ArenaCoach',
+          };
+        }
+
+        let validPath: string;
         try {
-          // Return mock data in UI dev mode (don't persist mock paths)
-          if (this.isUIDevMode) {
-            return {
-              path: '/mock/world-of-warcraft',
-              version: 'retail' as const,
-              combatLogPath: '/mock/world-of-warcraft/Logs',
-              addonsPath: '/mock/world-of-warcraft/Interface/AddOns',
-              addonInstalled: true,
-              arenaCoachAddonPath: '/mock/world-of-warcraft/Interface/AddOns/ArenaCoach',
-            };
-          }
-          const validPath = validateFilePath(installPath);
-          const installation = await WoWInstallationDetector.validateInstallation(validPath);
-
-          // Persist validated path to settings and refresh installation list
-          if (installation !== null) {
-            this.settingsService.setWoWInstallationPath(installation.path);
-            console.info(`[ArenaCoachDesktop] Persisted validated WoW path: ${installation.path}`);
-
-            // Re-resolve installations and notify renderer to keep UI in sync
-            const updated = await this.resolveWoWInstallations();
-            this.notifyAddonStatusToRenderer(updated);
-          }
-
-          return installation;
+          validPath = validateFilePath(installPath);
         } catch (error) {
           console.error('Error validating WoW installation:', error);
           return null;
         }
+
+        const installation = await WoWInstallationDetector.validateInstallation(validPath);
+        if (installation === null) return null;
+
+        // Post-success side effects are best-effort; do not clobber a successful validation result.
+        try {
+          this.settingsService.setWoWInstallationPath(installation.path);
+          console.info(`[ArenaCoachDesktop] Persisted validated WoW path: ${installation.path}`);
+
+          // Re-resolve installations and notify renderer to keep UI in sync
+          const updated = await this.resolveWoWInstallations();
+          this.notifyAddonStatusToRenderer(updated);
+        } catch (error) {
+          console.error('[ArenaCoachDesktop] Failed to refresh installations after validation:', error);
+        }
+
+        return installation;
       }
     );
 
@@ -1065,7 +1545,7 @@ class ArenaCoachDesktop {
         const result = await dialog.showOpenDialog(this.mainWindow, {
           title: 'Select World of Warcraft Installation Folder',
           properties: ['openDirectory'],
-          message: 'Select the main World of Warcraft installation directory (contains Wow.exe)',
+          message: `Select the main World of Warcraft installation directory (contains ${activeFlavor.windowsExecutable})`,
         });
 
         if (result.canceled || !result.filePaths || result.filePaths.length === 0) {
@@ -1282,20 +1762,35 @@ class ArenaCoachDesktop {
           body: JSON.stringify({ userProvidedCode: code.trim() }), // Match website pattern
         });
 
+        // 401: Token rejected - logout immediately (truthfulness)
+        if (response.status === 401) {
+          console.warn('[Main] Skill Capped verify returned 401, logging out');
+          await this.authManager.logout();
+          return { success: false, error: 'Session expired. Please log in again.' };
+        }
+
         const data = (await response.json()) as {
           success: boolean;
           user?: UserInfo;
-          error?: string;
-          message?: string;
+          error?: { code: string; message: string; details?: unknown };
         };
 
         if (!response.ok) {
           console.error('Error during Skill Capped verification:', data);
-          return { success: false, error: data.error || 'Verification failed' };
+          return {
+            success: false,
+            error: data.error?.message || 'Verification failed',
+            details: data.error?.details,
+          };
         }
 
         if (data.success) {
-          const updatedUser = data.user!;
+          if (!data.user) {
+            // Backend contract violation: success=true but no user data
+            console.error('Skill Capped verification: backend returned success without user data');
+            return { success: false, error: 'Verification failed: invalid server response' };
+          }
+          const updatedUser = data.user;
 
           // Update user info (no token changes)
           this.authManager.updateCurrentUser(updatedUser);
@@ -1311,10 +1806,15 @@ class ArenaCoachDesktop {
 
           return { success: true, user: updatedUser };
         } else {
-          return { success: false, error: data.error || 'Verification failed' };
+          return {
+            success: false,
+            error: data.error?.message || 'Verification failed',
+            details: data.error?.details,
+          };
         }
-      } catch (error: any) {
-        console.error('Error during Skill Capped verification:', error);
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('Error during Skill Capped verification:', message);
         return { success: false, error: 'Verification failed. Please try again.' };
       }
     });
@@ -1345,6 +1845,17 @@ class ArenaCoachDesktop {
           headers,
         });
 
+        // 401: Token rejected - logout immediately (truthfulness)
+        if (response.status === 401) {
+          console.warn('[Main] Skill Capped status check returned 401, logging out');
+          await this.authManager.logout();
+          return {
+            success: false,
+            verified: false,
+            error: 'Session expired. Please log in again.',
+          };
+        }
+
         const data = (await response.json()) as {
           success: boolean;
           is_verified: boolean;
@@ -1355,21 +1866,19 @@ class ArenaCoachDesktop {
           return { success: false, verified: false, error: 'Failed to check status' };
         }
 
-        // If verified, update only user object (no token changes)
-        if (data.is_verified) {
-          const currentUser = this.authManager.getCurrentUser();
-          if (currentUser && !currentUser.is_skill_capped_verified) {
-            const updatedUser = { ...currentUser, is_skill_capped_verified: true };
-            this.authManager.updateCurrentUser(updatedUser);
+        // Always update user based on backend response (supports revocation true→false)
+        const currentUser = this.authManager.getCurrentUser();
+        if (currentUser && currentUser.is_skill_capped_verified !== data.is_verified) {
+          const updatedUser = { ...currentUser, is_skill_capped_verified: data.is_verified };
+          this.authManager.updateCurrentUser(updatedUser);
 
-            // Emit auth:success to update UI
-            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-              this.mainWindow.webContents.send('auth:success', {
-                token: this.authManager.getAuthToken(),
-                user: updatedUser,
-                source: 'skillcapped-status', // Flag to identify source
-              });
-            }
+          // Emit auth:success to update UI on status change
+          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+            this.mainWindow.webContents.send('auth:success', {
+              token: this.authManager.getAuthToken(),
+              user: updatedUser,
+              source: 'skillcapped-status',
+            });
           }
         }
 
@@ -1378,6 +1887,58 @@ class ArenaCoachDesktop {
         console.error('Error checking Skill Capped status:', error);
         return { success: false, verified: false, error: 'Failed to check status' };
       }
+    });
+
+    ipcMain.handle('auth:getWebLoginUrl', async () => {
+      try {
+        if (!this.authManager.isAuthenticated()) {
+          return { success: false, error: 'Not authenticated' };
+        }
+
+        if (!this.apiHeadersProvider.hasAuth()) {
+          return { success: false, error: 'No auth token available' };
+        }
+
+        const headers = this.apiHeadersProvider.getHeaders({
+          'Content-Type': 'application/json',
+        });
+
+        const response = await fetch(`${this.apiBaseUrl}/api/auth/web-login-code`, {
+          method: 'POST',
+          headers,
+        });
+
+        if (response.status === 401) {
+          console.warn('[Main] Web login code returned 401, logging out');
+          await this.authManager.logout();
+          return { success: false, error: 'Session expired. Please log in again.' };
+        }
+
+        const data = (await response.json()) as
+          | { success: true; code: string }
+          | { success: false; error: { message?: string } };
+
+        if (!response.ok || !('code' in data)) {
+          const errorMessage =
+            'error' in data && data.error?.message ? data.error.message : 'Failed to create login code';
+          return { success: false, error: errorMessage };
+        }
+
+        const returnTo = '/account';
+        const loginUrl = `${this.apiBaseUrl}/api/auth/code-login?code=${encodeURIComponent(
+          data.code
+        )}&returnTo=${encodeURIComponent(returnTo)}`;
+
+        return { success: true, url: loginUrl };
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error('Error creating web login URL:', message);
+        return { success: false, error: 'Failed to open premium signup.' };
+      }
+    });
+
+    ipcMain.handle('auth:refreshBillingStatus', async () => {
+      return await this.checkBillingStatus();
     });
 
     // Extended match detection handlers
@@ -1445,7 +2006,7 @@ class ArenaCoachDesktop {
 
     ipcMain.handle('recording:enable', async (): Promise<void> => {
       if (!this.recordingService) {
-        return;
+        throw new Error('Recording service not available');
       }
 
       try {
@@ -1454,18 +2015,21 @@ class ArenaCoachDesktop {
         if (this.mainWindow) {
           this.recordingService.setMainWindow(this.mainWindow);
         }
-        await this.applyPersistedRecordingSettings();
+        const applyResult = await this.applyPersistedRecordingSettings();
+        if (!applyResult.success) {
+          throw new Error(applyResult.error ?? 'Failed to apply recording settings');
+        }
         // Persist user preference
         this.settingsService.updateSettings({ recordingEnabled: true });
       } catch (error) {
         console.error('[recording:enable] Failed to enable recording:', error);
-        throw error; // Re-throw to let renderer handle it
+        throw error;
       }
     });
 
     ipcMain.handle('recording:disable', async (): Promise<void> => {
       if (!this.recordingService) {
-        return;
+        throw new Error('Recording service not available');
       }
       await this.recordingService.disable();
       // Persist user preference
@@ -1499,128 +2063,52 @@ class ArenaCoachDesktop {
       };
     });
 
-    ipcMain.handle(
-      'recording:getRecordingInfoForMatch',
-      async (
-        _event,
-        bufferId: string
-      ): Promise<{
-        videoPath: string | null;
-        videoDuration: number | null;
-        recordingStatus: RecordingStatusType;
-        recordingErrorCode: string | null;
-        recordingErrorMessage: string | null;
-      }> => {
-        try {
-          const metadata = await this.metadataStorageService.loadMatchByBufferId(bufferId);
-          return {
-            videoPath: metadata?.videoPath ?? null,
-            videoDuration: metadata?.videoDuration ?? null,
-            recordingStatus: metadata?.recordingStatus ?? 'not_applicable',
-            recordingErrorCode: metadata?.recordingErrorCode ?? null,
-            recordingErrorMessage: metadata?.recordingErrorMessage ?? null,
-          };
-        } catch (error) {
-          console.error('[ArenaCoachDesktop] Failed to get recording info for match:', error);
-          return {
-            videoPath: null,
-            videoDuration: null,
-            recordingStatus: 'failed_unknown',
-            recordingErrorCode: 'METADATA_LOAD_FAILED',
-            recordingErrorMessage: 'Recording info is unavailable due to a local storage error.',
-          };
-        }
-      }
-    );
-
-    ipcMain.handle(
-      'recording:getThumbnailForMatch',
-      async (_event, bufferId: string): Promise<string | null> => {
-        try {
-          const metadata = await this.metadataStorageService.loadMatchByBufferId(bufferId);
-          return metadata?.videoThumbnail || null;
-        } catch (error) {
-          console.error('[ArenaCoachDesktop] Failed to get thumbnail for match:', error);
-          return null;
-        }
-      }
-    );
-
-    ipcMain.handle(
-      'recording:checkFileExists',
-      async (_event, filePath: string): Promise<boolean> => {
-        try {
-          if (typeof filePath !== 'string' || !filePath) {
-            return false;
-          }
-
-          // Get the allowed recording directory from settings
-          const settings = this.settingsService.getSettings();
-          const defaultDir = path.join(
-            app.getPath('videos'),
-            ArenaCoachDesktop.DEFAULT_RECORDING_SUBDIR
-          );
-
-          let recordingDir: string;
-          if (!settings.recordingLocation) {
-            recordingDir = defaultDir;
-          } else {
-            // Apply same validation as RecordingService to get actual directory
-            const normalizedPath = path.normalize(settings.recordingLocation);
-            const isRootDir = normalizedPath === path.parse(normalizedPath).root;
-
-            if (isRootDir) {
-              recordingDir = path.join(normalizedPath, 'ArenaCoach', 'Recordings');
-            } else {
-              recordingDir = normalizedPath;
-            }
-          }
-
-          // Normalize and resolve absolute paths
-          const baseDir = path.resolve(recordingDir);
-          const targetPath = path.resolve(filePath);
-          const rel = path.relative(baseDir, targetPath);
-
-          // Security: must be inside baseDir (no parent escapes or absolute rel)
-          if (rel.startsWith('..') || path.isAbsolute(rel)) {
-            console.warn(
-              `[Security] Attempted to check file outside recording directory: ${filePath}`
-            );
-            return false;
-          }
-
-          // Use fs imported at module level
-          await fs.access(targetPath);
-          return true;
-        } catch {
-          return false;
-        }
-      }
-    );
+    // Recording metadata handlers moved to setupStorageIPC() - require initialized metadataStorageService
 
     // Scene handlers for recording settings
     ipcMain.handle('scene:getSettings', () => {
       try {
         const settings = this.settingsService.getSettings();
-        return settings.recording;
+        return this.toRendererRecordingSettings(settings.recording);
       } catch (error) {
         console.error('[scene:getSettings] Failed to get settings:', error);
         throw new Error('Failed to retrieve scene settings');
       }
     });
 
-    ipcMain.handle('scene:updateSettings', async (_event, updates: Partial<RecordingSettings>) => {
-      try {
+    ipcMain.handle('scene:getRuntimeEncoder', () => {
+      const settings = this.settingsService.getSettings();
+      const mode = settings.recording.encoderMode || 'auto';
+      const preferredEncoder = settings.recording.encoder || 'x264';
+
+      const encoderId =
+        this.recordingService && this.recordingService.isOBSInitialized()
+          ? this.recordingService.getCurrentEncoderId()
+          : null;
+
+      return {
+        mode,
+        preferredEncoder,
+        encoder: inferEncoderTypeFromId(encoderId),
+      };
+    });
+
+    ipcMain.handle(
+      'scene:updateSettings',
+      async (
+        _event,
+        updates: Partial<RecordingSettings>
+      ): Promise<{ settings: RecordingSettings; obsApplyError?: string }> => {
         // Check if recording is active and trying to change unsafe settings
         if (this.recordingService) {
           const status = await this.recordingService.getStatus();
           if (status.isRecording) {
             const hasUnsafeUpdate = UNSAFE_RECORDING_SETTINGS.some(key => key in updates);
             if (hasUnsafeUpdate) {
-              // Throw structured error with code for better error handling
-              const error = new Error('Cannot change video settings while recording is active');
-              (error as any).code = 'RECORDING_ACTIVE';
-              throw error;
+              throw new AppError(
+                'Cannot change video settings while recording is active',
+                'RECORDING_ACTIVE'
+              );
             }
           }
         }
@@ -1631,63 +2119,66 @@ class ArenaCoachDesktop {
         // Early return if no valid updates to avoid unnecessary write
         if (Object.keys(validated).length === 0) {
           const current = this.settingsService.getSettings();
-          return current.recording;
+          return { settings: this.toRendererRecordingSettings(current.recording) };
         }
 
         const current = this.settingsService.getSettings();
-        const updated = {
-          ...current,
-          recording: {
-            ...current.recording,
-            ...validated,
-          },
+        const encoderTouched =
+          (updates as { _encoderTouched?: unknown })._encoderTouched === true;
+        const didEncoderChange =
+          validated.encoder !== undefined &&
+          validated.encoder !== (current.recording.encoder || 'x264');
+        const shouldApplyEncoderManually =
+          validated.encoder !== undefined && (didEncoderChange || encoderTouched);
+        const nextEncoderMode = shouldApplyEncoderManually
+          ? 'manual'
+          : current.recording.encoderMode || 'auto';
+
+        const updatedRecording = {
+          ...current.recording,
+          ...validated,
+          encoderMode: nextEncoderMode,
         };
 
-        this.settingsService.updateSettings(updated);
+        const persisted = this.settingsService.updateSettings({
+          recording: updatedRecording,
+        });
+
+        const obsApplySettings: Partial<RecordingSettings> = { ...validated };
+        if (!shouldApplyEncoderManually && obsApplySettings.encoder !== undefined) {
+          delete obsApplySettings.encoder;
+        }
 
         // Apply settings to OBS if initialized
-        if (this.recordingService && this.recordingService.isOBSInitialized()) {
+        let obsApplyError: string | undefined;
+        if (
+          this.recordingService &&
+          this.recordingService.isOBSInitialized() &&
+          Object.keys(obsApplySettings).length > 0
+        ) {
           try {
-            await this.recordingService.applyRecordingSettings(validated);
+            const success = await this.recordingService.applyRecordingSettings(obsApplySettings);
+            if (!success) {
+              // Service returned false (e.g., recording disabled after fatal error)
+              obsApplyError = 'Recording service rejected settings update';
+            }
           } catch (applyError) {
-            // Log but don't fail the entire update
-            // Settings are persisted, OBS apply can be retried
+            // Settings are persisted, OBS apply can be retried on next recording start
+            console.error('[scene:updateSettings] Failed to apply settings to OBS:', applyError);
+            obsApplyError =
+              applyError instanceof Error ? applyError.message : 'Failed to apply OBS settings';
           }
         }
 
-        return updated.recording;
-      } catch (error) {
-        throw error;
+        return obsApplyError
+          ? { settings: this.toRendererRecordingSettings(persisted.recording), obsApplyError }
+          : { settings: this.toRendererRecordingSettings(persisted.recording) };
       }
-    });
+    );
 
     // Recording directory helper for Scene UI - returns the actual sanitized path being used
     ipcMain.handle('recording:getEffectiveDirectory', () => {
-      try {
-        const settings = this.settingsService.getSettings();
-        const defaultDir = path.join(
-          app.getPath('videos'),
-          ArenaCoachDesktop.DEFAULT_RECORDING_SUBDIR
-        );
-
-        if (!settings.recordingLocation) {
-          return defaultDir;
-        }
-
-        // Apply same validation as RecordingService to show what's actually being used
-        const normalizedPath = path.normalize(settings.recordingLocation);
-        const isRootDir = normalizedPath === path.parse(normalizedPath).root;
-
-        if (isRootDir) {
-          // Return the sanitized path that RecordingService actually uses
-          return path.join(normalizedPath, 'ArenaCoach', 'Recordings');
-        }
-
-        return normalizedPath;
-      } catch (error) {
-        console.error('[recording:getEffectiveDirectory] Failed to get directory:', error);
-        throw new Error('Failed to determine recording directory');
-      }
+      return this.getRecordingDirectoryFromSettings();
     });
 
     // OBS Preview handlers
@@ -1747,41 +2238,24 @@ class ArenaCoachDesktop {
     ipcMain.handle('scene:setActive', (_event, active: boolean): void => {
       // Hide preview when Scene tab becomes inactive
       if (!active && this.recordingService) {
-        try {
-          this.recordingService.hidePreview();
-        } catch (error) {
-          // Silent fail - preview hiding is non-critical
-        }
+        this.recordingService.hidePreview();
       }
     });
 
     // Audio device enumeration for Scene UI
     ipcMain.handle('obs:audio:getDevices', async () => {
-      try {
-        if (!this.recordingService || !this.recordingService.isOBSInitialized()) {
-          return { input: [], output: [] };
-        }
-
-        return this.recordingService.getAudioDevices();
-      } catch (error) {
-        // Silent fail with empty device lists
-        return { input: [], output: [] };
+      if (!this.recordingService || !this.recordingService.isOBSInitialized()) {
+        throw new Error('OBS not initialized');
       }
+      return this.recordingService.getAudioDevices();
     });
 
     // Monitor enumeration for Scene UI
     ipcMain.handle('obs:display:getMonitors', async () => {
-      try {
-        if (!this.recordingService || !this.recordingService.isOBSInitialized()) {
-          return [];
-        }
-
-        return this.recordingService.getMonitors();
-      } catch (error) {
-        console.error('[obs:display:getMonitors] Failed to get monitors:', error);
-        // Return primary monitor as fallback
-        return [{ id: '0', name: 'Primary Monitor' }];
+      if (!this.recordingService || !this.recordingService.isOBSInitialized()) {
+        throw new Error('OBS not initialized');
       }
+      return this.recordingService.getMonitors();
     });
 
     // Settings handlers
@@ -1794,29 +2268,48 @@ class ArenaCoachDesktop {
       }
     });
 
-    ipcMain.handle('settings:update', async (_event, newSettings: Partial<AppSettings>) => {
-      try {
+    ipcMain.handle(
+      'settings:update',
+      async (
+        _event,
+        newSettings: Partial<AppSettings>
+      ): Promise<{
+        settings: AppSettings;
+        recordingDirUpdateError?: string;
+        recordingEnableError?: string;
+        recordingDisableError?: string;
+      }> => {
         // Check if recording enabled setting is changing
         const currentSettings = this.settingsService.getSettings();
         const wasRecordingEnabled = currentSettings.recordingEnabled !== false;
         const previousRunOnStartup = currentSettings.runOnStartup;
 
-        // Update settings first
+        // Update settings first (persisted)
         const updatedSettings = this.settingsService.updateSettings(newSettings);
         const willBeRecordingEnabled = updatedSettings.recordingEnabled !== false;
 
+        // Track partial failures
+        let recordingDirUpdateError: string | undefined;
+        let recordingEnableError: string | undefined;
+        let recordingDisableError: string | undefined;
+
         // Handle recording directory change if recording service is active
+        // Require string type (including '') to handle clearing to default; undefined is ignored
         if (
           this.recordingService &&
-          newSettings.recordingLocation &&
+          typeof newSettings.recordingLocation === 'string' &&
           newSettings.recordingLocation !== currentSettings.recordingLocation
         ) {
           try {
-            console.info(
-              '[ArenaCoachDesktop] Updating recording directory to:',
-              newSettings.recordingLocation
-            );
-            await this.recordingService.updateRecordingDirectory(newSettings.recordingLocation);
+            // Pass raw input to updateRecordingDirectory so it can do its own sanitization
+            // and update settings if needed. Exception: '' means clear to default, but
+            // updateRecordingDirectory rejects empty string, so compute effective dir for that case.
+            const dirToUpdate =
+              newSettings.recordingLocation === ''
+                ? getEffectiveRecordingDirectory('', app.getPath('videos'))
+                : newSettings.recordingLocation;
+            console.info('[ArenaCoachDesktop] Updating recording directory to:', dirToUpdate);
+            await this.recordingService.updateRecordingDirectory(dirToUpdate);
             console.info('[ArenaCoachDesktop] Recording directory updated successfully');
             // Re-read settings in case RecordingService sanitized the path
             const refreshedSettings = this.settingsService.getSettings();
@@ -1835,7 +2328,9 @@ class ArenaCoachDesktop {
             }
           } catch (error) {
             console.error('[ArenaCoachDesktop] Failed to update recording directory:', error);
-            // Don't throw - setting is saved, just couldn't update live service
+            // Settings are persisted, but live service update failed - record as partial failure
+            recordingDirUpdateError =
+              error instanceof Error ? error.message : 'Failed to update recording directory';
           }
         }
 
@@ -1851,33 +2346,42 @@ class ArenaCoachDesktop {
               console.warn(
                 '[ArenaCoachDesktop] Cannot enable recording - metadata service not yet initialized'
               );
-              return updatedSettings;
-            }
+              recordingEnableError = 'Recording service not ready - please try again';
+            } else {
+              // Enable recording - initialize service
+              try {
+                console.info(
+                  '[ArenaCoachDesktop] Enabling recording service due to settings change'
+                );
+                const recordingConfig = this.createRecordingServiceConfig(updatedSettings);
+                this.recordingService = new RecordingService(
+                  recordingConfig,
+                  this.metadataService,
+                  this.settingsService
+                );
+                await this.recordingService.initialize();
+                this.setupRecordingEvents(); // Wire up event handlers
 
-            // Enable recording - initialize service
-            try {
-              console.info('[ArenaCoachDesktop] Enabling recording service due to settings change');
-              const recordingConfig = this.createRecordingServiceConfig(updatedSettings);
-              this.recordingService = new RecordingService(
-                recordingConfig,
-                this.metadataService,
-                this.settingsService
-              );
-              await this.recordingService.initialize();
-              this.setupRecordingEvents(); // Wire up event handlers
+                // Pass main window for preview
+                if (this.mainWindow) {
+                  this.recordingService.setMainWindow(this.mainWindow);
+                }
 
-              // Pass main window for preview
-              if (this.mainWindow) {
-                this.recordingService.setMainWindow(this.mainWindow);
+                // Apply saved recording settings using helper method
+                const applyResult = await this.applyPersistedRecordingSettings();
+                if (!applyResult.success) {
+                  // Service initialized but settings failed to apply - report as partial failure
+                  recordingEnableError = applyResult.error ?? 'Failed to apply recording settings';
+                } else {
+                  console.info('[ArenaCoachDesktop] Recording service enabled via settings');
+                }
+              } catch (error) {
+                console.error('[ArenaCoachDesktop] Failed to enable recording service:', error);
+                this.recordingService = null;
+                this.clearRecordingRecoveryState();
+                recordingEnableError =
+                  error instanceof Error ? error.message : 'Failed to enable recording';
               }
-
-              // Apply saved recording settings using helper method
-              await this.applyPersistedRecordingSettings();
-
-              console.info('[ArenaCoachDesktop] Recording service enabled via settings');
-            } catch (error) {
-              console.error('[ArenaCoachDesktop] Failed to enable recording service:', error);
-              this.recordingService = null;
             }
           } else if (!willBeRecordingEnabled && this.recordingService) {
             // Disable recording - shutdown service
@@ -1887,9 +2391,12 @@ class ArenaCoachDesktop {
               );
               await this.recordingService.shutdown();
               this.recordingService = null;
+              this.clearRecordingRecoveryState();
               console.info('[ArenaCoachDesktop] Recording service disabled via settings');
             } catch (error) {
               console.error('[ArenaCoachDesktop] Error disabling recording service:', error);
+              recordingDisableError =
+                error instanceof Error ? error.message : 'Failed to disable recording';
             }
           }
         }
@@ -1902,12 +2409,24 @@ class ArenaCoachDesktop {
           this.applyAutoLaunchSetting(updatedSettings.runOnStartup === true);
         }
 
-        return updatedSettings;
-      } catch (error) {
-        console.error('Error updating settings:', error);
-        throw error;
+        const result: {
+          settings: AppSettings;
+          recordingDirUpdateError?: string;
+          recordingEnableError?: string;
+          recordingDisableError?: string;
+        } = { settings: updatedSettings };
+        if (recordingDirUpdateError) {
+          result.recordingDirUpdateError = recordingDirUpdateError;
+        }
+        if (recordingEnableError) {
+          result.recordingEnableError = recordingEnableError;
+        }
+        if (recordingDisableError) {
+          result.recordingDisableError = recordingDisableError;
+        }
+        return result;
       }
-    });
+    );
 
     ipcMain.handle('settings:reset', () => {
       try {
@@ -1962,12 +2481,40 @@ class ArenaCoachDesktop {
       }
     });
 
-    ipcMain.handle('matches:delete', async (_event, bufferId: string) => {
+    ipcMain.handle('matches:delete', async (_event, bufferId: unknown) => {
       try {
-        if (typeof bufferId !== 'string' || bufferId.length === 0) {
-          throw new Error('Invalid bufferId: must be a non-empty string');
+        if (!isValidBufferId(bufferId)) {
+          throw new Error('Invalid bufferId: must match expected format');
         }
-        return await this.metadataStorageService.deleteMatch(bufferId);
+
+        // Single-scan delete with pre-delete validation
+        const { deleted, scanErrors } =
+          await this.metadataStorageService.deleteMatchByBufferIdWithDiagnostics(
+            bufferId,
+            match => {
+              // Validator throws if match should not be deleted
+              if (match.matchCompletionStatus === 'in_progress') {
+                throw new Error('Cannot delete match while it is in progress');
+              }
+              if (ArenaCoachDesktop.NON_TERMINAL_UPLOAD_STATUSES.has(match.uploadStatus)) {
+                throw new Error(
+                  `Cannot delete match in non-terminal status: ${match.uploadStatus}`
+                );
+              }
+            }
+          );
+
+        // Log scan errors as warning but don't block idempotent deletes
+        // (scan errors are per-file and may be unrelated to the requested bufferId)
+        if (scanErrors.length > 0) {
+          const sampleErrors = scanErrors.slice(0, 3).map(e => `${e.file}: ${e.error}`);
+          console.warn(
+            `[matches:delete] ${scanErrors.length} file(s) could not be read during scan. ` +
+              `Sample errors: ${sampleErrors.join('; ')}`
+          );
+        }
+
+        return deleted;
       } catch (error) {
         console.error('Error deleting match:', error);
         throw error;
@@ -1982,6 +2529,362 @@ class ArenaCoachDesktop {
         throw error;
       }
     });
+
+    ipcMain.handle('matches:setFavourite', async (_event, bufferId: unknown, isFavourite: unknown): Promise<boolean> => {
+      try {
+        // Validate bufferId at IPC boundary
+        if (!isValidBufferId(bufferId)) {
+          throw new Error('Invalid bufferId: must match expected format');
+        }
+
+        // Validate isFavourite as boolean
+        if (typeof isFavourite !== 'boolean') {
+          throw new Error('Invalid isFavourite: must be a boolean');
+        }
+
+        await this.metadataStorageService.updateFavouriteByBufferId(bufferId, isFavourite);
+        return true;
+      } catch (error) {
+        console.error('Error setting favourite status:', error);
+        throw error;
+      }
+    });
+
+    // Recording info handlers - depend on metadataStorageService
+    ipcMain.handle(
+      'recording:getRecordingInfoForMatch',
+      async (_event, bufferId: unknown): Promise<RecordingInfoResult> => {
+        // Validate bufferId at IPC boundary
+        if (!isValidBufferId(bufferId)) {
+          return {
+            success: false,
+            error: 'Invalid bufferId format',
+            code: 'INVALID_BUFFER_ID',
+          };
+        }
+
+        // Load metadata with diagnostics for precise error handling
+        let result: Awaited<
+          ReturnType<typeof this.metadataStorageService.loadMatchByBufferIdWithDiagnostics>
+        >;
+        try {
+          result = await this.metadataStorageService.loadMatchByBufferIdWithDiagnostics(bufferId);
+        } catch (error) {
+          // Only handle expected storage errors; rethrow unexpected exceptions
+          if (!isNodeError(error) && !(error instanceof Error && isNodeError(error.cause))) {
+            throw error;
+          }
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          console.error('[ArenaCoachDesktop] Catastrophic metadata load failure:', error);
+          return {
+            success: false,
+            error: `Failed to load metadata: ${message}`,
+            code: 'METADATA_LOAD_FAILED',
+          };
+        }
+
+        const { match, scanErrors } = result;
+
+        // Distinguish "not found" from "load failed with errors"
+        if (match === null) {
+          if (scanErrors.length > 0) {
+            const firstErrorMsg = scanErrors[0]?.error ?? 'Unknown error';
+            return {
+              success: false,
+              error: `Failed to load metadata (${scanErrors.length} file error(s)): ${firstErrorMsg}`,
+              code: 'METADATA_LOAD_FAILED',
+            };
+          }
+          return {
+            success: false,
+            error: 'Match metadata not found',
+            code: 'METADATA_NOT_FOUND',
+          };
+        }
+
+        // Compute videoExists in main process (no renderer-supplied paths)
+        let videoExists = false;
+        const videoPath = match.videoPath ?? null;
+        if (videoPath !== null) {
+          try {
+            const validatedPath = validateFilePath(videoPath);
+            await fs.access(validatedPath);
+            videoExists = true;
+          } catch {
+            // Invalid path or file doesn't exist
+            videoExists = false;
+          }
+        }
+
+        return {
+          success: true,
+          videoPath,
+          videoExists,
+          videoDuration: match.videoDuration ?? null,
+          recordingStatus: match.recordingStatus ?? 'not_applicable',
+          recordingErrorCode: match.recordingErrorCode ?? null,
+          recordingErrorMessage: match.recordingErrorMessage ?? null,
+        };
+      }
+    );
+
+    ipcMain.handle(
+      'recording:getThumbnailForMatch',
+      async (_event, bufferId: unknown): Promise<string | null> => {
+        // Validate bufferId at IPC boundary; return null for invalid input
+        if (!isValidBufferId(bufferId)) {
+          return null;
+        }
+
+        // Load metadata with diagnostics
+        let result: Awaited<
+          ReturnType<typeof this.metadataStorageService.loadMatchByBufferIdWithDiagnostics>
+        >;
+        try {
+          result = await this.metadataStorageService.loadMatchByBufferIdWithDiagnostics(bufferId);
+        } catch (error) {
+          console.error('[ArenaCoachDesktop] Failed to get thumbnail for match:', error);
+          return null;
+        }
+
+        const { match, scanErrors } = result;
+
+        // Log scan errors if any occurred
+        if (match === null && scanErrors.length > 0) {
+          console.error(
+            '[ArenaCoachDesktop] Metadata load errors while getting thumbnail:',
+            scanErrors
+          );
+          return null;
+        }
+
+        if (!match) {
+          return null;
+        }
+
+        const thumbnail = match.videoThumbnail;
+        if (!thumbnail) {
+          return null;
+        }
+
+        // Validate thumbnail path before returning
+        try {
+          const validatedThumb = validateFilePath(thumbnail);
+          await fs.access(validatedThumb);
+          return validatedThumb;
+        } catch {
+          // Invalid path or thumbnail doesn't exist
+          return null;
+        }
+      }
+    );
+
+    // ID-based reveal handlers for recordings - uses bufferId, not renderer-supplied paths
+    ipcMain.handle(
+      'recording:revealVideoInFolder',
+      async (_event, bufferId: unknown): Promise<RevealResult> => {
+        // Validate bufferId at IPC boundary
+        if (!isValidBufferId(bufferId)) {
+          return {
+            success: false,
+            error: 'Invalid bufferId format',
+            code: 'INVALID_BUFFER_ID',
+          };
+        }
+
+        // Load metadata
+        let result: Awaited<
+          ReturnType<typeof this.metadataStorageService.loadMatchByBufferIdWithDiagnostics>
+        >;
+        try {
+          result = await this.metadataStorageService.loadMatchByBufferIdWithDiagnostics(bufferId);
+        } catch (error) {
+          // Only handle expected storage errors; rethrow unexpected exceptions
+          if (!isNodeError(error) && !(error instanceof Error && isNodeError(error.cause))) {
+            throw error;
+          }
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          console.error('[ArenaCoachDesktop] Failed to load metadata for video reveal:', error);
+          return {
+            success: false,
+            error: `Failed to load metadata: ${message}`,
+            code: 'NOT_FOUND',
+          };
+        }
+
+        const { match, scanErrors } = result;
+
+        // Distinguish metadata load failures from missing media
+        if (match === null) {
+          if (scanErrors.length > 0) {
+            const firstErrorMsg = scanErrors[0]?.error ?? 'Unknown error';
+            return {
+              success: false,
+              error: `Failed to load metadata (${scanErrors.length} file error(s)): ${firstErrorMsg}`,
+              code: 'NOT_FOUND',
+            };
+          }
+          // No match found and no errors = match doesn't exist
+          return {
+            success: false,
+            error: 'No video recording for this match',
+            code: 'NO_MEDIA',
+          };
+        }
+
+        if (!match.videoPath) {
+          return {
+            success: false,
+            error: 'No video recording for this match',
+            code: 'NO_MEDIA',
+          };
+        }
+
+        // Validate stored video path
+        let validatedPath: string;
+        try {
+          validatedPath = validateFilePath(match.videoPath);
+        } catch {
+          return {
+            success: false,
+            error: 'Invalid stored video path',
+            code: 'NOT_FOUND',
+          };
+        }
+
+        // Resolve to real path (also verifies existence)
+        let realPath: string;
+        try {
+          realPath = await fs.realpath(validatedPath);
+        } catch (error) {
+          // Only handle expected filesystem errors; rethrow unexpected exceptions
+          if (!isNodeError(error)) {
+            throw error;
+          }
+          return {
+            success: false,
+            error: 'Video file not found',
+            code: 'NOT_FOUND',
+          };
+        }
+
+        // Reveal in folder - shell.showItemInFolder is sync/void, wrap for any throws
+        try {
+          shell.showItemInFolder(realPath);
+          return { success: true };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          return {
+            success: false,
+            error: `Failed to open file manager: ${message}`,
+            code: 'OPEN_FAILED',
+          };
+        }
+      }
+    );
+
+    ipcMain.handle(
+      'recording:revealThumbnailInFolder',
+      async (_event, bufferId: unknown): Promise<RevealResult> => {
+        // Validate bufferId at IPC boundary
+        if (!isValidBufferId(bufferId)) {
+          return {
+            success: false,
+            error: 'Invalid bufferId format',
+            code: 'INVALID_BUFFER_ID',
+          };
+        }
+
+        // Load metadata
+        let result: Awaited<
+          ReturnType<typeof this.metadataStorageService.loadMatchByBufferIdWithDiagnostics>
+        >;
+        try {
+          result = await this.metadataStorageService.loadMatchByBufferIdWithDiagnostics(bufferId);
+        } catch (error) {
+          // Only handle expected storage errors; rethrow unexpected exceptions
+          if (!isNodeError(error) && !(error instanceof Error && isNodeError(error.cause))) {
+            throw error;
+          }
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          console.error('[ArenaCoachDesktop] Failed to load metadata for thumbnail reveal:', error);
+          return {
+            success: false,
+            error: `Failed to load metadata: ${message}`,
+            code: 'NOT_FOUND',
+          };
+        }
+
+        const { match, scanErrors } = result;
+
+        // Distinguish metadata load failures from missing media
+        if (match === null) {
+          if (scanErrors.length > 0) {
+            const firstErrorMsg = scanErrors[0]?.error ?? 'Unknown error';
+            return {
+              success: false,
+              error: `Failed to load metadata (${scanErrors.length} file error(s)): ${firstErrorMsg}`,
+              code: 'NOT_FOUND',
+            };
+          }
+          // No match found and no errors = match doesn't exist
+          return {
+            success: false,
+            error: 'No thumbnail for this match',
+            code: 'NO_MEDIA',
+          };
+        }
+
+        if (!match.videoThumbnail) {
+          return {
+            success: false,
+            error: 'No thumbnail for this match',
+            code: 'NO_MEDIA',
+          };
+        }
+
+        // Validate stored thumbnail path
+        let validatedPath: string;
+        try {
+          validatedPath = validateFilePath(match.videoThumbnail);
+        } catch {
+          return {
+            success: false,
+            error: 'Invalid stored thumbnail path',
+            code: 'NOT_FOUND',
+          };
+        }
+
+        // Resolve to real path (also verifies existence)
+        let realPath: string;
+        try {
+          realPath = await fs.realpath(validatedPath);
+        } catch (error) {
+          // Only handle expected filesystem errors; rethrow unexpected exceptions
+          if (!isNodeError(error)) {
+            throw error;
+          }
+          return {
+            success: false,
+            error: 'Thumbnail file not found',
+            code: 'NOT_FOUND',
+          };
+        }
+
+        // Reveal in folder - shell.showItemInFolder is sync/void, wrap for any throws
+        try {
+          shell.showItemInFolder(realPath);
+          return { success: true };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unknown error';
+          return {
+            success: false,
+            error: `Failed to open file manager: ${message}`,
+            code: 'OPEN_FAILED',
+          };
+        }
+      }
+    );
 
     // Live status update handler for Single Source of Truth pattern
     ipcMain.handle(
@@ -2079,7 +2982,7 @@ class ArenaCoachDesktop {
       };
     });
 
-    // Quota status handler - fetches daily enrichment quota from backend
+    // Quota status handler - fetches weekly enrichment quota from backend
     ipcMain.handle('quota:getStatus', async () => {
       try {
         const headers = this.apiHeadersProvider.getHeaders();
@@ -2131,6 +3034,15 @@ class ArenaCoachDesktop {
       }
     });
 
+    // Fatal OBS IPC recovery: request safe-point recovery for next match
+    this.recordingService.on('obsError', (error: Error) => {
+      const errorCode = (error as { code?: string }).code;
+      if (errorCode !== 'OBS_IPC_FATAL') {
+        return;
+      }
+      this.requestRecordingRecoveryDueToFatalObsIpc(error);
+    });
+
     // Forward user-facing recording error event (folder/permission issues)
     this.recordingService.on('recordingError', (userMessage: string) => {
       console.warn('[ArenaCoachDesktop] Recording user-facing error:', userMessage);
@@ -2138,6 +3050,17 @@ class ArenaCoachDesktop {
         this.mainWindow.webContents.send('recording:userError', userMessage);
       }
     });
+
+    // Forward retention cleanup event (quota-triggered deletions)
+    this.recordingService.on(
+      'recordingRetentionCleanup',
+      (data: { deletedCount: number; freedGB: number; maxGB: number }) => {
+        console.info('[ArenaCoachDesktop] Recording retention cleanup:', data);
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send('recording:retentionCleanup', data);
+        }
+      }
+    );
 
     console.info('[ArenaCoachDesktop] Recording event handlers registered');
   }
@@ -2169,6 +3092,11 @@ class ArenaCoachDesktop {
   private async handleMatchStartedInternal(event: MatchStartedEvent): Promise<void> {
     console.info('[ArenaCoachDesktop] Match started:', event);
 
+    if (this.recordingRecoveryTimeoutId) {
+      clearTimeout(this.recordingRecoveryTimeoutId);
+      this.recordingRecoveryTimeoutId = null;
+    }
+
     await this.matchLifecycleService?.handleMatchStarted(event);
 
     // Notify renderer process when match starts
@@ -2184,19 +3112,25 @@ class ArenaCoachDesktop {
   private async handleMatchEndedInternal(event: MatchEndedEvent): Promise<void> {
     console.info('[ArenaCoachDesktop] Match ended:', event);
 
-    if (!this.matchLifecycleService) return;
-
     const key = event.bufferId;
-    const finalizationPromise = this.matchLifecycleService.handleMatchEnded(event);
-    this.ongoingFinalizations.set(
-      key,
-      finalizationPromise.finally(() => this.ongoingFinalizations.delete(key))
-    );
-    await finalizationPromise;
+    const finalizationPromise = this.matchLifecycleService
+      ? this.matchLifecycleService.handleMatchEnded(event)
+      : Promise.resolve();
+    if (this.matchLifecycleService) {
+      this.ongoingFinalizations.set(key, finalizationPromise);
+    }
+    try {
+      await finalizationPromise;
+    } finally {
+      if (this.matchLifecycleService) {
+        this.ongoingFinalizations.delete(key);
+      }
 
-    // Notify renderer process
-    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send('match:ended', event);
+      // Always notify renderer so UI exits "in match" state
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('match:ended', event);
+      }
+      this.flushPendingRecordingRecovery('matchEnded');
     }
   }
 
@@ -2207,28 +3141,32 @@ class ArenaCoachDesktop {
   private async handleMatchEndedIncompleteInternal(
     event: MatchEndedIncompleteEvent
   ): Promise<void> {
-    const { bufferId, trigger, lines } = event;
-    console.warn(`[ArenaCoachDesktop] Match ended incomplete:`, {
-      bufferId,
-      trigger,
-      lines,
-    });
-
-    await this.matchLifecycleService?.handleMatchEndedIncomplete(event);
-
-    // Notify UI for match list refresh
-    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send('match:listNeedsRefresh', event);
-    }
-
-    // Notify renderer process of incomplete match
-    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send('match:endedIncomplete', {
+    try {
+      const { bufferId, trigger, lines } = event;
+      console.warn(`[ArenaCoachDesktop] Match ended incomplete:`, {
         bufferId,
         trigger,
         lines,
-        timestamp: new Date().toISOString(),
       });
+
+      await this.matchLifecycleService?.handleMatchEndedIncomplete(event);
+
+      // Notify UI for match list refresh
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('match:listNeedsRefresh', event);
+      }
+
+      // Notify renderer process of incomplete match
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('match:endedIncomplete', {
+          bufferId,
+          trigger,
+          lines,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    } finally {
+      this.flushPendingRecordingRecovery('matchEndedIncomplete');
     }
   }
 
@@ -2240,19 +3178,49 @@ class ArenaCoachDesktop {
   private async handleMatchProcessedInternal(payload: MatchProcessedPayload): Promise<void> {
     const { matchEvent, chunkFilePath } = payload;
 
-    // Load authoritative metadata state from disk (single source of truth)
-    const storedMetadata = await this.metadataStorageService.loadMatchByBufferId(
-      matchEvent.bufferId
-    );
+    // Load authoritative metadata state from disk with diagnostics
+    // to distinguish "not found" from "load failed"
+    let loadResult: Awaited<
+      ReturnType<typeof this.metadataStorageService.loadMatchByBufferIdWithDiagnostics>
+    >;
+
+    try {
+      loadResult = await this.metadataStorageService.loadMatchByBufferIdWithDiagnostics(
+        matchEvent.bufferId
+      );
+    } catch (loadError) {
+      // Catastrophic failure (cannot read directory) - skip without deleting chunk
+      // (transient; aged retention cleanup will handle once storage is healthy)
+      console.error(
+        `[ArenaCoachDesktop] Catastrophic metadata load failure in matchProcessed; preserving chunk:`,
+        { bufferId: matchEvent.bufferId, chunkFilePath },
+        loadError
+      );
+      return;
+    }
+
+    const { match: storedMetadata, scanErrors } = loadResult;
 
     console.info('[ArenaCoachDesktop] Match processed:', {
       bufferId: matchEvent.bufferId,
       matchHash: storedMetadata?.matchHash,
       chunkFilePath: chunkFilePath,
+      scanErrors: scanErrors.length > 0 ? scanErrors.length : undefined,
     });
+
     if (!storedMetadata) {
-      console.error(
-        `[ArenaCoachDesktop] No metadata found for match ${matchEvent.bufferId} - this should never happen in progressive system`
+      // Scan incomplete - can't prove "not found"; target file may be in scanErrors
+      if (scanErrors.length > 0) {
+        console.warn(
+          `[ArenaCoachDesktop] Metadata scan incomplete; preserving chunk for later cleanup:`,
+          { bufferId: matchEvent.bufferId, scanErrorCount: scanErrors.length, scanErrors }
+        );
+        return;
+      }
+
+      // Scan complete, truly not found - chunk preserved for log export/retention cleanup
+      console.warn(
+        `[ArenaCoachDesktop] No metadata found for bufferId; skipping matchProcessed (chunk preserved for retention cleanup): ${matchEvent.bufferId}`
       );
       return;
     }
@@ -2282,23 +3250,42 @@ class ArenaCoachDesktop {
           `[ArenaCoachDesktop] Successfully submitted chunk for complete match: ${matchHash}`
         );
       } catch (uploadError) {
-        console.error(`[ArenaCoachDesktop] Upload failed for match ${matchHash}:`, uploadError);
+        console.error(
+          `[ArenaCoachDesktop] Upload failed for match ${matchHash}:`,
+          toSafeAxiosErrorLog(uploadError)
+        );
 
         // Map upload errors to appropriate metadata updates
         if (isCombatLogExpiredError(uploadError)) {
           console.info('[ArenaCoachDesktop] Processing expired combat log for match:', matchHash);
 
-          // Update metadata and clean up chunks for expired match
-          if (storedMetadata.bufferId) {
-            await this.updateMatchMetadataToExpired(matchHash, storedMetadata.bufferId);
-          } else {
+          // Update metadata and delete chunk for expired match
+          if (!storedMetadata.bufferId) {
             console.warn(
               `[ArenaCoachDesktop] Cannot process expired match - no bufferId for ${matchHash}`
             );
+          } else {
+            const currentTimeMs = Date.now();
+            // Explicit construction with validated fields (no as cast)
+            const narrowedMatch = {
+              ...storedMetadata,
+              matchHash,
+              bufferId: storedMetadata.bufferId,
+            };
+            const result = await this.updateMatchMetadataToExpired(narrowedMatch, currentTimeMs);
+            if (result.errors.length > 0) {
+              console.warn(
+                `[ArenaCoachDesktop] Errors during expiration processing for ${matchHash}:`,
+                result.errors
+              );
+            }
           }
         } else {
           // Handle all other errors by marking as FAILED
-          console.error(`[ArenaCoachDesktop] Upload error for match ${matchHash}:`, uploadError);
+          console.error(
+            `[ArenaCoachDesktop] Upload error for match ${matchHash}:`,
+            toSafeAxiosErrorLog(uploadError)
+          );
 
           const errorMessage =
             uploadError instanceof Error ? uploadError.message : String(uploadError);
@@ -2470,8 +3457,28 @@ class ArenaCoachDesktop {
           }
         );
 
-        // Always clean up chunk files after successful analysis (both auth and non-auth)
-        await this.cleanupChunksAfterAnalysis(jobId);
+        // Keep auth state in sync with backend-authoritative job-status entitlement.
+        // This updates UI immediately when premium is gained/lost while app is running.
+        const authToken = this.authManager.getAuthToken();
+        const currentUser = this.authManager.getCurrentUser();
+        if (authToken && currentUser && typeof event.isPremiumViewer === 'boolean') {
+          const premiumChanged = currentUser.is_premium !== event.isPremiumViewer;
+
+          if (premiumChanged) {
+            const updatedUser: UserInfo = {
+              ...currentUser,
+              is_premium: event.isPremiumViewer,
+            };
+            this.authManager.updateCurrentUser(updatedUser);
+            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+              this.mainWindow.webContents.send('auth:success', {
+                token: authToken,
+                user: updatedUser,
+                source: 'billing-status',
+              });
+            }
+          }
+        }
 
         // Notify renderer process (existing behavior preserved)
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
@@ -2628,9 +3635,9 @@ class ArenaCoachDesktop {
       try {
         // SAFE BOUNDARY PATTERN: Immediately extract known properties
         const errorMessage = error?.message || error?.toString() || 'Unknown error';
-        console.error('Match detection service error:', error);
+        console.error('[ArenaCoachDesktop] Match detection service error:', errorMessage);
       } catch (handlingError) {
-        console.error('Error handling service error event:', handlingError);
+        console.error('[ArenaCoachDesktop] Error handling service error event:', handlingError);
       }
     });
 
@@ -2683,6 +3690,10 @@ class ArenaCoachDesktop {
           clearInterval(this.recoveryTimer);
           this.recoveryTimer = null;
         }
+        if (this.recordingRecoveryTimeoutId) {
+          clearTimeout(this.recordingRecoveryTimeoutId);
+          this.recordingRecoveryTimeoutId = null;
+        }
 
         // Shutdown recording service FIRST (critical for OBS cleanup)
         if (this.recordingService) {
@@ -2732,15 +3743,25 @@ class ArenaCoachDesktop {
    * Entitlements are enforced server-side via DB checks in /api/upload/job-status.
    */
   private async checkSkillCappedStatus(
-    data: { token: AuthToken; user: UserInfo },
+    _data: { token: AuthToken; user: UserInfo },
     sourceFlag?: string
-  ): Promise<{ token: AuthToken; user: UserInfo }> {
+  ): Promise<void> {
     try {
+      if (!this.authManager.isAuthenticated() || !this.apiHeadersProvider.hasAuth()) {
+        return;
+      }
       const headers = this.apiHeadersProvider.getHeaders();
       const response = await fetch(`${this.apiBaseUrl}/api/skillcapped/status`, {
         method: 'GET',
         headers,
       });
+
+      // 401: Token rejected - logout immediately (truthfulness)
+      if (response.status === 401) {
+        console.warn('[Main] Skill Capped status check returned 401, logging out');
+        await this.authManager.logout();
+        return;
+      }
 
       if (response.ok) {
         const statusData = (await response.json()) as {
@@ -2748,38 +3769,127 @@ class ArenaCoachDesktop {
           is_verified: boolean;
         };
 
+        // Check if still authenticated (logout/rotation could have occurred during fetch)
+        const currentToken = this.authManager.getAuthToken();
+        const currentUser = this.authManager.getCurrentUser();
+        if (!currentToken || !currentUser) {
+          // Auth changed mid-flight, don't emit stale state
+          return;
+        }
+
         // Update user object based on server status (supports revocation)
-        const updatedUser = { ...data.user, is_skill_capped_verified: statusData.is_verified };
+        const updatedUser = { ...currentUser, is_skill_capped_verified: statusData.is_verified };
 
         // Log status changes for debugging
-        if (data.user.is_skill_capped_verified !== statusData.is_verified) {
+        if (currentUser.is_skill_capped_verified !== statusData.is_verified) {
           console.info(
-            `[Main] Skill Capped status changed for ${data.user?.battletag || 'Unknown'} (ID: ${data.user?.id || 'N/A'}): ${data.user.is_skill_capped_verified} → ${statusData.is_verified}`
+            `[Main] Skill Capped status changed for ${currentUser.battletag || 'Unknown'} (ID: ${currentUser.id || 'N/A'}): ${currentUser.is_skill_capped_verified} → ${statusData.is_verified}`
           );
         }
 
         this.authManager.updateCurrentUser(updatedUser);
 
-        // Always emit auth:success (renderer only listens for this)
+        // Emit auth:success with current SSoT token and confirmed status
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           this.mainWindow.webContents.send('auth:success', {
-            token: data.token,
+            token: currentToken,
             user: updatedUser,
-            source: statusData.is_verified && sourceFlag ? sourceFlag : undefined,
+            source: sourceFlag,
           });
         }
-
-        return { token: data.token, user: updatedUser };
+        return;
       }
     } catch (error) {
       console.warn('[Main] Failed to check Skill Capped status:', error);
     }
+  }
 
-    // Fallback: emit auth:success with original data if status check failed
-    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send('auth:success', data);
+  /**
+   * Check billing status and update user object.
+   * Used by login, restore, and explicit refresh calls.
+   */
+  private async checkBillingStatus(): Promise<{ success: true } | { success: false; error: string }> {
+    try {
+      if (!this.authManager.isAuthenticated() || !this.apiHeadersProvider.hasAuth()) {
+        return { success: false, error: 'Not authenticated' };
+      }
+      const headers = this.apiHeadersProvider.getHeaders();
+      const response = await fetch(`${this.apiBaseUrl}/api/billing/status`, {
+        method: 'GET',
+        headers,
+      });
+
+      if (response.status === 401) {
+        console.warn('[Main] Billing status check returned 401, logging out');
+        await this.authManager.logout();
+        return { success: false, error: 'Unauthorized' };
+      }
+
+      let statusData: unknown = null;
+      try {
+        statusData = await response.json();
+      } catch (parseError) {
+        console.warn('[Main] Failed to parse billing status response:', parseError);
+      }
+
+      if (!response.ok) {
+        let errorMessage = `Billing status request failed (${response.status})`;
+        if (statusData && typeof statusData === 'object' && 'error' in statusData) {
+          const errorPayload = (statusData as { error?: { message?: string } }).error;
+          if (errorPayload && typeof errorPayload.message === 'string') {
+            errorMessage = errorPayload.message;
+          }
+        }
+        return { success: false, error: errorMessage };
+      }
+
+      if (
+        !statusData ||
+        typeof statusData !== 'object' ||
+        (statusData as { success?: boolean }).success !== true
+      ) {
+        return { success: false, error: 'Invalid billing status response.' };
+      }
+
+      const data = (statusData as {
+        data?: { billingEnabled?: boolean; isPremium?: boolean; premiumSources?: Array<'skillcapped' | 'stripe'> };
+      }).data;
+
+      if (
+        !data ||
+        typeof data.billingEnabled !== 'boolean' ||
+        typeof data.isPremium !== 'boolean' ||
+        !Array.isArray(data.premiumSources)
+      ) {
+        return { success: false, error: 'Invalid billing status response.' };
+      }
+
+      const currentToken = this.authManager.getAuthToken();
+      const currentUser = this.authManager.getCurrentUser();
+      if (!currentToken || !currentUser) {
+        return { success: false, error: 'Missing auth context.' };
+      }
+
+      const updatedUser: UserInfo = {
+        ...currentUser,
+        is_premium: data.isPremium,
+        premium_sources: data.premiumSources,
+      };
+
+      this.authManager.updateCurrentUser(updatedUser);
+
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('auth:success', {
+          token: currentToken,
+          user: updatedUser,
+          source: 'billing-status',
+        });
+      }
+      return { success: true };
+    } catch (error) {
+      console.warn('[Main] Failed to check billing status:', error);
     }
-    return data;
+    return { success: false, error: 'Failed to fetch billing status.' };
   }
 
   private setupAuthentication(): void {
@@ -2790,8 +3900,17 @@ class ArenaCoachDesktop {
       // Update all services with auth token
       this.updateAllServicesAuthToken(data.token.accessToken);
 
+      // Emit baseline auth success immediately (do not depend on status endpoints)
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('auth:success', {
+          token: data.token,
+          user: data.user,
+        });
+      }
+
       // Check Skill Capped status and emit result
       await this.checkSkillCappedStatus(data, 'login-with-status');
+      await this.checkBillingStatus();
     });
 
     this.authManager.on('auth-restored', async (data: { token: AuthToken; user: UserInfo }) => {
@@ -2800,8 +3919,18 @@ class ArenaCoachDesktop {
       // Update all services with restored auth token
       this.updateAllServicesAuthToken(data.token.accessToken);
 
+      // Emit baseline auth success immediately (do not depend on status endpoints)
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('auth:success', {
+          token: data.token,
+          user: data.user,
+          source: 'restore-with-status',
+        });
+      }
+
       // Check Skill Capped status and emit auth:success
       await this.checkSkillCappedStatus(data, 'restore-with-status');
+      await this.checkBillingStatus();
     });
 
     this.authManager.on('token-refreshed', (token: AuthToken) => {
@@ -2835,7 +3964,7 @@ class ArenaCoachDesktop {
     });
 
     this.authManager.on('auth-error', (error: Error) => {
-      console.error('Authentication error:', error);
+      console.error('Authentication error:', toSafeAxiosErrorLog(error));
 
       // Notify renderer process
       if (this.mainWindow && !this.mainWindow.isDestroyed()) {
@@ -3036,6 +4165,7 @@ class ArenaCoachDesktop {
       fps: settings.recording.fps,
       bitrate: QUALITY_BITRATE_KBPS_MAP[settings.recording.quality],
       encoder: settings.recording.encoder || 'x264',
+      encoderMode: settings.recording.encoderMode || 'auto',
       ...(settings.recordingLocation && { outputDir: settings.recordingLocation }),
     };
   }
@@ -3085,19 +4215,27 @@ class ArenaCoachDesktop {
           }
 
           // Apply saved recording settings using helper method
-          await this.applyPersistedRecordingSettings();
-
-          console.info('[ArenaCoachDesktop] Recording service initialized');
+          const applyResult = await this.applyPersistedRecordingSettings();
+          if (applyResult.success) {
+            console.info('[ArenaCoachDesktop] Recording service initialized');
+          } else {
+            console.warn(
+              '[ArenaCoachDesktop] Recording service initialized but settings apply failed:',
+              applyResult.error
+            );
+          }
         } catch (error) {
           console.error('[ArenaCoachDesktop] Failed to initialize recording service:', error);
           // Non-critical - continue without recording
           this.recordingService = null;
+          this.clearRecordingRecoveryState();
         }
       } else {
         console.info(
           '[ArenaCoachDesktop] Recording disabled in settings or not supported on this platform'
         );
         this.recordingService = null;
+        this.clearRecordingRecoveryState();
       }
 
       // 5. Lifecycle orchestrator (depends on metadata + recording)
@@ -3115,8 +4253,7 @@ class ArenaCoachDesktop {
       // Initialize health check service
       this.serviceHealthCheck = new ServiceHealthCheck(
         this.apiBaseUrl,
-        this.apiHeadersProvider,
-        ArenaCoachDesktop.JOB_STATUS_ENDPOINT
+        this.apiHeadersProvider
       );
       this.uploadService = new UploadService(
         this.apiBaseUrl,
@@ -3176,6 +4313,15 @@ class ArenaCoachDesktop {
         }
       });
 
+      // Handle auth failures from polling service (401 responses)
+      this.completionPollingService.on(
+        'authRequired',
+        async (event: { jobId: string; matchHash: string; reason: string }) => {
+          console.warn('[Main] CompletionPollingService reported auth failure:', event.reason);
+          await this.authManager.logout();
+        }
+      );
+
       // Pass the JobQueueOrchestrator to the MatchDetectionService
       // This allows it to use our new decomposed services for uploads
       this.matchDetectionService.setJobQueueOrchestrator(this.jobQueueOrchestrator);
@@ -3226,39 +4372,70 @@ class ArenaCoachDesktop {
   }
 
   /**
-   * Update match metadata to expired status when combat log is too old
+   * Update match metadata to expired status when combat log is too old.
+   * Returns explicit result (no silent swallowing of failures).
+   * @param match The match metadata with required matchHash and bufferId
+   * @param currentTimeMs Timestamp for deterministic failedAt/lastUpdatedAt
+   * @returns Object with metadataUpdated, chunkDeleted, and errors
    */
-  private async updateMatchMetadataToExpired(matchHash: string, bufferId: string): Promise<void> {
+  private async updateMatchMetadataToExpired(
+    match: StoredMatchMetadata & { matchHash: string; bufferId: string },
+    currentTimeMs: number
+  ): Promise<{ metadataUpdated: boolean; chunkDeleted: boolean; errors: string[] }> {
+    const errors: string[] = [];
+
+    // Build updated metadata with explicit field updates
+    const updatedMatch: StoredMatchMetadata = {
+      ...match,
+      uploadStatus: UploadStatus.EXPIRED,
+      errorMessage: `Combat log expired (older than ${ExpirationConfig.COMBAT_LOG_EXPIRATION_HOURS} hours)`,
+      failedAt: new Date(currentTimeMs).toISOString(),
+      lastUpdatedAt: new Date(currentTimeMs),
+      // Ensure storedAt is set (avoid Date.now() in storage layer)
+      storedAt: match.storedAt ?? currentTimeMs,
+    };
+
+    // Persist metadata update
+    let metadataUpdated = false;
     try {
-      await this.metadataStorageService.updateMatchStatus(matchHash, UploadStatus.EXPIRED, {
-        errorMessage: `Combat log expired (older than ${ExpirationConfig.COMBAT_LOG_EXPIRATION_HOURS} hours)`,
-        failedAt: new Date().toISOString(),
-      });
+      await this.metadataStorageService.saveMatch(updatedMatch);
+      metadataUpdated = true;
+      console.info('[ArenaCoachDesktop] Updated match metadata to expired:', match.matchHash);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errorMessage = `Failed to save expired metadata for ${match.matchHash}: ${message}`;
+      errors.push(errorMessage);
+      console.error('[ArenaCoachDesktop]', errorMessage);
+      // Return early - don't attempt chunk deletion if metadata update failed
+      return { metadataUpdated: false, chunkDeleted: false, errors };
+    }
 
-      console.info('[ArenaCoachDesktop] Updated match metadata to expired:', matchHash);
+    // Attempt chunk deletion via explicit-result API
+    const deleteResult = await this.chunkCleanupService.deleteChunkForBufferId(match.bufferId);
+    if (deleteResult.errors.length > 0) {
+      errors.push(...deleteResult.errors);
+    }
+    if (deleteResult.chunkDeleted) {
+      console.info(
+        '[ArenaCoachDesktop] Deleted chunk file for expired match (by bufferId):',
+        match.bufferId
+      );
+    }
 
-      try {
-        await this.chunkCleanupService.cleanupChunksForInstance(bufferId);
-        console.info(
-          '[ArenaCoachDesktop] Cleaned up chunk files for expired match (by bufferId):',
-          bufferId
-        );
-      } catch (cleanupError) {
-        console.error(
-          `[ArenaCoachDesktop] Failed to cleanup chunks for expired match ${matchHash}:`,
-          cleanupError
-        );
-      }
-
+    // Notify renderer process (guarded to maintain explicit-result contract)
+    try {
       if (this.mainWindow && !this.mainWindow.isDestroyed()) {
         this.mainWindow.webContents.send('match:statusUpdated', {
-          matchHash,
+          matchHash: match.matchHash,
           status: UploadStatus.EXPIRED,
         });
       }
-    } catch (error) {
-      console.error('[ArenaCoachDesktop] Failed to update match metadata to expired:', error);
+    } catch (notifyError) {
+      const message = notifyError instanceof Error ? notifyError.message : String(notifyError);
+      errors.push(`Failed to notify renderer: ${message}`);
     }
+
+    return { metadataUpdated, chunkDeleted: deleteResult.chunkDeleted, errors };
   }
 
   /**
@@ -3313,37 +4490,33 @@ class ArenaCoachDesktop {
     x: number;
     y: number;
   } {
-    // Type check
+    // Type check - narrow to Record<string, unknown> for safe property access
     if (!bounds || typeof bounds !== 'object') {
-      const error = new Error('Invalid preview bounds: must be an object');
-      (error as any).code = 'INVALID_PREVIEW_BOUNDS';
-      throw error;
+      throw new AppError('Invalid preview bounds: must be an object', 'INVALID_PREVIEW_BOUNDS');
     }
 
-    const b = bounds as any;
+    const b = bounds as Record<string, unknown>;
 
     // Check required properties exist
     if (!('width' in b) || !('height' in b) || !('x' in b) || !('y' in b)) {
-      const error = new Error(
-        'Invalid preview bounds: missing required properties (width, height, x, y)'
+      throw new AppError(
+        'Invalid preview bounds: missing required properties (width, height, x, y)',
+        'INVALID_PREVIEW_BOUNDS'
       );
-      (error as any).code = 'INVALID_PREVIEW_BOUNDS';
-      throw error;
     }
 
-    // Validate each property
+    // Extract and validate each property is a number
     const { width, height, x, y } = b;
-
-    // Check all are numbers
     if (
       typeof width !== 'number' ||
       typeof height !== 'number' ||
       typeof x !== 'number' ||
       typeof y !== 'number'
     ) {
-      const error = new Error('Invalid preview bounds: all properties must be numbers');
-      (error as any).code = 'INVALID_PREVIEW_BOUNDS';
-      throw error;
+      throw new AppError(
+        'Invalid preview bounds: all properties must be numbers',
+        'INVALID_PREVIEW_BOUNDS'
+      );
     }
 
     // Check all are finite
@@ -3353,33 +4526,35 @@ class ArenaCoachDesktop {
       !Number.isFinite(x) ||
       !Number.isFinite(y)
     ) {
-      const error = new Error('Invalid preview bounds: all properties must be finite numbers');
-      (error as any).code = 'INVALID_PREVIEW_BOUNDS';
-      throw error;
+      throw new AppError(
+        'Invalid preview bounds: all properties must be finite numbers',
+        'INVALID_PREVIEW_BOUNDS'
+      );
     }
 
-    // Check non-negative
+    // Check non-negative coordinates
     if (x < 0 || y < 0) {
-      const error = new Error('Invalid preview bounds: x and y must be non-negative');
-      (error as any).code = 'INVALID_PREVIEW_BOUNDS';
-      throw error;
+      throw new AppError(
+        'Invalid preview bounds: x and y must be non-negative',
+        'INVALID_PREVIEW_BOUNDS'
+      );
     }
 
     // Check positive dimensions
     if (width <= 0 || height <= 0) {
-      const error = new Error('Invalid preview bounds: width and height must be positive');
-      (error as any).code = 'INVALID_PREVIEW_BOUNDS';
-      throw error;
+      throw new AppError(
+        'Invalid preview bounds: width and height must be positive',
+        'INVALID_PREVIEW_BOUNDS'
+      );
     }
 
     // Sanity check for reasonable bounds (prevent memory issues)
     const MAX_DIMENSION = 10000;
     if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
-      const error = new Error(
-        `Invalid preview bounds: dimensions exceed maximum (${MAX_DIMENSION}px)`
+      throw new AppError(
+        `Invalid preview bounds: dimensions exceed maximum (${MAX_DIMENSION}px)`,
+        'INVALID_PREVIEW_BOUNDS'
       );
-      (error as any).code = 'INVALID_PREVIEW_BOUNDS';
-      throw error;
     }
 
     return { width, height, x, y };
@@ -3473,53 +4648,17 @@ class ArenaCoachDesktop {
   }
 
   /**
-   * Clean up chunk files after successful analysis completion
-   */
-  private async cleanupChunksAfterAnalysis(jobId: string): Promise<void> {
-    try {
-      // Find the match metadata to get the bufferId
-      const existingMatch = await this.metadataStorageService.findMatchByJobId(jobId);
-
-      if (existingMatch && existingMatch.bufferId) {
-        const bufferId = existingMatch.bufferId;
-
-        console.info('[ArenaCoachDesktop] Initiating chunk cleanup for successful analysis:', {
-          bufferId,
-          jobId,
-        });
-
-        // Clean up chunk files for this instance
-        await this.chunkCleanupService.cleanupChunksForInstance(bufferId, jobId);
-
-        console.info('[ArenaCoachDesktop] Chunk cleanup completed for instance:', bufferId);
-      } else {
-        console.warn(
-          '[ArenaCoachDesktop] Cannot cleanup chunks: No bufferId found for jobId:',
-          jobId
-        );
-      }
-    } catch (error) {
-      console.error('[ArenaCoachDesktop] Failed to cleanup chunks after analysis:', {
-        jobId,
-        error: (error as Error).message,
-      });
-      // Don't throw - chunk cleanup failure shouldn't break the analysis pipeline
-    }
-  }
-
-  /**
-   * Clean up chunk files for terminal failures (expired, not found)
-   * Preserves chunks for retryable failures to enable re-uploads
+   * Clean up chunk files for terminal NOT_FOUND failures (non-retryable).
+   * Expired matches are handled by updateMatchMetadataToExpired / periodic maintenance.
+   * Preserves chunks for retryable failures to enable re-uploads.
    */
   private async cleanupChunksForTerminalFailure(
     jobId: string,
     matchHash: string,
     isNotFound?: boolean
   ): Promise<void> {
-    // Only cleanup chunks for terminal failure types that shouldn't be retried
-    const shouldCleanup = isNotFound === true; // NOT_FOUND status (job doesn't exist on server)
-
-    if (!shouldCleanup) {
+    // Only cleanup chunks for NOT_FOUND (job doesn't exist on server, non-retryable)
+    if (isNotFound !== true) {
       console.debug(
         '[ArenaCoachDesktop] Preserving chunk files for potentially retryable failure:',
         {
@@ -3532,30 +4671,43 @@ class ArenaCoachDesktop {
       return;
     }
 
-    try {
-      console.info('[ArenaCoachDesktop] Initiating chunk cleanup for terminal failure:', {
-        matchHash,
-        jobId,
-        failureType: isNotFound ? 'NOT_FOUND' : 'OTHER',
-      });
+    console.info('[ArenaCoachDesktop] Initiating chunk cleanup for terminal failure:', {
+      matchHash,
+      jobId,
+      failureType: 'NOT_FOUND',
+    });
 
+    try {
       const existingMatch = await this.metadataStorageService.findMatchByJobId(jobId);
       if (existingMatch?.bufferId) {
-        await this.chunkCleanupService.cleanupChunksForInstance(existingMatch.bufferId, jobId);
+        const result = await this.chunkCleanupService.cleanupChunksForInstance(
+          existingMatch.bufferId,
+          jobId
+        );
+        if (result.success) {
+          console.info(
+            '[ArenaCoachDesktop] Chunk cleanup completed for terminal failure:',
+            matchHash
+          );
+        } else {
+          console.warn('[ArenaCoachDesktop] Chunk cleanup had errors for terminal failure:', {
+            matchHash,
+            errors: result.errors,
+          });
+        }
       } else {
         console.warn(
           '[ArenaCoachDesktop] Cannot cleanup chunks: No bufferId found for jobId:',
           jobId
         );
       }
-
-      console.info('[ArenaCoachDesktop] Chunk cleanup completed for terminal failure:', matchHash);
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
       console.error('[ArenaCoachDesktop] Failed to cleanup chunks for terminal failure:', {
         jobId,
         matchHash,
         isNotFound,
-        error: (error as Error).message,
+        error: errorMessage,
       });
       // Don't throw - chunk cleanup failure shouldn't break the analysis pipeline
     }
@@ -3597,94 +4749,160 @@ class ArenaCoachDesktop {
   }
 
   /**
-   * Perform periodic check for expired metadata files and mark them as expired
-   * This handles cases where users don't log in to trigger expiration checks
+   * Perform periodic maintenance pass with staged cleanup:
+   * 1. Aged chunk cleanup (delete chunks older than retention window)
+   * 2. Expiration maintenance (mark stale uploads as EXPIRED and delete their chunks)
+   * 3. Orphan detection (log orphaned chunks for diagnostics; no deletion here)
    */
   private async performPeriodicExpirationCheck(): Promise<void> {
+    console.info('[ArenaCoachDesktop] Starting periodic maintenance pass');
+    const currentTimeMs = Date.now();
+
+    // Stage 1: Aged chunk cleanup (always runs first)
     try {
-      console.info('[ArenaCoachDesktop] Starting periodic expiration check');
-
-      // Find all expired matches by scanning metadata files
-      const expiredMatchHashes = await this.findExpiredMatches();
-
-      if (expiredMatchHashes.length === 0) {
-        console.info('[ArenaCoachDesktop] No expired matches found during periodic check');
-        return;
-      }
-
-      console.info(
-        `[ArenaCoachDesktop] Found ${expiredMatchHashes.length} expired matches during periodic check`
-      );
-
-      // Process each expired match using matchHash directly
-      const processPromises = expiredMatchHashes.map(async matchHash => {
-        try {
-          await this.metadataStorageService.updateMatchStatus(matchHash, UploadStatus.EXPIRED);
-          return { matchHash, success: true };
-        } catch (error) {
-          console.error(
-            `[ArenaCoachDesktop] Failed to expire match during periodic check: ${matchHash}`,
-            error
-          );
-          return { matchHash, success: false, error: (error as Error).message };
-        }
-      });
-
-      // Use Promise.allSettled to handle failures gracefully
-      const results = await Promise.allSettled(processPromises);
-      const successCount = results.filter(r => r.status === 'fulfilled').length;
-      const failureCount = results.filter(r => r.status === 'rejected').length;
-
-      console.info('[ArenaCoachDesktop] Periodic expiration check completed:', {
-        totalMatches: expiredMatchHashes.length,
-        successCount,
-        failureCount,
-      });
-
-      // NEW: Check for orphaned chunk files (chunks without corresponding metadata)
-      try {
-        console.info('[ArenaCoachDesktop] Starting orphaned chunk detection');
-
-        // Get all valid bufferIds from metadata service
-        const allMatches = await this.metadataStorageService.listMatches(10000, 0); // Get large batch to cover all matches
-        const validBufferIds = new Set(allMatches.map(match => match.bufferId!).filter(Boolean));
-
-        console.debug(
-          `[ArenaCoachDesktop] Found ${validBufferIds.size} valid bufferIds in metadata`
+      console.info('[ArenaCoachDesktop] Stage 1: Aged chunk cleanup');
+      const { agedChunkPaths, scanErrors: agedScanErrors } =
+        await this.chunkCleanupService.findAgedChunks(
+          ChunkRetentionConfig.RETENTION_MS,
+          currentTimeMs
         );
 
-        // Find orphaned chunks
-        const orphanedChunks = await this.chunkCleanupService.findOrphanedChunks(validBufferIds);
+      if (agedScanErrors.length > 0) {
+        console.warn('[ArenaCoachDesktop] Aged chunk scan errors:', agedScanErrors);
+      }
 
-        if (orphanedChunks.length > 0) {
-          console.warn(
-            `[ArenaCoachDesktop] Found ${orphanedChunks.length} orphaned chunk files. Cleaning up.`
-          );
-
-          // Clean up orphaned chunks
-          const cleanupResult = await this.chunkCleanupService.cleanupFiles(orphanedChunks);
-
-          console.info('[ArenaCoachDesktop] Orphaned chunk cleanup completed:', {
-            totalOrphanedChunks: orphanedChunks.length,
-            successCount: cleanupResult.successCount,
-            failureCount: cleanupResult.failureCount,
-          });
-        } else {
-          console.debug('[ArenaCoachDesktop] No orphaned chunk files found');
-        }
-      } catch (orphanError) {
-        console.error('[ArenaCoachDesktop] Failed during orphaned chunk cleanup:', orphanError);
-        // Don't throw - this is a bonus cleanup, shouldn't break the main expiration logic
+      if (agedChunkPaths.length > 0) {
+        const cleanupResult = await this.chunkCleanupService.cleanupFiles(agedChunkPaths);
+        console.info('[ArenaCoachDesktop] Aged chunk cleanup completed:', {
+          totalAgedChunks: agedChunkPaths.length,
+          deletedCount: cleanupResult.deletedCount,
+          missingCount: cleanupResult.missingCount,
+          failureCount: cleanupResult.failureCount,
+        });
+      } else {
+        console.debug('[ArenaCoachDesktop] No aged chunks found');
       }
     } catch (error) {
-      console.error('[ArenaCoachDesktop] Failed during periodic expiration check:', error);
-      // Don't throw - timer should continue running
+      console.error('[ArenaCoachDesktop] Stage 1 failed (aged chunk cleanup):', error);
+      // Continue to next stage
     }
+
+    // Stage 2: Expiration maintenance (packaged app only via ExpirationConfig.isExpired)
+    try {
+      console.info('[ArenaCoachDesktop] Stage 2: Expiration maintenance');
+      const { matches, scanErrors: metadataScanErrors } =
+        await this.metadataStorageService.listAllMatchesWithDiagnostics();
+
+      if (metadataScanErrors.length > 0) {
+        console.warn('[ArenaCoachDesktop] Metadata scan errors:', metadataScanErrors);
+      }
+
+      // Filter for expirable matches (non-terminal upload status, expired by ExpirationConfig, has required fields)
+      const expirableMatches: Array<StoredMatchMetadata & { matchHash: string; bufferId: string }> =
+        [];
+      for (const match of matches) {
+        // Skip if already in terminal status or missing required fields
+        if (!ArenaCoachDesktop.NON_TERMINAL_UPLOAD_STATUSES.has(match.uploadStatus)) continue;
+        if (!match.matchHash || !match.bufferId) continue;
+        if (!match.matchData?.timestamp) continue;
+
+        // Check if expired via SSoT config (guard against invalid timestamps)
+        const timestampMs = match.matchData.timestamp.getTime();
+        if (!Number.isFinite(timestampMs)) {
+          console.warn(
+            `[ArenaCoachDesktop] Invalid timestamp for match ${match.matchHash}, skipping expiration check`
+          );
+          continue;
+        }
+
+        if (ExpirationConfig.isExpired(timestampMs, currentTimeMs)) {
+          // Explicit construction with validated fields (no as cast)
+          expirableMatches.push({
+            ...match,
+            matchHash: match.matchHash,
+            bufferId: match.bufferId,
+          });
+        }
+      }
+
+      if (expirableMatches.length > 0) {
+        console.info(`[ArenaCoachDesktop] Found ${expirableMatches.length} matches to expire`);
+
+        let metadataUpdatedCount = 0;
+        let chunkDeletedCount = 0;
+        let failureCount = 0;
+
+        for (const match of expirableMatches) {
+          const result = await this.updateMatchMetadataToExpired(match, currentTimeMs);
+          if (result.metadataUpdated) {
+            metadataUpdatedCount++;
+          } else {
+            failureCount++;
+          }
+          if (result.chunkDeleted) {
+            chunkDeletedCount++;
+          }
+          if (result.errors.length > 0) {
+            console.warn(
+              `[ArenaCoachDesktop] Expiration errors for ${match.matchHash}:`,
+              result.errors
+            );
+          }
+        }
+
+        console.info('[ArenaCoachDesktop] Expiration maintenance completed:', {
+          totalCandidates: expirableMatches.length,
+          metadataUpdatedCount,
+          chunkDeletedCount,
+          failureCount,
+        });
+      } else {
+        console.debug('[ArenaCoachDesktop] No expired matches found');
+      }
+    } catch (error) {
+      console.error('[ArenaCoachDesktop] Stage 2 failed (expiration maintenance):', error);
+      // Continue to next stage
+    }
+
+    // Stage 3: Orphan detection (diagnostics only; deletion handled by aged retention)
+    try {
+      console.info('[ArenaCoachDesktop] Stage 3: Orphan detection');
+      const validBufferIds = await this.metadataStorageService.listBufferIdsStrict();
+
+      console.debug(`[ArenaCoachDesktop] Found ${validBufferIds.size} valid bufferIds in metadata`);
+
+      const { orphanedChunkPaths, scanErrors: orphanScanErrors } =
+        await this.chunkCleanupService.findOrphanedChunks(validBufferIds);
+
+      if (orphanScanErrors.length > 0) {
+        console.warn('[ArenaCoachDesktop] Orphan scan errors:', orphanScanErrors);
+      }
+
+      if (orphanedChunkPaths.length > 0) {
+        // Log sample basenames for diagnostics (no deletion - handled by aged retention)
+        const sampleBasenames = orphanedChunkPaths.slice(0, 5).map(p => path.basename(p));
+        console.info(
+          '[ArenaCoachDesktop] Orphaned chunks detected (will be cleaned by retention):',
+          {
+            count: orphanedChunkPaths.length,
+            sampleBasenames,
+          }
+        );
+      } else {
+        console.debug('[ArenaCoachDesktop] No orphaned chunk files found');
+      }
+    } catch (error) {
+      console.error('[ArenaCoachDesktop] Stage 3 failed (orphan detection):', error);
+      // Don't throw - maintenance should continue
+    }
+
+    console.info('[ArenaCoachDesktop] Periodic maintenance pass completed');
   }
 
   /**
-   * Handle orphaned matches from previous application sessions (Task 2)
-   * Transitions stale 'in_progress' matches to 'incomplete' status after app crashes
+   * Handle orphaned matches from previous application sessions.
+   * Any 'in_progress' match at startup is orphaned by definition — no match from a
+   * previous process can recover to 'complete'. Transition all unconditionally.
    */
   private async handleOrphanedMatches(): Promise<void> {
     try {
@@ -3697,28 +4915,15 @@ class ArenaCoachDesktop {
         return;
       }
 
-      // Get all matches to identify stale in_progress states
-      const allMatches = await this.metadataStorageService.listMatches(1000, 0);
-      const currentTime = Date.now();
-      const ORPHAN_THRESHOLD_MS = 15 * 60 * 1000; // 15 minutes since last update
+      const allMatches = await this.metadataStorageService.listAllMatches();
 
       let processedCount = 0;
       let transitionedCount = 0;
 
       for (const match of allMatches) {
-        // Use hash or bufferId for logging
-        const idForLog = match.matchHash || match.bufferId || 'unknown';
-
-        const lastUpdateTime = match.lastUpdatedAt?.getTime() || match.createdAt?.getTime() || 0;
-        const timeSinceUpdate = currentTime - lastUpdateTime;
-
-        // Only handle stale 'in_progress' matches - app crashed during active match detection
-        if (
-          match.matchCompletionStatus === 'in_progress' &&
-          timeSinceUpdate > ORPHAN_THRESHOLD_MS
-        ) {
+        if (match.matchCompletionStatus === 'in_progress') {
+          const idForLog = match.matchHash || match.bufferId || 'unknown';
           try {
-            // Transition to incomplete - match was interrupted by crash
             const updatedMetadata = { ...match };
             updatedMetadata.matchCompletionStatus = 'incomplete';
             updatedMetadata.uploadStatus = UploadStatus.INCOMPLETE;
@@ -3730,7 +4935,7 @@ class ArenaCoachDesktop {
             await this.metadataStorageService.saveMatch(updatedMetadata);
 
             console.info(
-              `[ArenaCoachDesktop] Transitioned stale match to incomplete: ${idForLog} (stale for ${Math.round(timeSinceUpdate / 60000)} minutes)`
+              `[ArenaCoachDesktop] Transitioned orphaned match to incomplete: ${idForLog}`
             );
             transitionedCount++;
           } catch (error) {
@@ -3756,55 +4961,6 @@ class ArenaCoachDesktop {
     } catch (error) {
       console.error('[ArenaCoachDesktop] Error during orphaned match handling:', error);
       // Don't throw - allow app startup to continue
-    }
-  }
-
-  /**
-   * Find expired matches by scanning metadata files
-   * Returns array of matchHashes that need to be marked as expired
-   */
-  private async findExpiredMatches(): Promise<string[]> {
-    try {
-      // Get paginated matches to avoid loading everything into memory
-      const batchSize = 100;
-      let offset = 0;
-      const expiredMatchHashes: string[] = [];
-      const currentTime = Date.now();
-
-      while (true) {
-        const matches = await this.metadataStorageService.listMatches(batchSize, offset);
-
-        if (matches.length === 0) {
-          break; // No more matches
-        }
-
-        // Check each match for expiration
-        for (const match of matches) {
-          // Skip if already expired or has no timestamp
-          if (match.uploadStatus === UploadStatus.EXPIRED || !match.matchData.timestamp) {
-            continue;
-          }
-
-          // Check if match is expired using centralized config
-          const timestampMs = match.matchData.timestamp.getTime();
-          if (ExpirationConfig.isExpired(timestampMs, currentTime) && match.matchHash) {
-            expiredMatchHashes.push(match.matchHash); // Return matchHash for consistent downstream usage
-          }
-        }
-
-        // Move to next batch
-        offset += batchSize;
-
-        // If we got fewer matches than batch size, we've reached the end
-        if (matches.length < batchSize) {
-          break;
-        }
-      }
-
-      return expiredMatchHashes;
-    } catch (error) {
-      console.error('[ArenaCoachDesktop] Failed to find expired matches:', error);
-      return []; // Return empty array on error
     }
   }
 

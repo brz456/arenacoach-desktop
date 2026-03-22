@@ -2,7 +2,7 @@
 
 appId: gg.arenacoach.desktop
 productName: ArenaCoach
-copyright: 'Copyright © 2025 ArenaCoach Team'
+copyright: 'Copyright © 2026 ArenaCoach Team'
 
 directories:
   output: release
@@ -36,12 +36,13 @@ win:
   target:
     - target: nsis
       arch: [x64]
-  publisherName: ArenaCoach Team
+  publisherName: Brian Zourdani
   verifyUpdateCodeSignature: false
   requestedExecutionLevel: asInvoker
   artifactName: ArenaCoach-Setup-${version}.${ext}
 
 nsis:
+  differentialPackage: false # Blockmaps are invalidated by post-build code signing
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true

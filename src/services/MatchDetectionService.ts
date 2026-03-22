@@ -13,6 +13,7 @@ import {
 } from '../process-monitoring/WoWProcessMonitorErrors';
 import { WoWProcessMonitor } from '../process-monitoring/WoWProcessMonitor';
 import { MatchEndedEvent } from '../match-detection/types/MatchEvent';
+import { activeFlavor } from '../config/wowFlavor';
 
 /**
  * Configuration for the Match Detection Service
@@ -20,6 +21,7 @@ import { MatchEndedEvent } from '../match-detection/types/MatchEvent';
 export interface MatchDetectionServiceConfig {
   apiBaseUrl: string;
   enableWoWProcessMonitoring?: boolean;
+  isSkirmishTrackingEnabled?: () => boolean;
 }
 
 /**
@@ -64,18 +66,19 @@ export class MatchDetectionService extends EventEmitter {
   private installations: WoWInstallation[] = [];
   private outputDirectory: string;
   private isInitialized = false;
+  private didOneTimeProcessCheck = false;
 
   constructor(config: MatchDetectionServiceConfig) {
     super();
     this.config = config;
 
     // Set up output directory for match chunks with normalized folder structure
-    const userDataPath = app ? app.getPath('userData') : path.join(process.cwd(), 'data');
+    const userDataPath = app.getPath('userData');
     this.outputDirectory = path.join(userDataPath, 'logs', 'chunks');
   }
 
   /**
-   * Initialize the service with retail WoW installations only
+   * Initialize the service with WoW installations for the active flavor
    */
   public async initialize(installations: WoWInstallation[]): Promise<void> {
     if (this.isInitialized) {
@@ -83,25 +86,32 @@ export class MatchDetectionService extends EventEmitter {
       return;
     }
 
-    // Filter to retail installations only (scope reduction per architectural consensus)
-    const retailInstallations = installations.filter(installation =>
-      installation.combatLogPath.includes('_retail_')
-    );
+    // Reset one-time process check flag for new orchestrator lifecycle
+    this.didOneTimeProcessCheck = false;
 
-    if (retailInstallations.length === 0) {
+    if (installations.length === 0) {
       throw new Error(
-        'No retail WoW installations found. Only retail installations are supported.'
+        `No ${activeFlavor.id} WoW installations found. Only the active WoW flavor is supported: ${activeFlavor.id} (${activeFlavor.dirName}).`
       );
     }
 
-    this.installations = retailInstallations;
+    // Invariant: all installations must be for the active flavor
+    const invalidInstallation = installations.find(
+      i => !i.combatLogPath.includes(activeFlavor.dirName)
+    );
+    if (invalidInstallation) {
+      throw new Error(
+        `[MatchDetectionService] Installation path does not match active flavor (${activeFlavor.id} / ${activeFlavor.dirName})`
+      );
+    }
 
-    // Use the first retail installation's combat log directory
-    const primaryLogDirectory = retailInstallations[0]!.combatLogPath;
+    this.installations = installations;
 
-    console.info('[MatchDetectionService] Initializing with retail installations:', {
-      totalInstallations: installations.length,
-      retailInstallations: retailInstallations.length,
+    // Use the first installation's combat log directory
+    const primaryLogDirectory = installations[0]!.combatLogPath;
+
+    console.info(`[MatchDetectionService] Initializing with ${activeFlavor.id} installations:`, {
+      installationCount: installations.length,
       primaryLogDirectory,
       outputDirectory: this.outputDirectory,
     });
@@ -112,6 +122,9 @@ export class MatchDetectionService extends EventEmitter {
       outputDirectory: this.outputDirectory,
       watcherTimeoutMinutes: 10,
       enableWoWProcessMonitoring: this.config.enableWoWProcessMonitoring ?? true,
+      ...(this.config.isSkirmishTrackingEnabled && {
+        isSkirmishTrackingEnabled: this.config.isSkirmishTrackingEnabled,
+      }),
       chunkerOptions: {
         minMatchLines: 20,
         maxMatchLines: 200000,
@@ -165,6 +178,7 @@ export class MatchDetectionService extends EventEmitter {
       await this.orchestrator.stop();
       this.orchestrator = undefined; // Clear orchestrator reference for fresh restart
       this.isInitialized = false; // Reset initialization flag to allow restart
+      this.didOneTimeProcessCheck = false; // Reset for next lifecycle
       this.emit('stopped');
     } catch (error) {
       console.error('[MatchDetectionService] Error stopping:', error);
@@ -204,14 +218,26 @@ export class MatchDetectionService extends EventEmitter {
   public async getStatusWithProcessCheck(): Promise<MatchDetectionStatus> {
     const status = this.getStatus();
 
-    // If wowProcessStatus missing or not polled yet, do one-time check
-    if (!status.wowProcessStatus || !status.wowProcessStatus.firstPollCompleted) {
-      const processCheck = await WoWProcessMonitor.checkNow();
-      status.wowProcessStatus = {
-        isRunning: processCheck.isRunning,
-        isMonitoring: status.wowProcessStatus?.isMonitoring ?? false,
-        firstPollCompleted: status.wowProcessStatus?.firstPollCompleted ?? false,
-      };
+    // One-time check: if orchestrator hasn't polled yet and we haven't done our fallback check
+    const needsOneTimeCheck =
+      !this.didOneTimeProcessCheck &&
+      (!status.wowProcessStatus || !status.wowProcessStatus.firstPollCompleted);
+
+    if (needsOneTimeCheck) {
+      try {
+        const processCheck = await WoWProcessMonitor.checkNow();
+        this.didOneTimeProcessCheck = true;
+        status.wowProcessStatus = {
+          isRunning: processCheck.isRunning,
+          isMonitoring: status.wowProcessStatus?.isMonitoring ?? false,
+          firstPollCompleted: true,
+        };
+      } catch (error) {
+        // Log error but don't fail the status query - return status without process check
+        console.error('[MatchDetectionService] WoW process check failed:', error);
+        // Mark as attempted to avoid repeated failures
+        this.didOneTimeProcessCheck = true;
+      }
     }
 
     return status;
@@ -372,6 +398,11 @@ export class MatchDetectionService extends EventEmitter {
     this.orchestrator.on('serviceStatusChanged', status => {
       this.emit('serviceStatusChanged', status);
     });
+
+    // Forward job retry events
+    this.orchestrator.on('jobRetry', event => {
+      this.emit('jobRetry', event);
+    });
   }
 
   /**
@@ -390,5 +421,6 @@ export class MatchDetectionService extends EventEmitter {
 
     this.removeAllListeners();
     this.isInitialized = false;
+    this.didOneTimeProcessCheck = false;
   }
 }

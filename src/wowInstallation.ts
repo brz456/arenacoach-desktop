@@ -1,18 +1,48 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
+import { activeFlavor } from './config/wowFlavor';
 
 export interface WoWInstallation {
   path: string;
-  version: 'retail'; // Only retail is supported
   combatLogPath: string;
   addonsPath: string;
   addonInstalled: boolean;
   arenaCoachAddonPath: string;
 }
 
-// Windows installation constants
-const WINDOWS_EXECUTABLE = 'Wow.exe';
+/**
+ * Check if a file or directory exists.
+ * Only ENOENT is treated as non-existence; other errors (EACCES, EPERM, etc.) propagate.
+ */
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.promises.access(filePath, fs.constants.F_OK);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Synchronous path existence check.
+ * Only ENOENT is treated as non-existence; other errors (EACCES, EPERM, etc.) propagate.
+ */
+function pathExistsSync(filePath: string): boolean {
+  try {
+    fs.statSync(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false;
+    }
+    throw error;
+  }
+}
+
 const WINDOWS_INSTALL_PATHS = [
   'C:\\World of Warcraft',
   'C:\\Program Files (x86)\\World of Warcraft',
@@ -54,34 +84,25 @@ export class AddonManager {
   public static async checkAddonInstallation(
     installation: Omit<WoWInstallation, 'addonInstalled' | 'arenaCoachAddonPath'>
   ): Promise<boolean> {
-    try {
-      const addonPath = path.join(installation.addonsPath, ADDON_NAME);
+    const addonPath = path.join(installation.addonsPath, ADDON_NAME);
 
-      // Check if addon directory exists
-      if (!(await this.pathExists(addonPath))) {
-        console.debug(`ArenaCoach addon directory not found at: ${addonPath}`);
-        return false;
-      }
-
-      // Check if all required files exist
-      for (const fileName of ADDON_FILES) {
-        const filePath = path.join(addonPath, fileName);
-        if (!(await this.pathExists(filePath))) {
-          console.debug(`ArenaCoach addon file missing: ${filePath}`);
-          return false;
-        }
-      }
-
-      console.debug(`ArenaCoach addon properly installed at: ${addonPath}`);
-      return true;
-    } catch (error) {
-      if (error instanceof Error) {
-        console.error(`Error checking addon installation: ${error.message}`);
-      } else {
-        console.error('Unknown error checking addon installation:', error);
-      }
+    // Check if addon directory exists
+    if (!(await pathExists(addonPath))) {
+      console.debug(`ArenaCoach addon directory not found at: ${addonPath}`);
       return false;
     }
+
+    // Check if all required files exist
+    for (const fileName of ADDON_FILES) {
+      const filePath = path.join(addonPath, fileName);
+      if (!(await pathExists(filePath))) {
+        console.debug(`ArenaCoach addon file missing: ${filePath}`);
+        return false;
+      }
+    }
+
+    console.debug(`ArenaCoach addon properly installed at: ${addonPath}`);
+    return true;
   }
 
   /**
@@ -128,7 +149,7 @@ export class AddonManager {
 
         try {
           // Verify source file exists
-          if (!(await this.pathExists(sourcePath))) {
+          if (!(await pathExists(sourcePath))) {
             return {
               success: false,
               message: `Source addon file not found: ${fileName}`,
@@ -184,24 +205,19 @@ export class AddonManager {
    * Validate that installed addon files exist
    */
   public static async validateAddonFiles(installation: WoWInstallation): Promise<boolean> {
-    try {
-      const addonPath = path.join(installation.addonsPath, ADDON_NAME);
+    const addonPath = path.join(installation.addonsPath, ADDON_NAME);
 
-      // Check if all required files exist
-      for (const fileName of ADDON_FILES) {
-        const installedPath = path.join(addonPath, fileName);
+    // Check if all required files exist
+    for (const fileName of ADDON_FILES) {
+      const installedPath = path.join(addonPath, fileName);
 
-        if (!(await this.pathExists(installedPath))) {
-          console.debug(`Addon file missing: ${installedPath}`);
-          return false;
-        }
+      if (!(await pathExists(installedPath))) {
+        console.debug(`Addon file missing: ${installedPath}`);
+        return false;
       }
-
-      return true;
-    } catch (error) {
-      console.error('Error validating addon files:', error);
-      return false;
     }
+
+    return true;
   }
 
   /**
@@ -212,7 +228,7 @@ export class AddonManager {
       const sourceAddonPath = this.getSourceAddonPath();
 
       // Check if source directory exists
-      if (!(await this.pathExists(sourceAddonPath))) {
+      if (!(await pathExists(sourceAddonPath))) {
         return {
           isValid: false,
           error: `Source addon directory not found: ${sourceAddonPath}. Please ensure addon files are properly installed.`,
@@ -222,7 +238,7 @@ export class AddonManager {
       // Check if all required files exist
       for (const fileName of ADDON_FILES) {
         const filePath = path.join(sourceAddonPath, fileName);
-        if (!(await this.pathExists(filePath))) {
+        if (!(await pathExists(filePath))) {
           return {
             isValid: false,
             error: `Source addon file missing: ${fileName}. Please reinstall the application.`,
@@ -242,39 +258,16 @@ export class AddonManager {
   // Private helper methods
 
   /**
-   * Get the path to source addon files with fallback mechanisms for production
+   * Get the path to source addon files.
+   * Returns a single deterministic path - no fallbacks, no probing.
+   * If the path doesn't exist, validateSourceDirectory() will surface an explicit error.
    */
   private static getSourceAddonPath(): string {
-    // In development, use the local addon directory
-    if (process.env.NODE_ENV === 'development') {
-      // Use absolute path to ensure we find the addon files regardless of cwd
-      const possibleDevPaths = [
-        // Current working directory (for normal dev)
-        path.join(process.cwd(), 'addon'),
-        // Relative to compiled JS location
-        path.join(__dirname, '..', 'addon'),
-        path.join(__dirname, '..', '..', 'addon'),
-        // Built app location (for development builds)
-        path.join(app.getAppPath(), 'addon'),
-      ];
-
-      // Return the first path that exists
-      for (const devPath of possibleDevPaths) {
-        try {
-          if (fs.existsSync(devPath)) {
-            return devPath;
-          }
-        } catch (error) {
-          // Continue trying other paths
-        }
-      }
-
-      // Fallback to default path
-      return path.join(process.cwd(), 'addon');
+    if (!app.isPackaged) {
+      // Development: __dirname is desktop/dist, addon is at desktop/addon
+      return path.resolve(__dirname, '..', 'addon');
     }
-
-    // In production, addon files are unpacked via asarUnpack directive
-    // They are always located at resources/app.asar.unpacked/addon
+    // Production: addon files are unpacked via asarUnpack directive
     return path.join(process.resourcesPath, 'app.asar.unpacked', 'addon');
   }
 
@@ -285,36 +278,27 @@ export class AddonManager {
     addonPath: string,
     installedFiles: string[]
   ): Promise<void> {
-    try {
-      // Remove any files that were successfully copied
-      for (const filePath of installedFiles) {
-        try {
-          await fs.promises.unlink(filePath);
-        } catch (error) {
-          // Continue cleanup even if individual file removal fails
-        }
-      }
-
-      // Try to remove the addon directory if it's empty
+    // Remove any files that were successfully copied
+    for (const filePath of installedFiles) {
       try {
-        await fs.promises.rmdir(addonPath);
+        await fs.promises.unlink(filePath);
       } catch (error) {
-        // Directory might not be empty or might not exist, which is fine
+        console.warn(`[AddonManager] Failed to remove file during cleanup: ${filePath}`, error);
       }
-    } catch (error) {
-      console.error('Error during cleanup:', error);
     }
-  }
 
-  /**
-   * Check if a file or directory exists
-   */
-  private static async pathExists(filePath: string): Promise<boolean> {
+    // Try to remove the addon directory if it's empty
     try {
-      await fs.promises.access(filePath);
-      return true;
-    } catch {
-      return false;
+      await fs.promises.rmdir(addonPath);
+    } catch (error) {
+      // ENOTEMPTY or ENOENT are expected (directory has other files or doesn't exist)
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOTEMPTY' && code !== 'ENOENT') {
+        console.warn(
+          `[AddonManager] Failed to remove addon directory during cleanup: ${addonPath}`,
+          error
+        );
+      }
     }
   }
 }
@@ -324,22 +308,28 @@ export class WoWInstallationDetector {
    * Detect WoW installations on Windows
    */
   public static async detectInstallations(): Promise<WoWInstallation[]> {
-    try {
-      // Parallelize validation checks for better performance
-      const validationPromises = WINDOWS_INSTALL_PATHS.map(potentialPath =>
-        this.validateInstallation(potentialPath)
-      );
+    // Parallelize validation checks for better performance
+    const validationPromises = WINDOWS_INSTALL_PATHS.map(potentialPath =>
+      this.validateInstallation(potentialPath)
+    );
 
-      const results = await Promise.all(validationPromises);
+    // Guardrail: ensure one unexpected failure cannot reject the entire scan.
+    const results = await Promise.allSettled(validationPromises);
 
-      // Filter out null results and return valid installations
-      return results.filter(
-        (installation): installation is WoWInstallation => installation !== null
-      );
-    } catch (error) {
-      console.error('Error detecting WoW installations:', error);
-      return [];
+    const installations: WoWInstallation[] = [];
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        if (result.value !== null) {
+          installations.push(result.value);
+        }
+      } else {
+        console.debug('[WoWInstallationDetector] Unexpected rejection while scanning candidate paths', {
+          reason: result.reason,
+        });
+      }
     }
+
+    return installations;
   }
 
   /**
@@ -350,52 +340,55 @@ export class WoWInstallationDetector {
   public static async detectInstallationsWithOverrides(
     userPaths: string[] = []
   ): Promise<WoWInstallation[]> {
-    try {
-      // Combine user paths and default paths (user paths first for SSoT ordering)
-      const allPaths = [...userPaths, ...WINDOWS_INSTALL_PATHS];
+    // Combine user paths and default paths (user paths first for SSoT ordering)
+    const allPaths = [...userPaths, ...WINDOWS_INSTALL_PATHS];
 
-      // Deduplicate paths (case-insensitive on Windows)
-      const seenPaths = new Set<string>();
-      const uniquePaths: string[] = [];
+    // Deduplicate paths (case-insensitive on Windows)
+    const seenPaths = new Set<string>();
+    const uniquePaths: string[] = [];
 
-      for (const p of allPaths) {
-        const normalizedKey = p.toLowerCase();
-        if (!seenPaths.has(normalizedKey)) {
-          seenPaths.add(normalizedKey);
-          uniquePaths.push(p);
-        }
+    for (const p of allPaths) {
+      const normalizedKey = p.toLowerCase();
+      if (!seenPaths.has(normalizedKey)) {
+        seenPaths.add(normalizedKey);
+        uniquePaths.push(p);
       }
+    }
 
-      // Parallelize validation checks
-      const validationPromises = uniquePaths.map(potentialPath =>
-        this.validateInstallation(potentialPath)
-      );
+    // Parallelize validation checks
+    const validationPromises = uniquePaths.map(potentialPath =>
+      this.validateInstallation(potentialPath)
+    );
 
-      const results = await Promise.all(validationPromises);
+    // Guardrail: ensure one unexpected failure cannot reject the entire scan.
+    const results = await Promise.allSettled(validationPromises);
 
-      // Filter out null results and deduplicate by installation path
-      const installations: WoWInstallation[] = [];
-      const seenInstallPaths = new Set<string>();
+    // Filter out null results and deduplicate by installation path
+    const installations: WoWInstallation[] = [];
+    const seenInstallPaths = new Set<string>();
 
-      for (const installation of results) {
-        if (installation !== null) {
-          const normalizedInstallPath = installation.path.toLowerCase();
+    for (const installation of results) {
+      if (installation.status === 'fulfilled') {
+        const value = installation.value;
+        if (value !== null) {
+          const normalizedInstallPath = value.path.toLowerCase();
           if (!seenInstallPaths.has(normalizedInstallPath)) {
             seenInstallPaths.add(normalizedInstallPath);
-            installations.push(installation);
+            installations.push(value);
           }
         }
+      } else {
+        console.debug('[WoWInstallationDetector] Unexpected rejection while scanning candidate paths', {
+          reason: installation.reason,
+        });
       }
-
-      return installations;
-    } catch (error) {
-      console.error('Error detecting WoW installations with overrides:', error);
-      return [];
     }
+
+    return installations;
   }
 
   /**
-   * Validate a potential WoW retail installation path
+   * Validate a potential WoW installation path for the active flavor
    * Accepts both parent directory and subdirectory paths for compatibility
    */
   public static async validateInstallation(installPath: string): Promise<WoWInstallation | null> {
@@ -403,11 +396,11 @@ export class WoWInstallationDetector {
       // Normalize path - handle both parent dir and subdirectory selection
       const normalizedPath = this.normalizeWoWPath(installPath);
 
-      const retailPath = path.join(normalizedPath, '_retail_');
+      const flavorPath = path.join(normalizedPath, activeFlavor.dirName);
 
-      // Check for retail installation only
-      if (await this.pathExists(retailPath)) {
-        console.debug(`Found retail directory at: ${retailPath}`);
+      // Check for active flavor installation only
+      if (await pathExists(flavorPath)) {
+        console.debug(`Found ${activeFlavor.id} directory at: ${flavorPath}`);
         if (await this.validateInstallationStructure(normalizedPath)) {
           console.debug(`Successfully validated WoW installation at: ${normalizedPath}`);
           return await this.createInstallationObject(normalizedPath);
@@ -415,16 +408,17 @@ export class WoWInstallationDetector {
           console.debug(`Installation structure validation failed for: ${normalizedPath}`);
         }
       } else {
-        console.debug(`Retail directory not found at: ${retailPath}`);
+        console.debug(`${activeFlavor.id} directory not found at: ${flavorPath}`);
       }
 
       return null;
     } catch (error) {
-      if (error instanceof Error) {
-        console.error(`Error validating installation at '${installPath}': ${error.message}`);
-      } else {
-        console.error(`Unknown error validating installation at '${installPath}':`, error);
-      }
+      // Validation is best-effort. Any per-path probe error must not reject global detection.
+      const code = (error as NodeJS.ErrnoException).code ?? 'unknown';
+      console.debug(
+        `[WoWInstallationDetector] Error validating candidate path (code=${code}): ${installPath}`,
+        error
+      );
       return null;
     }
   }
@@ -439,16 +433,17 @@ export class WoWInstallationDetector {
       throw new Error('Invalid path: path must be a non-empty string');
     }
 
-    // Check for path traversal patterns
-    if (inputPath.includes('..') || inputPath.includes('\0') || inputPath.length > 260) {
-      throw new Error('Invalid path: directory traversal or malformed path detected');
+    // Check for null bytes (security)
+    if (inputPath.includes('\0')) {
+      throw new Error('Invalid path: null byte detected');
     }
 
     const normalizedInput = path.normalize(inputPath);
 
-    // Additional security check after normalization
-    if (normalizedInput.includes('..')) {
-      throw new Error('Invalid path: directory traversal detected after normalization');
+    // Segment-based traversal check: reject only if any segment is exactly '..'
+    const segments = normalizedInput.split(path.sep);
+    if (segments.some(segment => segment === '..')) {
+      throw new Error('Invalid path: directory traversal detected');
     }
 
     return this.findWoWRootFromPath(normalizedInput);
@@ -456,127 +451,115 @@ export class WoWInstallationDetector {
 
   /**
    * Robust upward search to find WoW root directory
-   * Replaces brittle depth assumptions with dynamic search
+   * Iterates until filesystem root; no artificial depth limit
    */
   private static findWoWRootFromPath(startPath: string): string {
     const basename = path.basename(startPath);
 
-    // Check if user selected retail subdirectory
-    if (basename === '_retail_') {
+    // Check if user selected the active flavor subdirectory
+    if (basename === activeFlavor.dirName) {
       return path.dirname(startPath);
     }
 
-    // Reject any WoW version that isn't retail
-    if (basename.startsWith('_') && basename.endsWith('_') && basename !== '_retail_') {
+    // Reject any WoW version that isn't the active flavor
+    if (basename.startsWith('_') && basename.endsWith('_') && basename !== activeFlavor.dirName) {
       throw new Error(
-        `Unsupported WoW installation: ${basename}. Only retail (_retail_) is supported.`
+        `Unsupported WoW installation: ${basename}. Only the active WoW flavor is supported: ${activeFlavor.id} (${activeFlavor.dirName}).`
       );
     }
 
-    // For Logs or other subdirectories, search upward for _retail_ directory
+    // For Logs or other subdirectories, search upward for active flavor directory
     let currentPath = startPath;
-    for (let i = 0; i < 5; i++) {
-      // Limit search depth to prevent infinite loops
+    while (true) {
       const parentPath = path.dirname(currentPath);
       if (parentPath === currentPath) {
         // Reached filesystem root
         break;
       }
 
-      // Check if parent contains _retail_ directory
-      const retailPath = path.join(parentPath, '_retail_');
+      // Check if parent contains active flavor directory
+      const flavorPath = path.join(parentPath, activeFlavor.dirName);
       try {
-        if (fs.existsSync(retailPath)) {
+        if (pathExistsSync(flavorPath)) {
           return parentPath;
         }
       } catch {
-        // Continue searching if access fails
+        // Best-effort detection probe: missing/disconnected drives can throw (e.g. Windows UNKNOWN).
+        // Treat probe errors as "not found" and continue walking upward.
       }
 
       currentPath = parentPath;
     }
 
-    // Assume user selected parent directory if no _retail_ found in upward search
+    // Assume user selected parent directory if no active flavor found in upward search
     return startPath;
   }
 
   // Private helper methods
 
   private static async checkExecutable(installPath: string): Promise<boolean> {
-    // Modern Battle.net installations put Wow.exe INSIDE the _retail_ directory
-    const retailDir = path.join(installPath, '_retail_');
-    const executablePath = path.join(retailDir, WINDOWS_EXECUTABLE);
-    return this.pathExists(executablePath);
+    // Modern Battle.net installations put the executable INSIDE the flavor directory
+    const flavorDir = path.join(installPath, activeFlavor.dirName);
+    const executablePath = path.join(flavorDir, activeFlavor.windowsExecutable);
+    return pathExists(executablePath);
   }
 
   /**
    * Validate .flavor.info file
-   * Ensures we're detecting a genuine retail WoW installation
+   * Ensures we're detecting a genuine WoW installation for the active flavor
    */
-  private static async validateFlavorInfo(retailDir: string): Promise<boolean> {
-    const flavorInfoPath = path.join(retailDir, '.flavor.info');
+  private static async validateFlavorInfo(flavorDir: string): Promise<boolean> {
+    const flavorInfoPath = path.join(flavorDir, '.flavor.info');
 
-    if (!(await this.pathExists(flavorInfoPath))) {
+    if (!(await pathExists(flavorInfoPath))) {
       console.debug(`Flavor info file not found: ${flavorInfoPath}`);
       return false;
     }
 
-    try {
-      const content = await fs.promises.readFile(flavorInfoPath, 'utf-8');
-      const lines = content.split('\n');
-      const flavor = lines[1]?.trim() || '';
+    const content = await fs.promises.readFile(flavorInfoPath, 'utf-8');
+    const lines = content.split('\n');
+    const flavor = lines[1]?.trim() || '';
 
-      // Retail WoW should have 'wow' as the flavor
-      const isRetail = flavor === 'wow';
-      if (!isRetail) {
-        console.debug(
-          `Invalid flavor detected in ${flavorInfoPath}: expected 'wow', got '${flavor}'`
-        );
-      }
-      return isRetail;
-    } catch (error) {
-      if (error instanceof Error) {
-        console.error(
-          `Error reading or parsing .flavor.info at ${flavorInfoPath}: ${error.message}`
-        );
-      } else {
-        console.error(`Unknown error reading .flavor.info at ${flavorInfoPath}:`, error);
-      }
-      return false;
+    // Validate against the active flavor's expected value
+    const isValidFlavor = flavor === activeFlavor.flavorInfoValue;
+    if (!isValidFlavor) {
+      console.debug(
+        `Invalid flavor detected in ${flavorInfoPath}: expected '${activeFlavor.flavorInfoValue}', got '${flavor}'`
+      );
     }
+    return isValidFlavor;
   }
 
   /**
-   * Enhanced validation for retail WoW installation
+   * Enhanced validation for WoW installation (active flavor)
    * Includes .flavor.info validation
    * Parallelized for optimal performance
    */
   private static async validateInstallationStructure(installPath: string): Promise<boolean> {
-    const retailDir = path.join(installPath, '_retail_');
-    const addonsPath = path.join(retailDir, 'Interface', 'AddOns');
-    const logsPath = path.join(retailDir, 'Logs');
+    const flavorDir = path.join(installPath, activeFlavor.dirName);
+    const addonsPath = path.join(flavorDir, 'Interface', 'AddOns');
+    const logsPath = path.join(flavorDir, 'Logs');
 
     // Run all validation checks in parallel for better performance
     const [executableExists, flavorValid, addonsPathExists, logsPathExists] = await Promise.all([
       this.checkExecutable(installPath),
-      this.validateFlavorInfo(retailDir),
-      this.pathExists(addonsPath),
-      this.pathExists(logsPath),
+      this.validateFlavorInfo(flavorDir),
+      pathExists(addonsPath),
+      pathExists(logsPath),
     ]);
 
     return executableExists && flavorValid && addonsPathExists && logsPathExists;
   }
 
   private static async createInstallationObject(installPath: string): Promise<WoWInstallation> {
-    const retailPath = path.join(installPath, '_retail_');
-    const addonsPath = path.join(retailPath, 'Interface', 'AddOns');
+    const flavorPath = path.join(installPath, activeFlavor.dirName);
+    const addonsPath = path.join(flavorPath, 'Interface', 'AddOns');
     const arenaCoachAddonPath = path.join(addonsPath, ADDON_NAME);
 
     // Check if addon is installed using the basic installation object for AddonManager
     const basicInstallation = {
       path: installPath,
-      version: 'retail' as const,
-      combatLogPath: path.join(retailPath, 'Logs'),
+      combatLogPath: path.join(flavorPath, 'Logs'),
       addonsPath,
     };
 
@@ -584,20 +567,10 @@ export class WoWInstallationDetector {
 
     return {
       path: installPath,
-      version: 'retail',
-      combatLogPath: path.join(retailPath, 'Logs'), // Point to Logs directory, not specific file
+      combatLogPath: path.join(flavorPath, 'Logs'), // Point to Logs directory, not specific file
       addonsPath,
       addonInstalled,
       arenaCoachAddonPath,
     };
-  }
-
-  private static async pathExists(filePath: string): Promise<boolean> {
-    try {
-      await fs.promises.access(filePath);
-      return true;
-    } catch {
-      return false;
-    }
   }
 }

@@ -16,6 +16,7 @@ import {
   getErrorDetails,
 } from '../process-monitoring/WoWProcessMonitorErrors';
 import { EarlyEndTrigger } from './types/EarlyEndTriggers';
+import type { JobRetryPayload } from './types/JobRetryPayload';
 
 /**
  * Payload for the matchProcessed event containing match data and chunk file path
@@ -34,6 +35,7 @@ export interface OrchestratorConfig {
   watcherTimeoutMinutes?: number;
   chunkerOptions?: Partial<MatchChunkerOptions>;
   enableWoWProcessMonitoring?: boolean;
+  isSkirmishTrackingEnabled?: () => boolean;
 }
 
 /**
@@ -46,6 +48,16 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
   private watcher: MatchLogWatcher;
   private chunker: MatchChunker;
   private jobQueueOrchestrator?: JobQueueOrchestrator;
+  private jobQueueHandlers: {
+    analysisJobCreated?: (data: any) => void;
+    analysisProgress?: (data: any) => void;
+    analysisCompleted?: (data: any) => void;
+    analysisFailed?: (data: any) => void;
+    serviceStatusChanged?: (status: any) => void;
+    pollError?: (data: any) => void;
+    pollTimeout?: (data: any) => void;
+    uploadRetrying?: (data: any) => void;
+  } = {};
   private processMonitor: WoWProcessMonitor | null = null;
   private isRunning = false;
   private isShuttingDown = false;
@@ -59,7 +71,11 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
     this.enableProcessMonitoring = config.enableWoWProcessMonitoring ?? true;
 
     // Initialize components
-    this.watcher = new MatchLogWatcher(config.logDirectory, config.watcherTimeoutMinutes || 10);
+    this.watcher = new MatchLogWatcher(
+      config.logDirectory,
+      config.watcherTimeoutMinutes || 10,
+      config.isSkirmishTrackingEnabled
+    );
 
     const chunkerOptions: MatchChunkerOptions = {
       outputDir: config.outputDirectory,
@@ -223,6 +239,7 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
       console.info('[MatchOrchestrator] Phase 5: Final resource cleanup...');
       this.watcher.cleanup();
       this.chunker.cleanup();
+      this.cleanupJobQueueHandlers();
 
       this.isRunning = false;
       this.isWatchingActive = false; // Reset watching state
@@ -291,7 +308,7 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
 
     // Connect MatchLogWatcher → MatchChunker
     this.watcher.on('matchStarted', (event: MatchStartedEvent) => {
-      // Note: Skirmish and unranked matches are already filtered at parsing level
+      // Note: non-skirmish unranked matches are filtered at parsing level
       console.info('[MatchOrchestrator] Match detected:', {
         bufferId: event.bufferId,
         zoneId: event.zoneId,
@@ -302,7 +319,7 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
     });
 
     this.watcher.on('matchEnded', (event: MatchEndedEvent) => {
-      // Note: Skirmish and unranked matches are already filtered at parsing level
+      // Note: non-skirmish unranked matches are filtered at parsing level
       console.info('[MatchOrchestrator] Match ended:', {
         bufferId: event.bufferId,
         bracket: event.metadata.bracket,
@@ -436,47 +453,113 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
     }
   }
 
+
+  /**
+   * Clean up JobQueueOrchestrator event handlers to prevent listener leaks
+   */
+  private cleanupJobQueueHandlers(): void {
+    if (!this.jobQueueOrchestrator) {
+      return;
+    }
+
+    // Remove all stored handler references
+    if (this.jobQueueHandlers.analysisJobCreated) {
+      this.jobQueueOrchestrator.off('analysisJobCreated', this.jobQueueHandlers.analysisJobCreated);
+    }
+    if (this.jobQueueHandlers.analysisProgress) {
+      this.jobQueueOrchestrator.off('analysisProgress', this.jobQueueHandlers.analysisProgress);
+    }
+    if (this.jobQueueHandlers.analysisCompleted) {
+      this.jobQueueOrchestrator.off('analysisCompleted', this.jobQueueHandlers.analysisCompleted);
+    }
+    if (this.jobQueueHandlers.analysisFailed) {
+      this.jobQueueOrchestrator.off('analysisFailed', this.jobQueueHandlers.analysisFailed);
+    }
+    if (this.jobQueueHandlers.serviceStatusChanged) {
+      this.jobQueueOrchestrator.off('serviceStatusChanged', this.jobQueueHandlers.serviceStatusChanged);
+    }
+    if (this.jobQueueHandlers.pollError) {
+      this.jobQueueOrchestrator.off('pollError', this.jobQueueHandlers.pollError);
+    }
+    if (this.jobQueueHandlers.pollTimeout) {
+      this.jobQueueOrchestrator.off('pollTimeout', this.jobQueueHandlers.pollTimeout);
+    }
+    if (this.jobQueueHandlers.uploadRetrying) {
+      this.jobQueueOrchestrator.off('uploadRetrying', this.jobQueueHandlers.uploadRetrying);
+    }
+
+    // Clear handler storage
+    this.jobQueueHandlers = {};
+  }
+
   /**
    * Set the JobQueueOrchestrator to use
    * This allows using the new decomposed services for uploads
    */
   public setJobQueueOrchestrator(orchestrator: JobQueueOrchestrator): void {
     console.info('[MatchOrchestrator] Setting JobQueueOrchestrator');
+    
+    // Remove old listeners before attaching new ones
+    this.cleanupJobQueueHandlers();
+    
     this.jobQueueOrchestrator = orchestrator;
 
-    // Wire up event forwarding from JobQueueOrchestrator
-    orchestrator.on('analysisJobCreated', data => {
+    // Wire up event forwarding from JobQueueOrchestrator and store handler references
+    this.jobQueueHandlers.analysisJobCreated = data => {
       this.emit('analysisJobCreated', data);
-    });
+    };
+    orchestrator.on('analysisJobCreated', this.jobQueueHandlers.analysisJobCreated);
 
-    orchestrator.on('analysisProgress', data => {
+    this.jobQueueHandlers.analysisProgress = data => {
       this.emit('analysisProgress', data);
-    });
+    };
+    orchestrator.on('analysisProgress', this.jobQueueHandlers.analysisProgress);
 
-    orchestrator.on('analysisCompleted', data => {
+    this.jobQueueHandlers.analysisCompleted = data => {
       this.emit('analysisCompleted', data);
-    });
+    };
+    orchestrator.on('analysisCompleted', this.jobQueueHandlers.analysisCompleted);
 
-    orchestrator.on('analysisFailed', data => {
+    this.jobQueueHandlers.analysisFailed = data => {
       this.emit('analysisFailed', data);
-    });
+    };
+    orchestrator.on('analysisFailed', this.jobQueueHandlers.analysisFailed);
 
-    orchestrator.on('serviceStatusChanged', status => {
+    this.jobQueueHandlers.serviceStatusChanged = status => {
       this.emit('serviceStatusChanged', status);
-    });
+    };
+    orchestrator.on('serviceStatusChanged', this.jobQueueHandlers.serviceStatusChanged);
 
-    orchestrator.on('pollError', data => {
+    this.jobQueueHandlers.pollError = data => {
       this.emit('pipelineError', data);
-    });
+    };
+    orchestrator.on('pollError', this.jobQueueHandlers.pollError);
 
-    orchestrator.on('pollTimeout', data => {
+    this.jobQueueHandlers.pollTimeout = data => {
       this.emit('analysisTimeout', {
         jobId: data.jobId,
         matchHash: data.matchHash,
         attempts: data.attempts,
       });
-    });
+    };
+    orchestrator.on('pollTimeout', this.jobQueueHandlers.pollTimeout);
+
+    this.jobQueueHandlers.uploadRetrying = data => {
+      // Map error information to JobRetryPayload with deterministic errorType
+      const errorType = data.code === 'ECONNABORTED' ? 'timeout' : 'network';
+      
+      const retryPayload: JobRetryPayload = {
+        matchHash: data.matchHash,
+        attempt: data.attempt,
+        delayMs: data.delayMs,
+        errorType,
+      };
+      
+      this.emit('jobRetry', retryPayload);
+    };
+    orchestrator.on('uploadRetrying', this.jobQueueHandlers.uploadRetrying);
   }
+
 
   /**
    * Submit a match chunk directly for upload

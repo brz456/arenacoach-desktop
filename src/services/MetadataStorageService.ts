@@ -58,7 +58,7 @@ export class MetadataStorageService extends EventEmitter {
 
       if (isTransient) {
         console.warn(
-          '[MetadataStorageService] Transient storage issue (will retry):',
+          '[MetadataStorageService] Transient storage issue:',
           error?.message || 'Unknown error'
         );
       } else {
@@ -105,8 +105,11 @@ export class MetadataStorageService extends EventEmitter {
    */
   public async saveMatch(metadata: StoredMatchMetadata): Promise<void> {
     return this.safeFileOperation(async () => {
-      // Serialize saves per instance using hash if available, else bufferId
-      const mutexKey = metadata.matchHash || metadata.bufferId!;
+      // Validate bufferId before acquiring mutex (required for SSoT consistency)
+      if (!metadata.bufferId) {
+        throw new Error('Cannot save match: bufferId is required');
+      }
+      const mutexKey = metadata.bufferId;
       const mutex = this.getMutex(mutexKey);
 
       return await mutex.runExclusive(async () => {
@@ -170,8 +173,9 @@ export class MetadataStorageService extends EventEmitter {
             }
           }
 
-          // Minimal backoff for transient locks (antivirus, etc.)
-          await new Promise(resolve => setTimeout(resolve, Math.random() * 25 + 25)); // 25-50ms
+          // Fixed backoff for transient locks (antivirus, etc.)
+          const RENAME_RETRY_DELAY_MS = 50;
+          await new Promise(resolve => setTimeout(resolve, RENAME_RETRY_DELAY_MS));
 
           await fs.rename(tempFilepath, filepath); // Retry atomic rename
         } catch (retryError) {
@@ -204,46 +208,128 @@ export class MetadataStorageService extends EventEmitter {
    * BREAKING CHANGE: Uses content-based bufferId matching for architectural decoupling
    */
   public async loadMatchByBufferId(bufferId: string): Promise<StoredMatchMetadata | null> {
-    return this.safeFileOperation(
-      async () => {
-        const files = await this.getMatchFiles();
+    try {
+      const result = await this.loadMatchByBufferIdWithDiagnostics(bufferId);
+      return result.match;
+    } catch (error) {
+      // Catastrophic failure (cannot read directory, etc.) - log and return null
+      // to preserve existing "null fallback" semantics for current callers
+      console.error(
+        '[MetadataStorageService] Catastrophic failure loading match by bufferId:',
+        error
+      );
+      this.emit('error', { context: 'loading match metadata by bufferId', error });
+      return null;
+    }
+  }
 
-        // Search through all files for matching bufferId in content
-        for (const file of files) {
-          try {
-            const filepath = path.join(this.storageDir, file);
-            const content = await fs.readFile(filepath, 'utf-8');
-            const metadata = JSON.parse(content) as StoredMatchMetadata;
+  /**
+   * Load match metadata by bufferId with detailed diagnostics.
+   * Unlike loadMatchByBufferId, this method:
+   * - Throws on catastrophic failures (cannot read directory)
+   * - Returns per-file scan errors separately from the result
+   * - Enables callers to distinguish "not found" from "load failed"
+   */
+  public async loadMatchByBufferIdWithDiagnostics(bufferId: string): Promise<{
+    match: StoredMatchMetadata | null;
+    scanErrors: Array<{ file: string; error: string }>;
+  }> {
+    const scanErrors: Array<{ file: string; error: string }> = [];
 
-            if (metadata.bufferId === bufferId) {
-              // Normalize all Date objects after JSON read
-              if (metadata.matchData?.timestamp) {
-                metadata.matchData.timestamp = new Date(metadata.matchData.timestamp as any);
-              }
-              if (metadata.createdAt) {
-                metadata.createdAt = new Date(metadata.createdAt as any);
-              }
-              if (metadata.lastUpdatedAt) {
-                metadata.lastUpdatedAt = new Date(metadata.lastUpdatedAt as any);
-              }
+    // This will throw if the directory cannot be read (catastrophic failure)
+    // Uses SSoT helper for deterministic, sorted iteration
+    const jsonFiles = await this.getMatchFilesStrict();
 
-              return metadata;
-            }
-          } catch (error) {
-            console.warn(
-              '[MetadataStorageService] Failed to load file during bufferId search:',
-              file,
-              error
-            );
-            // Continue with other files
-          }
+    // Search through all files for matching bufferId in content
+    for (const file of jsonFiles) {
+      try {
+        const filepath = path.join(this.storageDir, file);
+        const content = await fs.readFile(filepath, 'utf-8');
+        const metadata = JSON.parse(content) as StoredMatchMetadata;
+
+        if (metadata.bufferId === bufferId) {
+          this.normalizeMetadataDates(metadata);
+          return { match: metadata, scanErrors };
         }
+      } catch (error) {
+        // Per-file failure: record error and continue scanning other files
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        scanErrors.push({ file, error: errorMessage });
+        console.warn(
+          '[MetadataStorageService] Failed to load file during bufferId search:',
+          file,
+          error
+        );
+      }
+    }
 
-        return null; // No matching bufferId found
-      },
-      'loading match metadata by bufferId',
-      null
-    );
+    return { match: null, scanErrors };
+  }
+
+  /**
+   * Delete match by bufferId with pre-delete validation and diagnostics.
+   * Single-scan operation: finds match, validates via callback, then deletes.
+   *
+   * @param bufferId - The bufferId to search for
+   * @param validateMatch - Callback that throws if match should not be deleted; receives normalized metadata
+   * @returns { deleted: boolean, scanErrors: [...] } - deleted is true if match was found, validated, and deleted
+   * @throws On catastrophic failures (unreadable directory) or if validateMatch throws
+   */
+  public async deleteMatchByBufferIdWithDiagnostics(
+    bufferId: string,
+    validateMatch: (match: StoredMatchMetadata) => void
+  ): Promise<{
+    deleted: boolean;
+    scanErrors: Array<{ file: string; error: string }>;
+  }> {
+    const scanErrors: Array<{ file: string; error: string }> = [];
+
+    // This will throw if the directory cannot be read (catastrophic failure)
+    const jsonFiles = await this.getMatchFilesStrict();
+
+    for (const file of jsonFiles) {
+      let metadata: StoredMatchMetadata;
+      let filepath: string;
+
+      try {
+        filepath = path.join(this.storageDir, file);
+        const content = await fs.readFile(filepath, 'utf-8');
+        metadata = JSON.parse(content) as StoredMatchMetadata;
+      } catch (error) {
+        // Per-file failure: record error and continue scanning
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        scanErrors.push({ file, error: errorMessage });
+        console.warn(
+          '[MetadataStorageService] Failed to load file during delete scan:',
+          file,
+          error
+        );
+        continue;
+      }
+
+      if (metadata.bufferId !== bufferId) {
+        continue;
+      }
+
+      // Normalize dates before validation (consistent with loadMatchByBufferIdWithDiagnostics)
+      this.normalizeMetadataDates(metadata);
+
+      // Match found - validate before deleting (throws if invalid)
+      validateMatch(metadata);
+
+      // Validation passed - use shared deletion helper
+      const deleted = await this.deleteMatchAssetsAndMetadata({
+        bufferId,
+        filepath,
+        filename: file,
+        metadata,
+      });
+
+      return { deleted, scanErrors };
+    }
+
+    // Match not found
+    return { deleted: false, scanErrors };
   }
 
   /**
@@ -263,17 +349,7 @@ export class MetadataStorageService extends EventEmitter {
             const metadata = JSON.parse(content) as StoredMatchMetadata;
 
             if (metadata.matchHash === matchHash) {
-              // Normalize all Date objects after JSON read
-              if (metadata.matchData?.timestamp) {
-                metadata.matchData.timestamp = new Date(metadata.matchData.timestamp as any);
-              }
-              if (metadata.createdAt) {
-                metadata.createdAt = new Date(metadata.createdAt as any);
-              }
-              if (metadata.lastUpdatedAt) {
-                metadata.lastUpdatedAt = new Date(metadata.lastUpdatedAt as any);
-              }
-
+              this.normalizeMetadataDates(metadata);
               return metadata;
             }
           } catch (error) {
@@ -343,16 +419,7 @@ export class MetadataStorageService extends EventEmitter {
         const content = await fs.readFile(filepath, 'utf-8');
         const metadata = JSON.parse(content) as StoredMatchMetadata;
 
-        // Normalize all Date objects after JSON read (JSON.parse returns strings)
-        if (metadata.matchData?.timestamp) {
-          metadata.matchData.timestamp = new Date(metadata.matchData.timestamp as any);
-        }
-        if (metadata.createdAt) {
-          metadata.createdAt = new Date(metadata.createdAt as any);
-        }
-        if (metadata.lastUpdatedAt) {
-          metadata.lastUpdatedAt = new Date(metadata.lastUpdatedAt as any);
-        }
+        this.normalizeMetadataDates(metadata);
 
         return { file, metadata };
       } catch (error) {
@@ -395,16 +462,7 @@ export class MetadataStorageService extends EventEmitter {
             const content = await fs.readFile(filepath, 'utf-8');
             const metadata = JSON.parse(content) as StoredMatchMetadata;
 
-            // Normalize all Date objects after JSON read
-            if (metadata.matchData?.timestamp) {
-              metadata.matchData.timestamp = new Date(metadata.matchData.timestamp as any);
-            }
-            if (metadata.createdAt) {
-              metadata.createdAt = new Date(metadata.createdAt as any);
-            }
-            if (metadata.lastUpdatedAt) {
-              metadata.lastUpdatedAt = new Date(metadata.lastUpdatedAt as any);
-            }
+            this.normalizeMetadataDates(metadata);
 
             return metadata;
           } catch (error) {
@@ -441,8 +499,87 @@ export class MetadataStorageService extends EventEmitter {
   }
 
   /**
+   * Get all known bufferIds from metadata files (strict version - throws on directory read failure).
+   * SSoT for orphan detection: a chunk is orphan if its bufferId is not in this set.
+   * @returns Set of bufferIds derived from metadata filenames
+   */
+  public async listBufferIdsStrict(): Promise<Set<string>> {
+    const jsonFiles = await this.getMatchFilesStrict();
+    const bufferIds = new Set<string>();
+    for (const file of jsonFiles) {
+      const bufferId = path.basename(file, '.json');
+      bufferIds.add(bufferId);
+    }
+    return bufferIds;
+  }
+
+  /**
+   * List all matches with explicit error reporting (no silent fallbacks).
+   * Throws on catastrophic directory read failure.
+   * Per-file read/parse errors are collected in scanErrors.
+   * @returns Object with matches array and scanErrors array
+   */
+  public async listAllMatchesWithDiagnostics(): Promise<{
+    matches: StoredMatchMetadata[];
+    scanErrors: Array<{ file: string; error: string }>;
+  }> {
+    // Catastrophic failure: throw (no silent fallback)
+    const jsonFiles = await this.getMatchFilesStrict();
+
+    const matches: StoredMatchMetadata[] = [];
+    const scanErrors: Array<{ file: string; error: string }> = [];
+
+    for (const file of jsonFiles) {
+      try {
+        const filepath = path.join(this.storageDir, file);
+        const content = await fs.readFile(filepath, 'utf-8');
+        const metadata = JSON.parse(content) as StoredMatchMetadata;
+
+        // Require matchData.timestamp (expiration/maintenance depends on it)
+        if (!metadata.matchData?.timestamp) {
+          scanErrors.push({ file, error: 'Missing matchData.timestamp' });
+          continue;
+        }
+
+        // Normalize and validate date fields (no silent Invalid Date propagation)
+        const parsedTimestamp = new Date(metadata.matchData.timestamp as any);
+        if (Number.isNaN(parsedTimestamp.getTime())) {
+          scanErrors.push({ file, error: 'Invalid matchData.timestamp' });
+          continue;
+        }
+        metadata.matchData.timestamp = parsedTimestamp;
+
+        if (metadata.createdAt) {
+          const parsed = new Date(metadata.createdAt as any);
+          if (Number.isNaN(parsed.getTime())) {
+            scanErrors.push({ file, error: 'Invalid createdAt' });
+            continue;
+          }
+          metadata.createdAt = parsed;
+        }
+        if (metadata.lastUpdatedAt) {
+          const parsed = new Date(metadata.lastUpdatedAt as any);
+          if (Number.isNaN(parsed.getTime())) {
+            scanErrors.push({ file, error: 'Invalid lastUpdatedAt' });
+            continue;
+          }
+          metadata.lastUpdatedAt = parsed;
+        }
+
+        matches.push(metadata);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        scanErrors.push({ file, error: errorMessage });
+      }
+    }
+
+    return { matches, scanErrors };
+  }
+
+  /**
    * Update match upload status and additional metadata
    * Uses async-mutex to prevent race conditions in concurrent writes
+   * BREAKING CHANGE: Now locks on bufferId for consistency with other write paths
    */
   public async updateMatchStatus(
     matchHash: string,
@@ -450,30 +587,57 @@ export class MetadataStorageService extends EventEmitter {
     additionalData: Partial<StoredMatchMetadata> = {}
   ): Promise<void> {
     return this.safeFileOperation(async () => {
-      // Serialize writes per matchHash using async-mutex
-      const mutex = this.getMutex(matchHash);
+      // First load to get bufferId (outside mutex)
+      const existingMatch = await this.loadMatch(matchHash);
+      if (!existingMatch) {
+        console.debug(
+          `[MetadataStorageService] Skipping status update - no metadata file for: ${matchHash}`
+        );
+        return; // Gracefully skip updates for non-existent files
+      }
+
+      const bufferId = existingMatch.bufferId;
+      if (!bufferId) {
+        console.error(
+          `[MetadataStorageService] Cannot update status - no bufferId for: ${matchHash}`
+        );
+        return;
+      }
+
+      // BREAKING CHANGE: Lock on bufferId (not matchHash) for consistency
+      const mutex = this.getMutex(bufferId);
 
       return await mutex.runExclusive(async () => {
-        const existingMatch = await this.loadMatch(matchHash);
-        if (!existingMatch) {
+        // Reload inside mutex to get fresh state (prevent lost updates)
+        const freshMatch = await this.loadMatchByBufferId(bufferId);
+        if (!freshMatch) {
           console.debug(
-            `[MetadataStorageService] Skipping status update - no metadata file for: ${matchHash}`
+            `[MetadataStorageService] Match disappeared during status update: ${bufferId}`
           );
-          return; // Gracefully skip updates for non-existent files
+          return;
         }
 
         // No-op guard: Skip write if status unchanged and no additional fields
-        if (existingMatch.uploadStatus === status && Object.keys(additionalData).length === 0) {
+        if (freshMatch.uploadStatus === status && Object.keys(additionalData).length === 0) {
           return; // Skip redundant write
+        }
+
+        // Guard: Forbid identity field mutation via additionalData (SSoT invariant)
+        const forbiddenFields = ['bufferId', 'matchHash', 'storedAt'] as const;
+        for (const field of forbiddenFields) {
+          if (field in additionalData) {
+            throw new Error(
+              `Cannot mutate identity field '${field}' via additionalData in updateMatchStatus`
+            );
+          }
         }
 
         // Normal status update logic
         const updatedMatch: StoredMatchMetadata = {
-          ...existingMatch,
+          ...freshMatch,
           ...additionalData,
           uploadStatus: status,
           lastUpdatedAt: new Date(),
-          // IMPORTANT: Do NOT update storedAt - preserve original bufferId-based filename
         };
 
         // Clear progress message for final states to prevent stale data
@@ -488,22 +652,24 @@ export class MetadataStorageService extends EventEmitter {
         await this._saveMatchInternal(updatedMatch);
 
         // Log status changes or enrichment updates
-        if (existingMatch.uploadStatus !== status) {
+        if (freshMatch.uploadStatus !== status) {
           console.debug('[MetadataStorageService] Updated match status:', {
             matchHash,
-            oldUploadStatus: existingMatch.uploadStatus,
+            bufferId,
+            oldUploadStatus: freshMatch.uploadStatus,
             newUploadStatus: status,
           });
         } else if (Object.keys(additionalData).length > 0) {
           // Log enrichment updates for diagnostics
           console.debug('[MetadataStorageService] Enriching match with additional data:', {
             matchHash,
+            bufferId,
             status,
             fieldsAdded: Object.keys(additionalData),
           });
         }
 
-        this.emit('matchUpdated', { matchHash, status, additionalData });
+        this.emit('matchUpdated', { matchHash, bufferId, status, additionalData });
       });
     }, 'updating match status');
   }
@@ -549,6 +715,306 @@ export class MetadataStorageService extends EventEmitter {
   }
 
   /**
+   * Update favourite status by bufferId (works for complete and incomplete matches)
+   * Uses mutex to prevent race conditions with other bufferId-keyed operations
+   */
+  public async updateFavouriteByBufferId(
+    bufferId: string,
+    isFavourite: boolean
+  ): Promise<void> {
+    return this.safeFileOperation(async () => {
+      const mutex = this.getMutex(bufferId);
+
+      return await mutex.runExclusive(async () => {
+        const existingMatch = await this.loadMatchByBufferId(bufferId);
+        if (!existingMatch) {
+          console.debug(
+            `[MetadataStorageService] Skipping favourite update - no metadata file for bufferId: ${bufferId}`
+          );
+          return;
+        }
+
+        // No-op guard: Skip write if favourite status unchanged
+        if (existingMatch.isFavourite === isFavourite) {
+          return;
+        }
+
+        // Update ONLY favourite field, preserve all other fields
+        const updatedMatch: StoredMatchMetadata = {
+          ...existingMatch,
+          isFavourite,
+          lastUpdatedAt: new Date(),
+        };
+
+        await this._saveMatchInternal(updatedMatch);
+
+        console.debug('[MetadataStorageService] Updated favourite status:', {
+          bufferId,
+          isFavourite,
+        });
+
+        this.emit('matchUpdated', { bufferId, isFavourite });
+      });
+    }, 'updating favourite status');
+  }
+
+  /**
+   * List all favourite video paths with explicit error reporting.
+   * Returns normalized paths for protected set construction.
+   * Throws on catastrophic directory read failure.
+   * Per-file read/parse errors are collected in scanErrors.
+   */
+  public async listFavouriteVideoPathsWithDiagnostics(): Promise<{
+    paths: Set<string>;
+    scanErrors: Array<{ file: string; error: string }>;
+  }> {
+    const { matches, scanErrors } = await this.listAllMatchesWithDiagnostics();
+
+    const paths = new Set<string>();
+
+    for (const match of matches) {
+      if (match.isFavourite === true && match.videoPath) {
+        // Require absolute path (safety check)
+        if (!path.isAbsolute(match.videoPath)) {
+          // Use actual filename (derived from bufferId) for consistent diagnostics
+          const filename = match.bufferId ? this.generateFileName(match.bufferId) : 'unknown';
+          scanErrors.push({
+            file: filename,
+            error: `Non-absolute videoPath: ${match.videoPath}`,
+          });
+          continue;
+        }
+
+        const normalizedPath = this.normalizePathForComparison(match.videoPath);
+        paths.add(normalizedPath);
+      }
+    }
+
+    return { paths, scanErrors };
+  }
+
+  /**
+   * Mark recording as deleted by quota enforcement using video file path.
+   * Scans all matches for videoPath match (normalized for Windows case-insensitivity).
+   * @returns Number of matches updated
+   */
+  public async markRecordingDeletedByQuotaByVideoPath(videoFilePath: string): Promise<number> {
+    return this.safeFileOperation(
+      async () => {
+        const files = await this.getMatchFiles();
+        let updatedCount = 0;
+
+        // Normalize search path for comparison (case-insensitive on Windows)
+        const normalizedSearchPath = this.normalizePathForComparison(videoFilePath);
+
+        for (const file of files) {
+          try {
+            const filepath = path.join(this.storageDir, file);
+            const content = await fs.readFile(filepath, 'utf-8');
+            const metadata = JSON.parse(content) as StoredMatchMetadata;
+
+            // Normalize stored path for comparison
+            const normalizedStoredPath = metadata.videoPath
+              ? this.normalizePathForComparison(metadata.videoPath)
+              : null;
+
+            if (normalizedStoredPath === normalizedSearchPath) {
+              // Get bufferId for mutex and logging
+              const bufferId = metadata.bufferId;
+              if (!bufferId) {
+                console.warn(
+                  '[MetadataStorageService] Skipping quota update - no bufferId in metadata:',
+                  file
+                );
+                continue;
+              }
+
+              // Use mutex to prevent lost updates
+              const mutex = this.getMutex(bufferId);
+              await mutex.runExclusive(async () => {
+                // Re-load to get properly normalized metadata (dates as Date objects)
+                const existingMatch = await this.loadMatchByBufferId(bufferId);
+                if (!existingMatch) {
+                  console.debug(
+                    '[MetadataStorageService] Match disappeared during quota update:',
+                    bufferId
+                  );
+                  return;
+                }
+
+                // Re-check videoPath still matches (atomicity guard)
+                const reloadedNormalizedPath = existingMatch.videoPath
+                  ? this.normalizePathForComparison(existingMatch.videoPath)
+                  : null;
+                if (reloadedNormalizedPath !== normalizedSearchPath) {
+                  console.debug(
+                    '[MetadataStorageService] videoPath changed between scan and update, skipping:',
+                    { bufferId, expected: normalizedSearchPath, actual: reloadedNormalizedPath }
+                  );
+                  return;
+                }
+
+                // Clear video fields (use delete to satisfy exactOptionalPropertyTypes)
+                delete existingMatch.videoPath;
+                delete existingMatch.videoThumbnail;
+                delete existingMatch.videoSize;
+                delete existingMatch.videoDuration;
+                delete existingMatch.videoRecordedAt;
+                delete existingMatch.videoResolution;
+                delete existingMatch.videoFps;
+                delete existingMatch.videoCodec;
+
+                // Set quota deletion status
+                existingMatch.recordingStatus = 'deleted_quota';
+                existingMatch.recordingErrorCode = 'DELETED_QUOTA';
+                existingMatch.recordingErrorMessage = 'Recording deleted due to storage limit.';
+                existingMatch.lastUpdatedAt = new Date();
+
+                await this._saveMatchInternal(existingMatch);
+                updatedCount++;
+
+                console.debug(
+                  '[MetadataStorageService] Marked recording deleted by quota (videoPath match):',
+                  { bufferId, videoFilePath }
+                );
+
+                this.emit('matchUpdated', {
+                  bufferId,
+                  videoData: {
+                    recordingStatus: 'deleted_quota',
+                    recordingErrorCode: 'DELETED_QUOTA',
+                    recordingErrorMessage: 'Recording deleted due to storage limit.',
+                  },
+                });
+              });
+            }
+          } catch (error) {
+            console.warn(
+              '[MetadataStorageService] Failed to check/update file during videoPath search:',
+              file,
+              error
+            );
+          }
+        }
+
+        return updatedCount;
+      },
+      'marking recording deleted by quota via videoPath',
+      0
+    );
+  }
+
+  /**
+   * Normalize path for comparison (case-insensitive on Windows).
+   */
+  private normalizePathForComparison(filePath: string): string {
+    const normalized = path.resolve(filePath);
+    // Windows paths are case-insensitive
+    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  }
+
+  /**
+   * Normalize Date fields in metadata after JSON.parse (JSON serializes dates as strings).
+   * Mutates the metadata object in place. Safe if called on already-normalized metadata.
+   */
+  private normalizeMetadataDates(metadata: StoredMatchMetadata): void {
+    if (metadata.matchData?.timestamp) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      metadata.matchData.timestamp = new Date(metadata.matchData.timestamp as any);
+    }
+    if (metadata.createdAt) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      metadata.createdAt = new Date(metadata.createdAt as any);
+    }
+    if (metadata.lastUpdatedAt) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      metadata.lastUpdatedAt = new Date(metadata.lastUpdatedAt as any);
+    }
+  }
+
+  /**
+   * Delete video, thumbnail, and metadata file for a match.
+   * SSoT for deletion logic - used by both deleteMatch and deleteMatchByBufferIdWithDiagnostics.
+   *
+   * @returns true if deletion succeeded, false if video deletion failed (metadata preserved)
+   */
+  private async deleteMatchAssetsAndMetadata(params: {
+    bufferId: string;
+    filepath: string;
+    filename: string;
+    metadata: StoredMatchMetadata;
+  }): Promise<boolean> {
+    const { bufferId, filepath, filename, metadata } = params;
+
+    // Delete video if present
+    if (metadata.videoPath) {
+      if (!path.isAbsolute(metadata.videoPath)) {
+        console.error('[MetadataStorageService] Refusing to delete non-absolute video path:', {
+          bufferId,
+          videoPath: metadata.videoPath,
+        });
+        return false;
+      }
+
+      try {
+        await fs.unlink(metadata.videoPath);
+        console.debug('[MetadataStorageService] Deleted associated video file:', {
+          bufferId,
+          videoPath: metadata.videoPath,
+        });
+      } catch (videoError: unknown) {
+        const nodeError = videoError as NodeJS.ErrnoException;
+        if (nodeError.code !== 'ENOENT') {
+          console.error('[MetadataStorageService] Video deletion failed - keeping metadata:', {
+            bufferId,
+            videoPath: metadata.videoPath,
+            error: nodeError.message,
+          });
+          return false;
+        }
+        // ENOENT → already gone, proceed
+      }
+    }
+
+    // Delete thumbnail if present (non-critical)
+    if (metadata.videoThumbnail) {
+      if (path.isAbsolute(metadata.videoThumbnail)) {
+        try {
+          await fs.unlink(metadata.videoThumbnail);
+          console.debug('[MetadataStorageService] Deleted associated thumbnail file:', {
+            bufferId,
+            videoThumbnail: metadata.videoThumbnail,
+          });
+        } catch (thumbnailError: unknown) {
+          const nodeError = thumbnailError as NodeJS.ErrnoException;
+          if (nodeError.code !== 'ENOENT') {
+            console.warn('[MetadataStorageService] Thumbnail deletion failed (non-critical):', {
+              bufferId,
+              videoThumbnail: metadata.videoThumbnail,
+              error: nodeError.message,
+            });
+          }
+        }
+      } else {
+        console.error('[MetadataStorageService] Refusing to delete non-absolute thumbnail path:', {
+          bufferId,
+          videoThumbnail: metadata.videoThumbnail,
+        });
+      }
+    }
+
+    // Delete metadata file
+    await fs.unlink(filepath);
+    console.debug('[MetadataStorageService] Deleted match metadata:', {
+      bufferId,
+      filename,
+    });
+    this.emit('matchDeleted', { bufferId, hadVideo: !!metadata.videoPath });
+
+    return true;
+  }
+
+  /**
    * Delete match metadata by bufferId (works for complete and incomplete matches)
    */
   public async deleteMatch(bufferId: string): Promise<boolean> {
@@ -561,82 +1027,12 @@ export class MetadataStorageService extends EventEmitter {
             const content = await fs.readFile(filepath, 'utf-8');
             const metadata = JSON.parse(content) as StoredMatchMetadata;
             if (metadata.bufferId === bufferId) {
-              // Atomic video deletion with minimal guard
-              if (metadata.videoPath) {
-                if (!path.isAbsolute(metadata.videoPath)) {
-                  console.error(
-                    '[MetadataStorageService] Refusing to delete non-absolute video path:',
-                    {
-                      bufferId,
-                      videoPath: metadata.videoPath,
-                    }
-                  );
-                  return false;
-                }
-
-                try {
-                  await fs.unlink(metadata.videoPath);
-                  console.debug('[MetadataStorageService] Deleted associated video file:', {
-                    bufferId,
-                    videoPath: metadata.videoPath,
-                  });
-                } catch (videoError: any) {
-                  if (videoError.code !== 'ENOENT') {
-                    console.error(
-                      '[MetadataStorageService] Video deletion failed - keeping metadata:',
-                      {
-                        bufferId,
-                        videoPath: metadata.videoPath,
-                        error: videoError?.message,
-                      }
-                    );
-                    return false; // keep metadata if deletion actually failed
-                  }
-                  // ENOENT → already gone, proceed to delete metadata
-                }
-              }
-
-              // Delete thumbnail if it exists
-              if (metadata.videoThumbnail) {
-                if (!path.isAbsolute(metadata.videoThumbnail)) {
-                  console.error(
-                    '[MetadataStorageService] Refusing to delete non-absolute thumbnail path:',
-                    {
-                      bufferId,
-                      videoThumbnail: metadata.videoThumbnail,
-                    }
-                  );
-                } else {
-                  try {
-                    await fs.unlink(metadata.videoThumbnail);
-                    console.debug('[MetadataStorageService] Deleted associated thumbnail file:', {
-                      bufferId,
-                      videoThumbnail: metadata.videoThumbnail,
-                    });
-                  } catch (thumbnailError) {
-                    // Thumbnail deletion is non-critical, just log
-                    if ((thumbnailError as NodeJS.ErrnoException).code !== 'ENOENT') {
-                      console.warn(
-                        '[MetadataStorageService] Thumbnail deletion failed (non-critical):',
-                        {
-                          bufferId,
-                          videoThumbnail: metadata.videoThumbnail,
-                          error: (thumbnailError as Error)?.message,
-                        }
-                      );
-                    }
-                  }
-                }
-              }
-
-              // Delete metadata file (only reached if video deletion succeeded or not needed)
-              await fs.unlink(filepath);
-              console.debug('[MetadataStorageService] Deleted match metadata:', {
+              return await this.deleteMatchAssetsAndMetadata({
                 bufferId,
+                filepath,
                 filename: file,
+                metadata,
               });
-              this.emit('matchDeleted', { bufferId, hadVideo: !!metadata.videoPath });
-              return true;
             }
           } catch (error) {
             console.warn('[MetadataStorageService] Failed during delete scan:', file, error);
@@ -666,6 +1062,7 @@ export class MetadataStorageService extends EventEmitter {
   /**
    * Clean up excess matches based on file count limit
    * Uses content-based sorting to keep the most recent matches
+   * NEVER deletes favourited matches
    */
   public async cleanupOldMatches(): Promise<number> {
     return this.safeFileOperation(
@@ -675,33 +1072,99 @@ export class MetadataStorageService extends EventEmitter {
         // Load all matches using the shared helper method
         const allMatches = await this.loadAllMatchesWithFiles();
 
-        const validMatches = allMatches.filter(
-          (m): m is { file: string; metadata: StoredMatchMetadata } =>
-            m.metadata.matchData.timestamp !== null
-        );
+        // Helper to get valid timestamp in ms (returns null for invalid/NaN/missing)
+        const getValidTimeMs = (date: Date | null | undefined): number | null => {
+          if (!date || !(date instanceof Date)) return null;
+          const time = date.getTime();
+          return Number.isNaN(time) ? null : time;
+        };
 
-        // Clean up by file count if configured
+        // Clean up by file count if configured (use allMatches - fallback sorting handles missing timestamps)
         if (
           this.config.maxFiles &&
           this.config.maxFiles > 0 &&
-          validMatches.length > this.config.maxFiles
+          allMatches.length > this.config.maxFiles
         ) {
-          // Sort by timestamp (oldest first) for proper cleanup
-          const sortedMatches = validMatches.sort(
-            (a, b) =>
-              a.metadata.matchData.timestamp.getTime() - b.metadata.matchData.timestamp.getTime()
+          // CRITICAL: Exclude favourites from deletion candidates
+          const deletableMatches = allMatches.filter(
+            m => m.metadata.isFavourite !== true
           );
+          const favouriteCount = allMatches.length - deletableMatches.length;
 
-          const excessCount = sortedMatches.length - this.config.maxFiles;
-          const excessMatches = sortedMatches.slice(0, excessCount);
+          // Sort deletable matches by effective date with deterministic tie-breaker (oldest first)
+          const sortedMatches = deletableMatches.sort((a, b) => {
+            // Compute effective time per match (timestamp ?? lastUpdatedAt ?? createdAt)
+            // Uses optional chaining to guard against missing matchData
+            const aTimeMs =
+              getValidTimeMs(a.metadata.matchData?.timestamp) ??
+              getValidTimeMs(a.metadata.lastUpdatedAt) ??
+              getValidTimeMs(a.metadata.createdAt);
+            const bTimeMs =
+              getValidTimeMs(b.metadata.matchData?.timestamp) ??
+              getValidTimeMs(b.metadata.lastUpdatedAt) ??
+              getValidTimeMs(b.metadata.createdAt);
 
-          for (const { file } of excessMatches) {
-            try {
-              await fs.unlink(path.join(this.storageDir, file));
-              deletedCount++;
-            } catch (error) {
-              console.warn('[MetadataStorageService] Failed to delete excess file:', file, error);
+            // Both have valid times - compare them
+            if (aTimeMs !== null && bTimeMs !== null) {
+              const timeDiff = aTimeMs - bTimeMs;
+              if (timeDiff !== 0) return timeDiff;
+
+              // Deterministic tie-breaker using bufferId (lexicographic)
+              const aBufferId = a.metadata.bufferId || '';
+              const bBufferId = b.metadata.bufferId || '';
+              return aBufferId.localeCompare(bBufferId);
             }
+
+            // If one side missing effective time, put it at the end (prefer deleting matches with dates)
+            if (aTimeMs === null && bTimeMs !== null) return 1;
+            if (aTimeMs !== null && bTimeMs === null) return -1;
+
+            // Both missing - tie-break by bufferId for determinism
+            const aBufferId = a.metadata.bufferId || '';
+            const bBufferId = b.metadata.bufferId || '';
+            return aBufferId.localeCompare(bBufferId);
+          });
+
+          const excessCount = allMatches.length - this.config.maxFiles;
+          const canDelete = Math.min(excessCount, sortedMatches.length);
+          const excessMatches = sortedMatches.slice(0, canDelete);
+
+          for (const { file, metadata } of excessMatches) {
+            const bufferId = metadata.bufferId;
+            if (!bufferId) {
+              console.warn('[MetadataStorageService] Skipping cleanup - no bufferId:', file);
+              continue;
+            }
+
+            const filepath = path.join(this.storageDir, file);
+            try {
+              const deleted = await this.deleteMatchAssetsAndMetadata({
+                bufferId,
+                filepath,
+                filename: file,
+                metadata,
+              });
+              if (deleted) {
+                deletedCount++;
+              }
+              // If deletion failed (e.g., unsafe paths), leave over-limit (same policy as favourites)
+            } catch (error) {
+              console.warn('[MetadataStorageService] Failed to delete excess match:', file, error);
+            }
+          }
+
+          // Log if favourites prevented reaching quota
+          if (favouriteCount > 0 && deletedCount < excessCount) {
+            console.warn(
+              '[MetadataStorageService] Cannot reach maxFiles quota due to favourites:',
+              {
+                maxFiles: this.config.maxFiles,
+                totalMatches: allMatches.length,
+                favouriteCount,
+                deletedCount,
+                remainingOverLimit: allMatches.length - deletedCount - this.config.maxFiles,
+              }
+            );
           }
         }
 
@@ -752,14 +1215,25 @@ export class MetadataStorageService extends EventEmitter {
   }
 
   /**
-   * Get all match files from storage directory
+   * Get all match files from storage directory (strict version - throws on failure).
+   * SSoT for: ensureStorageDirectory + readdir + filter + deterministic sort.
+   * Used by methods that need to propagate catastrophic failures.
+   */
+  private async getMatchFilesStrict(): Promise<string[]> {
+    await this.ensureStorageDirectory();
+    const files = await fs.readdir(this.storageDir);
+    // Match files are named {sanitizedBufferId}.json where bufferId contains timestamp
+    // Sort for deterministic iteration order (readdir order is not guaranteed)
+    return files.filter(file => file.endsWith('.json')).sort();
+  }
+
+  /**
+   * Get all match files from storage directory (fallback version - returns [] on failure).
+   * Wraps getMatchFilesStrict with try/catch for callers that need graceful degradation.
    */
   private async getMatchFiles(): Promise<string[]> {
     try {
-      await this.ensureStorageDirectory();
-      const files = await fs.readdir(this.storageDir);
-      // Match files are named {sanitizedBufferId}.json where bufferId contains timestamp
-      return files.filter(file => file.endsWith('.json'));
+      return await this.getMatchFilesStrict();
     } catch (error) {
       console.warn('[MetadataStorageService] Failed to read storage directory:', error);
       return [];
@@ -797,10 +1271,14 @@ export class MetadataStorageService extends EventEmitter {
 
     if (!metadata.createdAt || !(metadata.createdAt instanceof Date)) {
       errors.push('createdAt is required and must be a Date object');
+    } else if (Number.isNaN(metadata.createdAt.getTime())) {
+      errors.push('createdAt has invalid Date value');
     }
 
     if (!metadata.lastUpdatedAt || !(metadata.lastUpdatedAt instanceof Date)) {
       errors.push('lastUpdatedAt is required and must be a Date object');
+    } else if (Number.isNaN(metadata.lastUpdatedAt.getTime())) {
+      errors.push('lastUpdatedAt has invalid Date value');
     }
 
     // Validate service-generated IDs for complete matches only (both generated at finalize)
@@ -823,6 +1301,8 @@ export class MetadataStorageService extends EventEmitter {
 
     if (!metadata.matchData.timestamp || !(metadata.matchData.timestamp instanceof Date)) {
       errors.push('matchData.timestamp is required and must be a Date object');
+    } else if (Number.isNaN(metadata.matchData.timestamp.getTime())) {
+      errors.push('matchData.timestamp has invalid Date value');
     }
 
     if (!Object.values(UploadStatus).includes(metadata.uploadStatus)) {
@@ -958,6 +1438,11 @@ export class MetadataStorageService extends EventEmitter {
       if (typeof metadata.matchData.team1MMR !== 'number') {
         errors.push('matchData.team1MMR is required for complete matches and must be a number');
       }
+    }
+
+    // Validate optional favourite field if present
+    if (metadata.isFavourite !== undefined && typeof metadata.isFavourite !== 'boolean') {
+      errors.push('isFavourite must be a boolean when provided');
     }
 
     return {

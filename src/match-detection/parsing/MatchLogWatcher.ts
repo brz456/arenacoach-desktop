@@ -48,20 +48,20 @@ export default class MatchLogWatcher extends EventEmitter {
     lastProcessingTime: 0,
   };
 
-  constructor(logDir: string, timeoutMinutes: number = 10) {
+  constructor(
+    logDir: string,
+    timeoutMinutes: number = 10,
+    isSkirmishTrackingEnabled?: () => boolean
+  ) {
     super();
     this.timeoutDuration = timeoutMinutes * 60 * 1000;
     this.logDirectory = this.resolveLogDirectory(logDir);
-    this.parser = new CombatLogParser();
+    this.parser = new CombatLogParser(isSkirmishTrackingEnabled);
   }
 
   private resolveLogDirectory(logDir: string): string {
     if (!logDir) {
-      const userProfile = process.env.USERPROFILE;
-      if (!userProfile) {
-        throw new Error('USERPROFILE environment variable not set');
-      }
-      return path.join(userProfile, 'Documents', 'World of Warcraft', '_retail_', 'Logs');
+      throw new Error('logDir is required: no default log directory exists');
     }
     return path.resolve(logDir);
   }

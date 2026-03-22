@@ -4,13 +4,24 @@ import {
   RecordingQuality,
   CaptureMode,
   RESOLUTION_DIMENSIONS,
+  EncoderMode,
 } from './RecordingTypes';
+
+// Canonical minimum window dimensions - used in BrowserWindow config and window bounds clamping
+export const MIN_WINDOW_WIDTH = 1000;
+export const MIN_WINDOW_HEIGHT = 750;
 
 export interface WindowBounds {
   x?: number;
   y?: number;
   width: number;
   height: number;
+}
+
+export type MistakeViewMode = 'all' | 'mine';
+
+export interface EnabledBracketsSettings {
+  skirmish: boolean;
 }
 
 export interface AppSettings {
@@ -20,26 +31,35 @@ export interface AppSettings {
   recordingEnabled?: boolean;
   matchDetectionEnabled?: boolean;
   windowBounds?: WindowBounds;
-  recording: RecordingSettings; // Nested recording settings
+  recording: StoredRecordingSettings; // Nested recording settings
   runOnStartup?: boolean;
+  minimizeToTray: boolean; // Close button minimizes to tray instead of quitting
+  showMmrBadge: boolean; // Show MMR badge on match cards
+  defaultMistakeView: MistakeViewMode; // Default event-filter player scope
+  enabledBrackets: EnabledBracketsSettings; // Which detected brackets are allowed into processing
   wowInstallationPath?: string; // User-validated WoW installation root
 }
 
+export type StoredRecordingSettings = RecordingSettings & {
+  encoderMode?: EncoderMode;
+};
+
 const DEFAULT_SETTINGS: AppSettings = {
   maxMatchFiles: 1000,
-  maxDiskStorage: 50, // 50 GB default
+  maxDiskStorage: 100, // 100 GB default
   recordingEnabled: true,
   matchDetectionEnabled: true,
   windowBounds: {
-    width: 1400,
+    width: 1650, // Optimal 4-column layout
     height: 1000,
   },
   recording: {
     captureMode: CaptureMode.WINDOW,
     resolution: '1920x1080',
-    fps: 60,
+    fps: 30,
     quality: RecordingQuality.MEDIUM,
     encoder: 'x264',
+    encoderMode: 'auto',
     desktopAudioEnabled: false,
     desktopAudioDevice: 'default',
     microphoneAudioEnabled: false,
@@ -49,6 +69,12 @@ const DEFAULT_SETTINGS: AppSettings = {
     forceMonoInput: true,
   },
   runOnStartup: true,
+  minimizeToTray: true, // Default: close button minimizes to tray
+  showMmrBadge: true, // Default: show MMR badge on match cards
+  defaultMistakeView: 'all',
+  enabledBrackets: {
+    skirmish: true,
+  },
 };
 
 /**
@@ -85,6 +111,23 @@ export class SettingsService {
         runOnStartup: {
           type: 'boolean',
         },
+        minimizeToTray: {
+          type: 'boolean',
+        },
+        showMmrBadge: {
+          type: 'boolean',
+        },
+        defaultMistakeView: {
+          type: 'string',
+          enum: ['all', 'mine'],
+        },
+        enabledBrackets: {
+          type: 'object',
+          properties: {
+            skirmish: { type: 'boolean' },
+          },
+          required: ['skirmish'],
+        },
         wowInstallationPath: {
           type: 'string',
           maxLength: 1024,
@@ -94,8 +137,8 @@ export class SettingsService {
           properties: {
             x: { type: 'number' },
             y: { type: 'number' },
-            width: { type: 'number', minimum: 1400 },
-            height: { type: 'number', minimum: 900 },
+            width: { type: 'number' },
+            height: { type: 'number' },
           },
           required: ['width', 'height'],
         },
@@ -122,6 +165,10 @@ export class SettingsService {
               type: 'string',
               enum: ['nvenc', 'amd', 'x264'],
             },
+            encoderMode: {
+              type: 'string',
+              enum: ['auto', 'manual'],
+            },
             desktopAudioEnabled: { type: 'boolean' },
             desktopAudioDevice: { type: 'string' },
             microphoneAudioEnabled: { type: 'boolean' },
@@ -143,7 +190,7 @@ export class SettingsService {
 
   updateSettings(newSettings: Partial<AppSettings>): AppSettings {
     // Let electron-store schema handle all validation
-    const { recording, ...otherSettings } = newSettings;
+    const { recording, enabledBrackets, ...otherSettings } = newSettings;
 
     // Filter out undefined values to avoid unintended deletes
     const entries = Object.entries(otherSettings).filter(([, v]) => v !== undefined);
@@ -153,9 +200,24 @@ export class SettingsService {
 
     // Handle nested recording object with proper merge
     if (recording !== undefined) {
-      const currentRecording = this.store.get('recording', DEFAULT_SETTINGS.recording);
+      const currentRecording = {
+        ...DEFAULT_SETTINGS.recording,
+        ...this.store.get('recording', DEFAULT_SETTINGS.recording),
+      };
       const mergedRecording = { ...currentRecording, ...recording };
       this.store.set('recording', mergedRecording);
+    }
+
+    if (enabledBrackets !== undefined) {
+      const currentEnabledBrackets = {
+        ...DEFAULT_SETTINGS.enabledBrackets,
+        ...this.store.get('enabledBrackets', DEFAULT_SETTINGS.enabledBrackets),
+      };
+      const mergedEnabledBrackets = {
+        ...currentEnabledBrackets,
+        ...Object.fromEntries(Object.entries(enabledBrackets).filter(([, v]) => v !== undefined)),
+      };
+      this.store.set('enabledBrackets', mergedEnabledBrackets);
     }
 
     return this.getSettings();

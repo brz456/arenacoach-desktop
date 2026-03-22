@@ -21,6 +21,7 @@ import {
   RecordingQuality,
   QUALITY_BITRATE_KBPS_MAP,
   AudioDevice,
+  EncoderMode,
 } from '../RecordingTypes';
 
 /**
@@ -50,17 +51,9 @@ export interface OBSRecorderConfig {
   fps?: 30 | 60;
   bitrate?: number;
   encoder?: 'nvenc' | 'amd' | 'x264';
+  encoderMode?: EncoderMode;
   audioDevice?: string;
 }
-
-/**
- * Encoder constants for type safety
- */
-const Encoder = {
-  NVIDIA: 'jim_nvenc',
-  AMD: 'h264_texture_amf',
-  X264: 'obs_x264',
-} as const;
 
 /**
  * Manages OBS settings and configuration
@@ -137,9 +130,7 @@ export class OBSSettingsManager {
   /**
    * Configure OBS output settings
    */
-  public configureOutput(config?: OBSRecorderConfig): void {
-    const finalConfig = config || this.config;
-
+  public configureOutput(options: { encoderId?: string; preserveCurrentEncoder?: boolean } = {}): void {
     // Configuring output settings
 
     // Set output mode to Advanced for more control
@@ -148,9 +139,18 @@ export class OBSSettingsManager {
     // Set recording path
     this.applySetting('Output', 'RecFilePath', this.defaultOutputDir);
 
-    // Configure encoder
-    const encoder = this.resolveEncoderId(finalConfig);
-    this.applySetting('Output', 'RecEncoder', encoder);
+    // Configure encoder (unless explicitly preserving current OBS/default value)
+    let encoder: string | undefined;
+    if (!options.preserveCurrentEncoder) {
+      if (!options.encoderId) {
+        console.warn(
+          '[OBSSettingsManager] configureOutput called without encoderId while preserveCurrentEncoder=false'
+        );
+      } else {
+        encoder = options.encoderId;
+        this.applySetting('Output', 'RecEncoder', encoder);
+      }
+    }
 
     // Set recording format
     this.applySetting('Output', 'RecFormat', RECORDING_FORMAT);
@@ -158,8 +158,10 @@ export class OBSSettingsManager {
     // Set keyframe interval to 1 second for better seeking
     this.applySetting('Output', 'Reckeyint_sec', 1);
 
-    // Configure quality based on encoder
-    this.configureEncoderQuality(encoder);
+    // Configure quality based on encoder when we explicitly apply one
+    if (encoder) {
+      this.configureEncoderQuality(encoder);
+    }
 
     // Output configured with encoder
   }
@@ -206,34 +208,17 @@ export class OBSSettingsManager {
    * Configure encoder-specific quality settings
    */
   private configureEncoderQuality(encoder: string): void {
-    if (encoder === 'obs_x264') {
+    const normalized = encoder.toLowerCase();
+
+    if (normalized === 'obs_x264') {
       // x264 uses CRF
       this.applySetting('Output', 'Recrate_control', 'CRF');
       this.applySetting('Output', 'Reccrf', this.defaultQuality);
-    } else if (encoder.includes('nvenc') || encoder.includes('amf')) {
+    } else if (normalized.includes('nvenc') || normalized.includes('amf')) {
       // Hardware encoders use CQP
       this.applySetting('Output', 'Recrate_control', 'CQP');
       this.applySetting('Output', 'Reccqp', this.defaultQuality);
     }
-  }
-
-  /**
-   * Select the best available encoder
-   */
-  private resolveEncoderId(config?: OBSRecorderConfig): string {
-    const finalConfig = config || this.config;
-
-    // Check requested encoder type
-    if (finalConfig.encoder === 'nvenc') {
-      return Encoder.NVIDIA;
-    }
-
-    if (finalConfig.encoder === 'amd') {
-      return Encoder.AMD;
-    }
-
-    // Fallback to x264 software encoder
-    return Encoder.X264;
   }
 
   /**
@@ -259,15 +244,26 @@ export class OBSSettingsManager {
     if (config.outputDir) {
       this.defaultOutputDir = config.outputDir;
     }
-    if (config.encoder) {
-      // Re-apply encoder immediately to keep OBS in sync
-      const encoder = this.resolveEncoderId(this.config);
-      // Avoid redundant writes: only configure if applySetting returns true
-      const updated = this.applySetting('Output', 'RecEncoder', encoder);
-      if (updated) {
-        this.configureEncoderQuality(encoder);
+  }
+
+  public applyEncoderById(encoderId: string): boolean {
+    const updated = this.applySetting('Output', 'RecEncoder', encoderId);
+    if (updated) {
+      this.configureEncoderQuality(encoderId);
+    }
+    return updated;
+  }
+
+  public getRecordingEncoderId(): string | null {
+    const settingsResponse = osn.NodeObs.OBS_settings_getSettings('Output') as OBSSettingsCategory;
+    for (const subcategory of settingsResponse.data) {
+      for (const param of subcategory.parameters) {
+        if (param.name === 'RecEncoder' && typeof param.currentValue === 'string') {
+          return param.currentValue;
+        }
       }
     }
+    return null;
   }
 
   /**

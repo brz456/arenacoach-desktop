@@ -13,16 +13,17 @@
 .video-player-container {
     display: flex;
     flex-direction: column;
-    height: 100%;
+    flex: 1;          /* grow/shrink within parent */
+    min-height: 0;    /* allow shrinking below intrinsic size */
     position: relative;
 }
 
 /* Video element - flexes to fill space above footer */
 .video-player-element {
     flex: 1;
+    min-height: 0;    /* critical: allow shrinking, height driven by container not intrinsic size */
     width: 100%;
     max-width: 100%;
-    min-height: 0;
     object-fit: contain;
     object-position: center;
     background: #000;
@@ -336,6 +337,15 @@
     background: rgba(255,255,255,0.08);
 }
 
+.events-filter-item.is-disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.events-filter-item.is-disabled:hover {
+    background: transparent;
+}
+
 .events-filter-item input[type="checkbox"] {
     appearance: none;
     -webkit-appearance: none;
@@ -352,6 +362,11 @@
 .events-filter-item input[type="checkbox"]:checked {
     background: rgba(120, 115, 255, 1);
     box-shadow: inset 0 0 0 2px rgba(38, 34, 43, 1);
+}
+
+.events-filter-item input[type="checkbox"]:disabled {
+    border-color: rgba(255, 255, 255, 0.35);
+    background: rgba(255, 255, 255, 0.08);
 }
 
 .events-filter-text { 
@@ -550,6 +565,18 @@
     align-items: center;
     gap: 4px;
     overflow: hidden;
+    flex: 1;
+    min-width: 0;
+}
+
+.events-filter-player-name {
+    min-width: 0;
+}
+
+.events-filter-player-count {
+    flex-shrink: 0;
+    white-space: nowrap;
+    color: rgba(255, 255, 255, 0.9);
 }
 
 .event-tooltip,

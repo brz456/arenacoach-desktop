@@ -66,12 +66,27 @@ describe('CombatLogParser - arena match metadata', () => {
       expect(startEvent.bracket).toBe('2v2');
     });
 
-    it('filters skirmish (unranked) matches', () => {
+    it('parses skirmish (unranked) matches', () => {
       const line = '6/22/2025 14:05:33.222  ARENA_MATCH_START,1552,21,Skirmish,0';
       const event = parser.parseLogLine(line);
 
-      // Skirmish returns null because isRanked=false
+      expect(event).not.toBeNull();
+      expect(event!.type).toBe(MatchEventType.MATCH_STARTED);
+
+      const startEvent = event as MatchStartedEvent;
+      expect(startEvent.zoneId).toBe(1552);
+      expect(startEvent.bracket).toBe('Skirmish');
+      expect(startEvent.isRanked).toBe(false);
+    });
+
+    it('skips skirmish matches when skirmish tracking is disabled', () => {
+      parser = new CombatLogParser(() => false);
+
+      const line = '6/22/2025 14:05:33.222  ARENA_MATCH_START,1552,21,Skirmish,0';
+      const event = parser.parseLogLine(line);
+
       expect(event).toBeNull();
+      expect(parser.getCurrentMatch()).toBeNull();
     });
 
     it('returns null for unknown arena type', () => {

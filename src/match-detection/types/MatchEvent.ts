@@ -1,3 +1,4 @@
+import { BRACKET_BY_SLUG, BRACKET_LABEL_SKIRMISH } from '@wow/game-data';
 import { MatchMetadata, PlayerMetadata } from './MatchMetadata';
 import { MatchBuffer } from './MatchTypes';
 import { EarlyEndTrigger } from './EarlyEndTriggers';
@@ -12,13 +13,19 @@ export enum MatchEventType {
 }
 
 /**
- * Arena bracket types based on combat log parsing
+ * Arena bracket labels derived from @wow/game-data (SSoT)
  */
-export enum ArenaBracket {
-  TwoVTwo = '2v2',
-  ThreeVThree = '3v3',
-  SoloShuffle = 'Solo Shuffle',
-}
+export const ARENA_BRACKET_LABELS = {
+  TwoVTwo: BRACKET_BY_SLUG['2v2'].label,
+  ThreeVThree: BRACKET_BY_SLUG['3v3'].label,
+  SoloShuffle: BRACKET_BY_SLUG['shuffle'].label,
+  Skirmish: BRACKET_LABEL_SKIRMISH,
+} as const;
+
+/**
+ * Arena bracket type - union of bracket label values
+ */
+export type ArenaBracket = (typeof ARENA_BRACKET_LABELS)[keyof typeof ARENA_BRACKET_LABELS];
 
 /**
  * Match start event data - minimal orchestration fields plus optional combatant data

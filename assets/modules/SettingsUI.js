@@ -29,6 +29,10 @@ class SettingsUI {
         this.wowPath = document.getElementById('wow-path');
         this.browseWowBtn = document.getElementById('browse-wow');
         this.autoStartupToggle = document.getElementById('auto-startup');
+        this.minimizeToTrayToggle = document.getElementById('minimize-to-tray');
+        this.showMmrBadgeToggle = document.getElementById('show-mmr-badge');
+        this.defaultMistakeViewToggle = document.getElementById('default-mistake-view');
+        this.enableSkirmishTrackingToggle = document.getElementById('enable-skirmish-tracking');
 
         // Store last valid value for restoration
         this.lastValidMaxFiles = null;
@@ -54,7 +58,7 @@ class SettingsUI {
         // Tab switching for Settings
         document.querySelectorAll('.settings-tab').forEach(tab => {
             tab.addEventListener('click', (e) => {
-                this.switchSettingsTab(e.target.dataset.tab);
+                this.switchSettingsTab(e.currentTarget.dataset.tab);
             });
         });
         
@@ -73,6 +77,10 @@ class SettingsUI {
         this.resetDiskStorageBtn?.addEventListener('click', () => this.handleResetDiskStorage());
         this.recordingToggleBtn?.addEventListener('click', () => this.handleRecordingToggle());
         this.autoStartupToggle?.addEventListener('change', () => this.handleAutoStartupChange());
+        this.minimizeToTrayToggle?.addEventListener('change', () => this.handleMinimizeToTrayChange());
+        this.showMmrBadgeToggle?.addEventListener('change', () => this.handleShowMmrBadgeChange());
+        this.defaultMistakeViewToggle?.addEventListener('change', () => this.handleDefaultMistakeViewChange());
+        this.enableSkirmishTrackingToggle?.addEventListener('change', () => this.handleSkirmishTrackingChange());
     }
 
     async loadSettings() {
@@ -103,7 +111,7 @@ class SettingsUI {
                     const effectiveDir = await window.arenaCoach.recording.getEffectiveDirectory();
                     this.recordingLocationDisplay.textContent = effectiveDir || '';
                 } catch (e) {
-                    // Fall back to placeholder if IPC fails
+                    console.warn('[SettingsUI] Failed to get effective recording directory:', e);
                     this.recordingLocationDisplay.textContent = '';
                 }
             }
@@ -111,7 +119,7 @@ class SettingsUI {
         
         // Update max disk storage input
         if (this.maxDiskStorageInput) {
-            this.maxDiskStorageInput.value = this.currentSettings.maxDiskStorage || 50;
+            this.maxDiskStorageInput.value = this.currentSettings.maxDiskStorage ?? 50;
         }
         
         // Update recording status and disk usage
@@ -121,6 +129,24 @@ class SettingsUI {
         // Update auto-startup toggle
         if (this.autoStartupToggle) {
             this.autoStartupToggle.checked = !!this.currentSettings.runOnStartup;
+        }
+
+        // Update minimize to tray toggle
+        if (this.minimizeToTrayToggle) {
+            this.minimizeToTrayToggle.checked = this.currentSettings.minimizeToTray;
+        }
+
+        // Update show MMR badge toggle
+        if (this.showMmrBadgeToggle) {
+            this.showMmrBadgeToggle.checked = this.currentSettings.showMmrBadge;
+        }
+
+        if (this.defaultMistakeViewToggle) {
+            this.defaultMistakeViewToggle.checked = this.currentSettings.defaultMistakeView === 'mine';
+        }
+
+        if (this.enableSkirmishTrackingToggle) {
+            this.enableSkirmishTrackingToggle.checked = this.currentSettings.enabledBrackets?.skirmish !== false;
         }
     }
 
@@ -156,24 +182,28 @@ class SettingsUI {
         }
         
         // Parse and clamp the value
-        let numValue = parseInt(value, 10);
-        
-        // Handle invalid input
+        const numValue = parseInt(value, 10);
+
+        // Invalid input: restore last valid value, don't save
         if (isNaN(numValue)) {
-            inputElement.value = '0';
-            numValue = 0;
+            if (this.lastValidMaxFiles !== null) {
+                inputElement.value = this.lastValidMaxFiles.toString();
+            }
+            return;
         }
-        // Clamp to valid range (industry standard: silently enforce limits)
-        else if (numValue < 0) {
+
+        // Clamp to valid range
+        let clampedValue = numValue;
+        if (numValue < 0) {
             inputElement.value = '0';
-            numValue = 0;
+            clampedValue = 0;
         } else if (numValue > 100000) {
             inputElement.value = '100000';
-            numValue = 100000;
+            clampedValue = 100000;
         }
-        
+
         // Store the valid value and trigger debounced save
-        this.lastValidMaxFiles = numValue;
+        this.lastValidMaxFiles = clampedValue;
         this.debouncedAutoSave();
     }
 
@@ -195,15 +225,21 @@ class SettingsUI {
     }
 
     async handleAutoSave() {
-        const maxMatchFiles = parseInt(this.maxMatchFilesInput.value, 10) || 0;
-        const newSettings = { maxMatchFiles };
+        const parsed = parseInt(this.maxMatchFilesInput.value, 10);
+        if (!Number.isFinite(parsed) || parsed < 0) {
+            console.error('[SettingsUI] Invalid maxMatchFiles value:', this.maxMatchFilesInput.value);
+            return;
+        }
+        const newSettings = { maxMatchFiles: parsed };
 
         try {
-            this.currentSettings = await window.arenaCoach.settings.update(newSettings);
+            const updateResult = await window.arenaCoach.settings.update(newSettings);
+            this.currentSettings = updateResult.settings;
             // Auto-save doesn't show success notification to avoid spam
         } catch (error) {
             console.error('Failed to save settings:', error);
-            NotificationManager.show(`Failed to save settings: ${error.message}`, 'error');
+            const message = error instanceof Error ? error.message : String(error);
+            NotificationManager.show(`Failed to save settings: ${message}`, 'error');
         }
     }
 
@@ -226,15 +262,15 @@ class SettingsUI {
             // Get current location from settings for default path
             const currentLocation = this.currentSettings?.recordingLocation;
 
-            const result = await window.arenaCoach.dialogs.showOpenDialog({
+            const dialogResult = await window.arenaCoach.dialogs.showOpenDialog({
                 title: 'Select Recording Location',
                 defaultPath: currentLocation || '',
                 properties: ['openDirectory', 'createDirectory']
             });
-            
-            if (result && !result.canceled && result.filePaths.length > 0) {
-                const selectedPath = result.filePaths[0];
-                
+
+            if (dialogResult && !dialogResult.canceled && dialogResult.filePaths.length > 0) {
+                const selectedPath = dialogResult.filePaths[0];
+
                 // Update display temporarily with selected path
                 this.recordingLocationDisplay.textContent = selectedPath;
 
@@ -243,7 +279,13 @@ class SettingsUI {
                     recordingLocation: selectedPath
                 };
 
-                this.currentSettings = await window.arenaCoach.settings.update(newSettings);
+                const updateResult = await window.arenaCoach.settings.update(newSettings);
+                this.currentSettings = updateResult.settings;
+
+                // Warn if live recording service update failed
+                if (updateResult.recordingDirUpdateError) {
+                    NotificationManager.show('Recording location saved but live update failed. Restart to apply.', 'warning');
+                }
 
                 // Update display with the actual saved path (may be sanitized if root directory)
                 if (this.currentSettings.recordingLocation) {
@@ -252,10 +294,10 @@ class SettingsUI {
                     // If the path was sanitized, show a more specific notification
                     if (this.currentSettings.recordingLocation !== selectedPath) {
                         NotificationManager.show(`Recording location set to: ${this.currentSettings.recordingLocation}`, 'info');
-                    } else {
+                    } else if (!updateResult.recordingDirUpdateError) {
                         NotificationManager.show('Recording location updated', 'success');
                     }
-                } else {
+                } else if (!updateResult.recordingDirUpdateError) {
                     NotificationManager.show('Recording location updated', 'success');
                 }
             }
@@ -278,14 +320,11 @@ class SettingsUI {
         if (isNaN(value) || value < 0) return;
         
         try {
-            await window.arenaCoach.settings.update({
+            const updateResult = await window.arenaCoach.settings.update({
                 maxDiskStorage: value
             });
-            
-            // Update the current settings and refresh disk usage display
-            this.currentSettings = await window.arenaCoach.settings.get();
+            this.currentSettings = updateResult.settings;
             this.updateDiskUsage();
-            
         } catch (error) {
             console.error('Failed to update max disk storage:', error);
         }
@@ -383,26 +422,40 @@ class SettingsUI {
     async updateDiskUsage() {
         try {
             const status = await window.arenaCoach.recording.getStatus();
-            const maxStorage = this.currentSettings?.maxDiskStorage || 50;
-            
+            const maxStorage = this.currentSettings?.maxDiskStorage ?? 50;
+
             if (this.diskUsageFill && this.diskUsageText) {
-                // OBS recorder reports actual used space by recordings
-                const usedGB = status.diskUsedGB || 0;
-                const percentage = maxStorage > 0 ? Math.max(0, Math.min((usedGB / maxStorage) * 100, 100)) : 0;
-                
-                // Update progress bar (represents used space)
-                this.diskUsageFill.style.width = `${percentage}%`;
-                
-                // Update color based on used space
-                this.diskUsageFill.className = 'disk-usage-fill';
-                if (percentage >= 95) {
-                    this.diskUsageFill.classList.add('danger'); // High usage = danger
-                } else if (percentage >= 80) {
-                    this.diskUsageFill.classList.add('warning'); // High usage = warning
+                // Validate diskUsedGB before rendering
+                if (typeof status.diskUsedGB !== 'number' || !Number.isFinite(status.diskUsedGB)) {
+                    this.diskUsageFill.style.width = '0%';
+                    this.diskUsageFill.className = 'disk-usage-fill';
+                    this.diskUsageText.textContent = 'Disk usage unavailable';
+                    return;
                 }
-                
-                // Update text to show used space vs user limit
-                this.diskUsageText.textContent = `Used: ${usedGB.toFixed(1)} GB / ${maxStorage} GB`;
+                const usedGB = status.diskUsedGB;
+
+                if (maxStorage === 0) {
+                    // No limit mode: hide progress bar, show usage only
+                    this.diskUsageFill.style.width = '0%';
+                    this.diskUsageFill.className = 'disk-usage-fill';
+                    this.diskUsageText.textContent = `Used: ${usedGB.toFixed(1)} GB (no limit)`;
+                } else {
+                    const percentage = Math.max(0, Math.min((usedGB / maxStorage) * 100, 100));
+
+                    // Update progress bar (represents used space)
+                    this.diskUsageFill.style.width = `${percentage}%`;
+
+                    // Update color based on used space
+                    this.diskUsageFill.className = 'disk-usage-fill';
+                    if (percentage >= 95) {
+                        this.diskUsageFill.classList.add('danger'); // High usage = danger
+                    } else if (percentage >= 80) {
+                        this.diskUsageFill.classList.add('warning'); // High usage = warning
+                    }
+
+                    // Update text to show used space vs user limit
+                    this.diskUsageText.textContent = `Used: ${usedGB.toFixed(1)} GB / ${maxStorage} GB`;
+                }
             }
         } catch (error) {
             console.error('Failed to update disk usage:', error);
@@ -455,8 +508,8 @@ class SettingsUI {
             this.isRecording = status.isRecording;
             this.updateRecordingDisabledState();
         } catch (error) {
-            // If IPC fails, assume not recording
-            this.isRecording = false;
+            // Keep last-known value on IPC error (no inference)
+            console.warn('[SettingsUI] Failed to get recording status, keeping last-known value:', error);
             this.updateRecordingDisabledState();
         }
     }
@@ -520,8 +573,8 @@ class SettingsUI {
             this.isInMatch = !!match;
             this.updateMatchDisabledState();
         } catch (error) {
-            // If IPC fails, assume no active match
-            this.isInMatch = false;
+            // Keep last-known value on IPC error (no inference)
+            console.warn('[SettingsUI] Failed to get current match, keeping last-known value:', error);
             this.updateMatchDisabledState();
         }
     }
@@ -558,13 +611,13 @@ class SettingsUI {
         }
 
         try {
-            const updatedSettings = await window.arenaCoach.settings.update({ runOnStartup: enabled });
+            const result = await window.arenaCoach.settings.update({ runOnStartup: enabled });
 
-            // Sync local state with persisted settings for accurate future reverts
-            if (updatedSettings) {
-                this.currentSettings = updatedSettings;
+            if (!result?.settings) {
+                throw new Error('Unexpected response: settings missing');
             }
 
+            this.currentSettings = result.settings;
             console.log(`Auto-startup setting updated: ${enabled}`);
         } catch (error) {
             console.error('Failed to update auto-startup setting:', error);
@@ -578,6 +631,144 @@ class SettingsUI {
             if (this.autoStartupToggle) {
                 this.autoStartupToggle.disabled = false;
             }
+        }
+    }
+
+    async handleMinimizeToTrayChange() {
+        if (!this.minimizeToTrayToggle) {
+            console.error('[SettingsUI] minimizeToTrayToggle element not found');
+            return;
+        }
+
+        const enabled = this.minimizeToTrayToggle.checked;
+        if (this.currentSettings && enabled === this.currentSettings.minimizeToTray) {
+            return;
+        }
+
+        this.minimizeToTrayToggle.disabled = true;
+
+        try {
+            const result = await window.arenaCoach.settings.update({ minimizeToTray: enabled });
+
+            if (!result?.settings) {
+                throw new Error('Unexpected response: settings missing');
+            }
+
+            this.currentSettings = result.settings;
+            console.log(`Minimize to tray setting updated: ${enabled}`);
+        } catch (error) {
+            console.error('Failed to update minimize to tray setting:', error);
+            // Revert checkbox to prior state (opposite of attempted change)
+            this.minimizeToTrayToggle.checked = !enabled;
+            NotificationManager.show('Failed to update close behavior setting', 'error');
+        } finally {
+            this.minimizeToTrayToggle.disabled = false;
+        }
+    }
+
+    async handleShowMmrBadgeChange() {
+        if (!this.showMmrBadgeToggle) {
+            console.error('[SettingsUI] showMmrBadgeToggle element not found');
+            return;
+        }
+
+        const enabled = this.showMmrBadgeToggle.checked;
+        if (this.currentSettings && enabled === this.currentSettings.showMmrBadge) {
+            return;
+        }
+
+        this.showMmrBadgeToggle.disabled = true;
+
+        try {
+            const result = await window.arenaCoach.settings.update({ showMmrBadge: enabled });
+
+            if (!result?.settings) {
+                throw new Error('Unexpected response: settings missing');
+            }
+
+            this.currentSettings = result.settings;
+            console.log(`Show MMR badge setting updated: ${enabled}`);
+
+            this.dispatchSettingsUpdated('showMmrBadge', enabled);
+        } catch (error) {
+            console.error('Failed to update show MMR badge setting:', error);
+            // Revert checkbox to prior state (opposite of attempted change)
+            this.showMmrBadgeToggle.checked = !enabled;
+            NotificationManager.show('Failed to update MMR badge setting', 'error');
+        } finally {
+            this.showMmrBadgeToggle.disabled = false;
+        }
+    }
+
+    dispatchSettingsUpdated(key, value) {
+        window.dispatchEvent(new CustomEvent('settings:updated', {
+            detail: { key, value }
+        }));
+    }
+
+    async handleDefaultMistakeViewChange() {
+        if (!this.defaultMistakeViewToggle) {
+            console.error('[SettingsUI] defaultMistakeViewToggle element not found');
+            return;
+        }
+
+        const value = this.defaultMistakeViewToggle.checked ? 'mine' : 'all';
+
+        if (this.currentSettings && value === this.currentSettings.defaultMistakeView) {
+            return;
+        }
+
+        this.defaultMistakeViewToggle.disabled = true;
+
+        try {
+            const result = await window.arenaCoach.settings.update({ defaultMistakeView: value });
+
+            if (!result?.settings) {
+                throw new Error('Unexpected response: settings missing');
+            }
+
+            this.currentSettings = result.settings;
+            this.dispatchSettingsUpdated('defaultMistakeView', value);
+        } catch (error) {
+            console.error('Failed to update default mistake view setting:', error);
+            const revertValue = this.currentSettings?.defaultMistakeView || 'all';
+            this.defaultMistakeViewToggle.checked = revertValue === 'mine';
+            NotificationManager.show('Failed to update events default setting', 'error');
+        } finally {
+            this.defaultMistakeViewToggle.disabled = false;
+        }
+    }
+
+    async handleSkirmishTrackingChange() {
+        if (!this.enableSkirmishTrackingToggle) {
+            console.error('[SettingsUI] enableSkirmishTrackingToggle element not found');
+            return;
+        }
+
+        const enabled = this.enableSkirmishTrackingToggle.checked;
+        const currentValue = this.currentSettings?.enabledBrackets?.skirmish;
+        if (this.currentSettings && enabled === currentValue) {
+            return;
+        }
+
+        this.enableSkirmishTrackingToggle.disabled = true;
+
+        try {
+            const result = await window.arenaCoach.settings.update({
+                enabledBrackets: { skirmish: enabled }
+            });
+
+            if (!result?.settings) {
+                throw new Error('Unexpected response: settings missing');
+            }
+
+            this.currentSettings = result.settings;
+        } catch (error) {
+            console.error('Failed to update skirmish tracking setting:', error);
+            this.enableSkirmishTrackingToggle.checked = !enabled;
+            NotificationManager.show('Failed to update skirmish setting', 'error');
+        } finally {
+            this.enableSkirmishTrackingToggle.disabled = false;
         }
     }
 

@@ -86,6 +86,25 @@ describe('Metadata Extraction', () => {
       const team1Count = players.filter(p => p.teamId === 1).length;
       expect(team0Count).toBe(3);
       expect(team1Count).toBe(3);
+
+      // TWW fixture: verify specific expected values to catch schema mismatches
+      // These values are from the 3v3-single-match.txt TWW fixture and will fail
+      // if the wrong schema indices are used (e.g., reading talents as specId)
+      const expectedPlayers: Record<string, { specId: number; personalRating: number }> = {
+        'Player-2073-09E7AF2D': { specId: 70, personalRating: 288 }, // Retribution Paladin
+        'Player-1379-0AD90BC6': { specId: 264, personalRating: 960 }, // Restoration Shaman
+        'Player-581-04013838': { specId: 256, personalRating: 576 }, // Discipline Priest
+        'Player-3686-0A23D29D': { specId: 269, personalRating: 576 }, // Windwalker Monk
+        'Player-1104-0599985E': { specId: 71, personalRating: 576 }, // Arms Warrior
+        'Player-1305-0C96E179': { specId: 258, personalRating: 960 }, // Shadow Priest
+      };
+
+      for (const player of players) {
+        const expected = expectedPlayers[player.id];
+        expect(expected).toBeDefined();
+        expect(player.specId).toBe(expected.specId);
+        expect(player.personalRating).toBe(expected.personalRating);
+      }
     });
 
     it('extracts player names from SPELL events', async () => {
@@ -147,12 +166,15 @@ describe('Metadata Extraction', () => {
       expect(event).toBeNull();
     });
 
-    it('handles skirmish matches (filtered out)', () => {
+    it('handles skirmish matches (unranked)', () => {
       const skirmishLine = '8/3/2025 22:12:04.889  ARENA_MATCH_START,2547,33,Skirmish,0';
       const event = parser.parseLogLine(skirmishLine);
 
-      // Skirmish is unranked (last arg is 0), should be filtered
-      expect(event).toBeNull();
+      expect(event).not.toBeNull();
+      expect(event!.type).toBe(MatchEventType.MATCH_STARTED);
+      const startEvent = event as MatchStartedEvent;
+      expect(startEvent.bracket).toBe('Skirmish');
+      expect(startEvent.isRanked).toBe(false);
     });
   });
 });

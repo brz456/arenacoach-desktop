@@ -2,7 +2,7 @@
 class SceneUI {
     // Constants for default values
     static DEFAULT_CAPTURE_MODE = 'game_capture';
-    static DEFAULT_FPS = '60';
+    static DEFAULT_FPS = '30';
     static DEFAULT_RESOLUTION = '1920x1080';
     static DEFAULT_QUALITY = 'medium';
     static DEFAULT_DESKTOP_AUDIO_ENABLED = false;
@@ -37,6 +37,9 @@ class SceneUI {
         // Store current values - initialize with safe defaults, will be overridden by loadSettings()
         this.captureMode = SceneUI.DEFAULT_CAPTURE_MODE;  // Safe default, will be updated by loadSettings()
         this.fps = SceneUI.DEFAULT_FPS;  // Safe default, will be updated by loadSettings()
+        this.currentEncoderMode = 'auto';
+        this.persistedEncoderPreference = 'x264';
+        this.encoderSelectionTouched = false;
         
         // Initialize preview retry state
         this.previewRetryAttempts = 0;
@@ -44,8 +47,8 @@ class SceneUI {
         
         // Recording state for UI disabling
         this.isRecording = false;
-        this.recordingCheckInterval = null;
         this._bannerReflowRAF = null;
+        this._lastPreviewBoundsWarn = 0;
         
         this.setupElements();
         this.setupEvents();
@@ -59,6 +62,7 @@ class SceneUI {
         this.desktopDeviceSelect = document.getElementById('desktop-audio-device');
         this.micDeviceSelect = document.getElementById('microphone-device');
         this.monitorDeviceSelect = document.getElementById('monitor-device');
+        this.encoderSelect = document.getElementById('encoder');
         this.previewBox = document.getElementById('scene-preview-box');
         this.previewPlaceholder = this.previewBox?.querySelector('.preview-placeholder');
         this.previewInitialized = false;
@@ -125,6 +129,10 @@ class SceneUI {
         this.monitorDeviceSelect?.addEventListener('change', () => this.trackSettings());
         this.monitorDeviceSelect?.addEventListener('focus', () => this.refreshMonitorsDebounced());
         this.monitorDeviceSelect?.addEventListener('mousedown', () => this.refreshMonitorsDebounced());
+
+        this.encoderSelect?.addEventListener('change', () => {
+            this.encoderSelectionTouched = true;
+        });
         
         // Track other settings changes
         document.querySelectorAll('.scene-setting').forEach(element => {
@@ -185,7 +193,7 @@ class SceneUI {
                 await window.arenaCoach.obs.preview.show(bounds);
                 this.setupResizeObserver();
             } catch (error) {
-                SceneUI.debugLog('SceneUI', 'Failed to re-show preview', error);
+                console.warn('[SceneUI] Failed to re-show preview:', error);
             }
         } else {
             this.initializePreview();
@@ -234,7 +242,7 @@ class SceneUI {
             // Setup resize observer
             this.setupResizeObserver();
         } catch (error) {
-            SceneUI.debugLog('SceneUI', 'Failed to initialize preview - scheduling retry', error);
+            console.warn('[SceneUI] Failed to initialize preview - scheduling retry:', error);
             // Schedule retry with exponential backoff
             this.schedulePreviewRetry();
         }
@@ -243,8 +251,7 @@ class SceneUI {
     schedulePreviewRetry() {
         // Check if we've exceeded max retries
         if (this.previewRetryAttempts >= SceneUI.PREVIEW_MAX_RETRIES) {
-            // Preview initialization failed after maximum retries
-            // Silently stop retrying - recording is likely disabled
+            console.warn('[SceneUI] Preview initialization failed after maximum retries');
             return;
         }
         
@@ -285,9 +292,19 @@ class SceneUI {
             if (!this.isVisible || !this.previewInitialized) return;
             try {
                 const bounds = this.getPreviewBounds();
-                window.arenaCoach.obs.preview.updateBounds(bounds).catch(() => {});
+                window.arenaCoach.obs.preview.updateBounds(bounds).catch((err) => {
+                    // Rate-limit warning: at most once per 5 seconds
+                    if (Date.now() - this._lastPreviewBoundsWarn > 5000) {
+                        console.warn('[SceneUI] Preview bounds IPC update failed:', err);
+                        this._lastPreviewBoundsWarn = Date.now();
+                    }
+                });
             } catch (e) {
-                SceneUI.debugLog('SceneUI', 'Preview bounds update during banner animation failed', e);
+                // Rate-limit warning: at most once per 5 seconds
+                if (Date.now() - this._lastPreviewBoundsWarn > 5000) {
+                    console.warn('[SceneUI] Preview bounds update failed:', e);
+                    this._lastPreviewBoundsWarn = Date.now();
+                }
             }
             if (now - start < durationMs) {
                 this._bannerReflowRAF = requestAnimationFrame(tick);
@@ -303,10 +320,14 @@ class SceneUI {
         
         this.resizeObserver = new ResizeObserver(() => {
             if (!this.isVisible || !this.previewInitialized) return;
-            
+
             const bounds = this.getPreviewBounds();
             window.arenaCoach.obs.preview.updateBounds(bounds).catch(error => {
-                SceneUI.debugLog('SceneUI', 'Failed to update preview bounds', error);
+                // Rate-limit warning: at most once per 5 seconds
+                if (Date.now() - this._lastPreviewBoundsWarn > 5000) {
+                    console.warn('[SceneUI] Failed to update preview bounds:', error);
+                    this._lastPreviewBoundsWarn = Date.now();
+                }
             });
         });
         
@@ -319,7 +340,7 @@ class SceneUI {
         try {
             await window.arenaCoach.obs.preview.hide();
         } catch (error) {
-            SceneUI.debugLog('SceneUI', 'Failed to hide preview', error);
+            console.warn('[SceneUI] Failed to hide preview:', error);
         }
         
         // Cleanup resize observer
@@ -414,10 +435,10 @@ class SceneUI {
                 }
             }
         } catch (error) {
-            SceneUI.debugLog('SceneUI', 'Failed to fetch audio devices - using defaults', error);
+            console.warn('[SceneUI] Failed to fetch audio devices:', error);
         }
     }
-    
+
     // Fetch and populate monitors from OBS
     async fetchMonitors() {
         try {
@@ -439,34 +460,39 @@ class SceneUI {
                 
                 // Add monitors to dropdown
                 if (monitors.length > 0) {
+                    this.monitorDeviceSelect.disabled = false;
                     monitors.forEach(monitor => {
                         const option = document.createElement('option');
                         option.value = monitor.id;
                         option.textContent = monitor.name;
                         this.monitorDeviceSelect.appendChild(option);
                     });
+
+                    // Restore previous selection if it exists
+                    if (monitors.some(m => m.id === currentMonitor)) {
+                        this.monitorDeviceSelect.value = currentMonitor;
+                    }
                 } else {
-                    // Fallback if no monitors returned
+                    // No monitors available - show disabled empty state
                     const option = document.createElement('option');
-                    option.value = '0';
-                    option.textContent = 'Primary Monitor';
+                    option.value = '';
+                    option.textContent = 'No monitors available';
+                    option.disabled = true;
                     this.monitorDeviceSelect.appendChild(option);
-                }
-                
-                // Restore previous selection if it exists
-                if (monitors.some(m => m.id === currentMonitor)) {
-                    this.monitorDeviceSelect.value = currentMonitor;
+                    this.monitorDeviceSelect.disabled = true;
                 }
             }
         } catch (error) {
-            SceneUI.debugLog('SceneUI', 'Failed to fetch monitors - using defaults', error);
-            // Add default option on error
+            console.warn('[SceneUI] Failed to fetch monitors:', error);
+            // Show unavailable state on error
             if (this.monitorDeviceSelect) {
                 this.monitorDeviceSelect.innerHTML = '';
                 const option = document.createElement('option');
-                option.value = '0';
-                option.textContent = 'Primary Monitor';
+                option.value = '';
+                option.textContent = 'Monitors unavailable';
+                option.disabled = true;
                 this.monitorDeviceSelect.appendChild(option);
+                this.monitorDeviceSelect.disabled = true;
             }
         }
     }
@@ -483,8 +509,8 @@ class SceneUI {
                 this.updateUIDisabledState();
             }
         } catch (error) {
-            SceneUI.debugLog('SceneUI', 'Failed to update recording state - assuming not recording', error);
-            this.isRecording = false;
+            // Keep last-known state on error (no inference); log for diagnostics
+            console.warn('[SceneUI] Failed to update recording state, keeping last-known value:', error);
         }
     }
     
@@ -622,11 +648,21 @@ class SceneUI {
     // Save settings via IPC
     async trackSettings() {
         const settings = this.getSettingsFromUI();
+        if (this.encoderSelectionTouched) {
+            settings._encoderTouched = true;
+        }
         try {
-            await window.arenaCoach.scene.updateSettings(settings);
+            const result = await window.arenaCoach.scene.updateSettings(settings);
+            // Apply canonical persisted settings to UI (SSoT: server may have validated/transformed values)
+            this.applySettingsToUI(result.settings);
+            await this.refreshEncoderDropdownFromRuntime();
+            // Warn if OBS apply failed (settings still saved)
+            if (result.obsApplyError) {
+                NotificationManager.show('Settings saved but OBS update failed. Changes will apply on next recording.', 'warning');
+            }
         } catch (error) {
             // Handle structured errors with specific messages
-            const message = error?.code === 'RECORDING_ACTIVE' 
+            const message = error?.code === 'RECORDING_ACTIVE'
                 ? 'Cannot change settings while recording'
                 : 'Failed to save settings';
             NotificationManager.show(message, 'error');
@@ -638,14 +674,18 @@ class SceneUI {
         try {
             const settings = await window.arenaCoach.scene.getSettings();
             this.applySettingsToUI(settings);
+            await this.refreshEncoderDropdownFromRuntime();
         } catch (error) {
-            // Silent fail - fall back to hardcoded defaults if IPC fails
+            console.error('Failed to load scene settings:', error);
+            NotificationManager.show('Failed to load settings, using defaults', 'warning');
             this.loadDefaults();
         }
     }
     
     // Apply settings to UI elements
     applySettingsToUI(settings) {
+        this.encoderSelectionTouched = false;
+
         // Update button groups
         if (settings.captureMode) {
             this.captureMode = settings.captureMode;
@@ -698,6 +738,7 @@ class SceneUI {
             if (Array.from(encoder.options).some(opt => opt.value === settings.encoder)) {
                 encoder.value = settings.encoder;
             }
+            this.persistedEncoderPreference = settings.encoder;
         }
         if (desktopAudio && settings.desktopAudioEnabled !== undefined) desktopAudio.checked = settings.desktopAudioEnabled;
         if (microphone && settings.microphoneAudioEnabled !== undefined) microphone.checked = settings.microphoneAudioEnabled;
@@ -728,6 +769,28 @@ class SceneUI {
         }
         this.updateAudioDeviceVisibility();
     }
+
+    async refreshEncoderDropdownFromRuntime() {
+        try {
+            const runtime = await window.arenaCoach.scene.getRuntimeEncoder();
+            this.currentEncoderMode = runtime.mode || 'auto';
+            this.persistedEncoderPreference = runtime.preferredEncoder || this.persistedEncoderPreference;
+
+            if (this.currentEncoderMode !== 'auto' || this.encoderSelectionTouched) {
+                return;
+            }
+
+            if (!this.encoderSelect || !runtime.encoder) {
+                return;
+            }
+
+            if (Array.from(this.encoderSelect.options).some(opt => opt.value === runtime.encoder)) {
+                this.encoderSelect.value = runtime.encoder;
+            }
+        } catch (error) {
+            console.warn('[SceneUI] Failed to refresh runtime encoder selection:', error);
+        }
+    }
     
     // Get current settings from UI with proper null checks and defaults
     getSettingsFromUI() {
@@ -743,12 +806,18 @@ class SceneUI {
         const micSuppressionEl = document.getElementById('microphone-suppression');
         const micForceMonoEl = document.getElementById('microphone-force-mono');
         
+        const selectedEncoder = encoderEl ? encoderEl.value : 'x264';
+        const encoderToPersist =
+            this.currentEncoderMode === 'auto' && !this.encoderSelectionTouched
+                ? (this.persistedEncoderPreference || selectedEncoder)
+                : selectedEncoder;
+
         return {
             captureMode: this.captureMode || SceneUI.DEFAULT_CAPTURE_MODE,
             resolution: resolutionEl ? resolutionEl.value : SceneUI.DEFAULT_RESOLUTION,
             fps: parseInt(this.fps, 10) || parseInt(SceneUI.DEFAULT_FPS, 10),
             quality: qualityEl ? qualityEl.value : SceneUI.DEFAULT_QUALITY,
-            encoder: encoderEl ? encoderEl.value : 'x264',
+            encoder: encoderToPersist,
             desktopAudioEnabled: desktopAudioEl ? desktopAudioEl.checked : SceneUI.DEFAULT_DESKTOP_AUDIO_ENABLED,
             desktopAudioDevice: desktopDeviceEl ? desktopDeviceEl.value : SceneUI.DEFAULT_AUDIO_DEVICE,
             microphoneAudioEnabled: microphoneEl ? microphoneEl.checked : SceneUI.DEFAULT_MICROPHONE_AUDIO_ENABLED,

@@ -54,8 +54,13 @@ class AuthUI {
                 this.updateAuthState(true, user);
                 
                 // Only show welcome toast if not from automatic status check or app restore
-                // Sources that suppress toast: 'skillcapped-status', 'login-with-status', 'restore-with-status'
-                if (source !== 'skillcapped-status' && source !== 'login-with-status' && source !== 'restore-with-status') {
+                // Sources that suppress toast: 'skillcapped-status', 'login-with-status', 'restore-with-status', 'billing-status'
+                if (
+                    source !== 'skillcapped-status' &&
+                    source !== 'login-with-status' &&
+                    source !== 'restore-with-status' &&
+                    source !== 'billing-status'
+                ) {
                     NotificationManager.show(`Welcome back, ${user?.battletag || 'User'}!`, 'success');
                 }
             })

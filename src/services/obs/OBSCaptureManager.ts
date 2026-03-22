@@ -6,6 +6,7 @@
 import * as osn from 'obs-studio-node';
 import { IScene, IInput, ISceneItem } from 'obs-studio-node';
 import { CaptureMode } from '../RecordingTypes';
+import { activeFlavor } from '../../config/wowFlavor';
 
 /**
  * Supervisor interface for fatal OBS IPC errors.
@@ -42,6 +43,9 @@ export class OBSCaptureManager {
   private static readonly MIN_BACKOFF_MS = 500;
   private static readonly MAX_BACKOFF_MS = 30000;
 
+  // OBS IPC error signature (SSoT for detection)
+  private static readonly OBS_IPC_ERROR_SIGNATURE = 'Failed to make IPC call';
+
   private scene: IScene | null = null;
   private gameCapture: IInput | null = null;
   private windowCapture: IInput | null = null;
@@ -77,8 +81,22 @@ export class OBSCaptureManager {
   private windowPollIntervalId: NodeJS.Timeout | null = null;
   private static readonly WINDOW_POLL_INTERVAL_MS = 5000;
 
+  // Dimension tracking for resize detection
+  private lastGameCaptureWidth = 0;
+  private lastGameCaptureHeight = 0;
+  private lastWindowCaptureWidth = 0;
+  private lastWindowCaptureHeight = 0;
+
+  // Game capture dimension monitoring
+  private gameDimensionCheckIntervalId: NodeJS.Timeout | null = null;
+  private static readonly DIMENSION_CHECK_INTERVAL_MS = 2000;
+
+  // Monotonic for deterministic OBS property refresh
+  private monotonic = 0;
+
   // Supervisor for fatal IPC error escalation
   private readonly supervisor: ObsIpcSupervisor | undefined;
+  private fatalIpcReported = false; // Idempotency flag for single-report guarantee
 
   constructor(options: { hookCheckDelayMs?: number; supervisor?: ObsIpcSupervisor } = {}) {
     this.wowHookCheckDelay = options.hookCheckDelayMs ?? 500;
@@ -88,64 +106,80 @@ export class OBSCaptureManager {
   /**
    * Initialize scene and capture sources
    * Creates game, window, and monitor capture sources (only one active at a time)
+   * On failure: performs best-effort cleanup and rethrows
    */
   public async initialize(context: ReturnType<typeof osn.VideoFactory.create>): Promise<void> {
     this.isShuttingDown = false;
+    this.fatalIpcReported = false; // Reset for new session
     this.context = context;
 
-    // Create scene
-    this.scene = osn.SceneFactory.create('ArenaCoach Scene');
+    try {
+      // Create scene
+      this.scene = osn.SceneFactory.create('ArenaCoach Scene');
 
-    // Set scene as output source for video channel
-    osn.Global.setOutputSource(0, this.scene);
+      // Set scene as output source for video channel
+      osn.Global.setOutputSource(0, this.scene);
 
-    // Create all capture sources (only one will be enabled at a time)
+      // Create all capture sources (only one will be enabled at a time)
 
-    // 1. Game capture for WoW
-    this.gameCapture = osn.InputFactory.create('game_capture', 'WoW Game Capture');
-    this.gameCapture.enabled = false; // Initially disabled until WoW detected
+      // 1. Game capture for WoW
+      this.gameCapture = osn.InputFactory.create('game_capture', 'WoW Game Capture');
+      this.gameCapture.enabled = false; // Initially disabled until WoW detected
 
-    // Add game capture to scene
-    const gameCaptureItem = this.scene.add(this.gameCapture);
-    gameCaptureItem.position = { x: 0, y: 0 };
-    gameCaptureItem.scale = { x: 1.0, y: 1.0 };
+      // Add game capture to scene
+      const gameCaptureItem = this.scene.add(this.gameCapture);
+      gameCaptureItem.position = { x: 0, y: 0 };
+      gameCaptureItem.scale = { x: 1.0, y: 1.0 };
 
-    // 2. Window capture (for non-fullscreen windows)
-    this.windowCapture = osn.InputFactory.create('window_capture', 'Window Capture');
-    this.windowCapture.enabled = false; // Disabled by default
+      // 2. Window capture (for non-fullscreen windows)
+      this.windowCapture = osn.InputFactory.create('window_capture', 'Window Capture');
+      this.windowCapture.enabled = false; // Disabled by default
 
-    // Add window capture to scene
-    const windowCaptureItem = this.scene.add(this.windowCapture);
-    windowCaptureItem.position = { x: 0, y: 0 };
-    windowCaptureItem.scale = { x: 1.0, y: 1.0 };
+      // Add window capture to scene
+      const windowCaptureItem = this.scene.add(this.windowCapture);
+      windowCaptureItem.position = { x: 0, y: 0 };
+      windowCaptureItem.scale = { x: 1.0, y: 1.0 };
 
-    // Ensure dummy window capture is ready for polling
-    if (!this.ensureDummyWindowCapture()) {
-      console.warn(
-        '[OBSCaptureManager] Failed to create dummy window capture during initialization; polling will retry on demand'
-      );
+      // Ensure dummy window capture is ready for polling
+      if (!this.ensureDummyWindowCapture()) {
+        // Check if failure was due to fatal IPC - fail closed (abort initialization)
+        if (this.fatalIpcReported) {
+          throw new Error(
+            'OBS initialization aborted: fatal IPC error during dummy window capture creation'
+          );
+        }
+        // Non-fatal failure - continue (polling will retry on demand)
+        console.warn(
+          '[OBSCaptureManager] Failed to create dummy window capture during initialization; polling will retry on demand'
+        );
+      }
+
+      // 3. Monitor capture (for entire screen)
+      this.monitorCapture = osn.InputFactory.create('monitor_capture', 'Monitor Capture');
+      this.monitorCapture.enabled = false; // Disabled by default
+
+      // Add monitor capture to scene
+      const monitorCaptureItem = this.scene.add(this.monitorCapture);
+      monitorCaptureItem.position = { x: 0, y: 0 };
+      monitorCaptureItem.scale = { x: 1.0, y: 1.0 };
+
+      // Create desktop audio capture
+      this.audioCapture = osn.InputFactory.create('wasapi_output_capture', 'Desktop Audio');
+
+      // Create microphone capture
+      this.microphoneCapture = osn.InputFactory.create('wasapi_input_capture', 'Microphone');
+
+      // Set audio sources for channels
+      osn.Global.setOutputSource(1, this.audioCapture); // Desktop audio on channel 1
+      osn.Global.setOutputSource(2, this.microphoneCapture); // Microphone on channel 2
+
+      // Game capture, desktop audio, and microphone initialized
+    } catch (initError) {
+      // Cleanup any partially-created resources before rethrowing
+      console.error('[OBSCaptureManager] Initialization failed, performing cleanup:', initError);
+      this.releaseAll(); // Sets isShuttingDown = true and releases resources
+      throw initError;
     }
-
-    // 3. Monitor capture (for entire screen)
-    this.monitorCapture = osn.InputFactory.create('monitor_capture', 'Monitor Capture');
-    this.monitorCapture.enabled = false; // Disabled by default
-
-    // Add monitor capture to scene
-    const monitorCaptureItem = this.scene.add(this.monitorCapture);
-    monitorCaptureItem.position = { x: 0, y: 0 };
-    monitorCaptureItem.scale = { x: 1.0, y: 1.0 };
-
-    // Create desktop audio capture
-    this.audioCapture = osn.InputFactory.create('wasapi_output_capture', 'Desktop Audio');
-
-    // Create microphone capture
-    this.microphoneCapture = osn.InputFactory.create('wasapi_input_capture', 'Microphone');
-
-    // Set audio sources for channels
-    osn.Global.setOutputSource(1, this.audioCapture); // Desktop audio on channel 1
-    osn.Global.setOutputSource(2, this.microphoneCapture); // Microphone on channel 2
-
-    // Game capture, desktop audio, and microphone initialized
 
     // WoW detection will start only when game capture mode is selected
   }
@@ -154,18 +188,27 @@ export class OBSCaptureManager {
    * Try to attach game capture to WoW window
    */
   public tryAttachToWoWWindow(): void {
-    // Only attempt if game capture enabled
-    if (!this.gameCapture || !this.isGameCaptureEnabled) return;
+    // Guards: shutdown, mode mismatch, or disabled (consistent with other timer callbacks)
+    if (
+      this.isShuttingDown ||
+      this.currentCaptureMode !== CaptureMode.GAME ||
+      !this.gameCapture ||
+      !this.isGameCaptureEnabled
+    ) {
+      return;
+    }
 
     this.wowDetectionAttempts++;
 
-    // Create dummy game_capture to refresh properties
-    const dummyInput = osn.InputFactory.create('game_capture', 'temp_dummy');
+    let dummyInput: IInput | null = null;
 
     try {
-      // Force refresh to get current window list
+      // Create dummy game_capture to refresh properties
+      dummyInput = osn.InputFactory.create('game_capture', 'temp_dummy');
+
+      // Force refresh to get current window list (monotonic)
       const dummySettings = dummyInput.settings;
-      dummySettings.refresh = `${Math.random().toString(36).substr(2, 9)}-${Date.now()}`;
+      dummySettings.refresh = String(++this.monotonic);
       dummyInput.update(dummySettings);
 
       // Find window property
@@ -176,11 +219,6 @@ export class OBSCaptureManager {
 
       if (prop && prop.name === 'window' && this.isObsListProperty(prop)) {
         const windowList = prop.details.items;
-
-        // Debug: Log available windows on early attempts
-        if (this.wowDetectionAttempts <= 2) {
-          // Available windows found
-        }
 
         // Find WoW window with robust, case-insensitive matching
         const wowWindow = windowList.find((item: OBSWindowItem) =>
@@ -223,12 +261,33 @@ export class OBSCaptureManager {
             this.scheduleNextAttempt();
           }
         }
+      } else {
+        // Window property not found or not a list - treat same as WoW not found
+        // Schedule next attempt with backoff if still enabled and not attached
+        if (this.isGameCaptureEnabled && !this.isWoWAttached) {
+          this.scheduleNextAttempt();
+        }
       }
     } catch (error) {
-      // Error during WoW attach
+      // Handle attach errors explicitly
+      if (this.isObsIpcError(error)) {
+        this.handleGameCaptureFatalIpc(error);
+      } else {
+        console.warn('[OBSCaptureManager] Error during WoW attach:', error);
+        // Schedule retry for non-IPC errors (transient failures)
+        if (this.isGameCaptureEnabled && !this.isWoWAttached) {
+          this.scheduleNextAttempt();
+        }
+      }
     } finally {
-      // Always cleanup dummy input
-      dummyInput.release();
+      // Always cleanup dummy input (best-effort)
+      if (dummyInput) {
+        try {
+          dummyInput.release();
+        } catch (releaseErr) {
+          console.warn('[OBSCaptureManager] Best-effort dummyInput release failed:', releaseErr);
+        }
+      }
     }
   }
 
@@ -266,21 +325,14 @@ export class OBSCaptureManager {
   }
 
   /**
-   * Reset detection attempts counter
+   * Reset detection attempts counter and all related state.
+   * Delegates lifecycle shutdown to setGameCaptureEnabled(false) (SSoT).
    */
   public resetDetectionAttempts(): void {
     this.wowDetectionAttempts = 0;
-    this.isWoWAttached = false;
-
-    // Clear any pending detection
-    this.clearDetectionTimer();
     this.resetBackoff();
-
-    // Disable game capture
-    if (this.gameCapture) {
-      this.gameCapture.enabled = false;
-      // Detection reset, game capture disabled
-    }
+    // Delegate lifecycle shutdown to SSoT (handles timers, monitoring, state, source disable)
+    this.setGameCaptureEnabled(false);
   }
 
   /**
@@ -302,44 +354,162 @@ export class OBSCaptureManager {
 
   /** Determine if an OBS window list item name is a WoW window */
   private static isWoWWindowName(name: string): boolean {
-    const lower = name.toLowerCase();
-    return lower.includes('wow.exe');
+    return activeFlavor.obsWindowNameRegex.test(name);
+  }
+
+  /**
+   * Start continuous dimension monitoring for game capture
+   */
+  private startGameDimensionMonitoring(): void {
+    this.clearGameDimensionMonitoring();
+    if (this.isShuttingDown || !this.gameCapture) return;
+
+    this.gameDimensionCheckIntervalId = setInterval(() => {
+      this.checkGameDimensionChange();
+    }, OBSCaptureManager.DIMENSION_CHECK_INTERVAL_MS);
+  }
+
+  /**
+   * Stop game capture dimension monitoring
+   */
+  private clearGameDimensionMonitoring(): void {
+    if (this.gameDimensionCheckIntervalId) {
+      clearInterval(this.gameDimensionCheckIntervalId);
+      this.gameDimensionCheckIntervalId = null;
+    }
+  }
+
+  /**
+   * Check if game capture dimensions changed and re-scale if needed
+   */
+  private checkGameDimensionChange(): void {
+    try {
+      if (
+        this.isShuttingDown ||
+        this.currentCaptureMode !== CaptureMode.GAME ||
+        !this.gameCapture ||
+        !this.gameCapture.enabled
+      ) {
+        this.clearGameDimensionMonitoring();
+        return;
+      }
+
+      const currentWidth = this.gameCapture.width;
+      const currentHeight = this.gameCapture.height;
+
+      // Handle lost source (dimensions went to 0 while attached)
+      if (currentWidth <= 0 || currentHeight <= 0) {
+        if (this.isWoWAttached && this.isGameCaptureEnabled) {
+          // Lost source - WoW may have minimized/closed
+          this.clearGameDimensionMonitoring();
+          this.isWoWAttached = false;
+          this.lastGameCaptureWidth = 0;
+          this.lastGameCaptureHeight = 0;
+          try {
+            this.gameCapture.enabled = false;
+          } catch (disableErr) {
+            if (this.isObsIpcError(disableErr)) {
+              this.handleGameCaptureFatalIpc(disableErr);
+              return;
+            }
+            console.warn(
+              '[OBSCaptureManager] Best-effort game capture disable failed:',
+              disableErr
+            );
+          }
+          // Schedule reattachment attempt
+          this.scheduleNextAttempt();
+        }
+        return;
+      }
+
+      // Check if dimensions changed from last successful scale
+      if (
+        currentWidth !== this.lastGameCaptureWidth ||
+        currentHeight !== this.lastGameCaptureHeight
+      ) {
+        // Attempt re-scale (scale method updates last*Width/Height on success)
+        // On failure, last dims unchanged so next interval retries naturally
+        this.scaleGameCaptureSource();
+      }
+    } catch (error) {
+      if (this.isObsIpcError(error)) {
+        this.handleGameCaptureFatalIpc(error);
+      } else {
+        console.warn('[OBSCaptureManager] Error in game dimension check:', error);
+      }
+    }
   }
 
   /**
    * Check if source is hooked and scale if ready
    */
   private checkAndScaleSource(attempts = 0): void {
-    if (!this.gameCapture) return;
+    // Early guard: no-op if shutdown, disabled, or mode changed (handles untracked setTimeout callbacks)
+    if (
+      this.isShuttingDown ||
+      !this.isGameCaptureEnabled ||
+      this.currentCaptureMode !== CaptureMode.GAME ||
+      !this.gameCapture
+    ) {
+      return;
+    }
 
-    if (this.gameCapture.width > 0 && this.gameCapture.height > 0) {
-      // Source hooked successfully
-      this.scaleGameCaptureSource();
-    } else if (attempts < OBSCaptureManager.MAX_SCALE_ATTEMPTS) {
-      // Check if we lost the source (WoW closed while attached)
-      if (this.isWoWAttached && attempts > OBSCaptureManager.LOST_SOURCE_ATTEMPTS) {
-        // Lost source dimensions - WoW may have closed
-        this.isWoWAttached = false;
-        this.gameCapture.enabled = false;
-        // Schedule reattachment attempt
-        if (this.isGameCaptureEnabled) {
-          this.scheduleNextAttempt();
+    try {
+      if (this.gameCapture.width > 0 && this.gameCapture.height > 0) {
+        // Source hooked successfully - attempt initial scale
+        this.scaleGameCaptureSource();
+        // Start monitoring regardless of initial scale result
+        // (on scale failure, lastGameCapture* unchanged so next interval retries)
+        this.startGameDimensionMonitoring();
+      } else if (attempts < OBSCaptureManager.MAX_SCALE_ATTEMPTS) {
+        // Check if we lost the source (WoW closed while attached)
+        if (this.isWoWAttached && attempts > OBSCaptureManager.LOST_SOURCE_ATTEMPTS) {
+          // Lost source dimensions - WoW may have closed
+          this.clearGameDimensionMonitoring();
+          this.isWoWAttached = false;
+          this.lastGameCaptureWidth = 0;
+          this.lastGameCaptureHeight = 0;
+          // Best-effort disable (still schedule reattach even if this throws non-IPC)
+          try {
+            this.gameCapture.enabled = false;
+          } catch (disableErr) {
+            if (this.isObsIpcError(disableErr)) {
+              this.handleGameCaptureFatalIpc(disableErr);
+              return;
+            }
+            console.warn(
+              '[OBSCaptureManager] Error disabling game capture on lost source:',
+              disableErr
+            );
+          }
+          // Schedule reattachment attempt
+          if (this.isGameCaptureEnabled) {
+            this.scheduleNextAttempt();
+          }
+          return;
         }
-        return;
+        // Retry scaling check with attempt limit
+        setTimeout(
+          () => this.checkAndScaleSource(attempts + 1),
+          OBSCaptureManager.SCALE_CHECK_DELAY_MS
+        );
+      } else {
+        // Failed to get source dimensions - scaling aborted
       }
-      // Retry scaling check with attempt limit
-      setTimeout(
-        () => this.checkAndScaleSource(attempts + 1),
-        OBSCaptureManager.SCALE_CHECK_DELAY_MS
-      );
-    } else {
-      // Failed to get source dimensions - scaling aborted
+    } catch (error) {
+      if (this.isObsIpcError(error)) {
+        this.handleGameCaptureFatalIpc(error);
+      } else {
+        console.warn('[OBSCaptureManager] Error in checkAndScaleSource:', error);
+      }
     }
   }
 
   /**
    * Scale game capture source to fit output resolution
    * @returns true if scaling succeeded, false otherwise
+   * @throws Fatal OBS IPC errors (callers must handle via boundary try/catch)
    */
   private scaleGameCaptureSource(): boolean {
     if (!this.scene || !this.gameCapture || !this.context) return false;
@@ -357,61 +527,98 @@ export class OBSCaptureManager {
         (item: ISceneItem) => item.source.name === this.gameCapture!.name
       );
 
-      if (gameCaptureItem) {
-        const outputWidth = this.context.video.outputWidth;
-        const outputHeight = this.context.video.outputHeight;
-        const sourceWidth = this.gameCapture.width;
-        const sourceHeight = this.gameCapture.height;
-
-        // Calculate scale to fit (maintain aspect ratio)
-        const scaleX = outputWidth / sourceWidth;
-        const scaleY = outputHeight / sourceHeight;
-        const scale = Math.min(scaleX, scaleY);
-
-        // Apply scaling
-        gameCaptureItem.scale = { x: scale, y: scale };
-
-        // Center the scaled source in the scene canvas
-        const scaledWidth = sourceWidth * scale;
-        const scaledHeight = sourceHeight * scale;
-
-        gameCaptureItem.position = {
-          x: (outputWidth - scaledWidth) / 2,
-          y: (outputHeight - scaledHeight) / 2,
-        };
-
-        // Game capture centered in scene
+      if (!gameCaptureItem) {
+        console.warn('[OBSCaptureManager] Game capture scene item not found, cannot scale');
+        return false;
       }
+
+      const outputWidth = this.context.video.outputWidth;
+      const outputHeight = this.context.video.outputHeight;
+      const sourceWidth = this.gameCapture.width;
+      const sourceHeight = this.gameCapture.height;
+
+      // Calculate scale to fit (maintain aspect ratio)
+      const scaleX = outputWidth / sourceWidth;
+      const scaleY = outputHeight / sourceHeight;
+      const scale = Math.min(scaleX, scaleY);
+
+      // Apply scaling
+      gameCaptureItem.scale = { x: scale, y: scale };
+
+      // Center the scaled source in the scene canvas
+      const scaledWidth = sourceWidth * scale;
+      const scaledHeight = sourceHeight * scale;
+
+      gameCaptureItem.position = {
+        x: (outputWidth - scaledWidth) / 2,
+        y: (outputHeight - scaledHeight) / 2,
+      };
+
+      // Track dimensions for resize detection (only on success)
+      this.lastGameCaptureWidth = sourceWidth;
+      this.lastGameCaptureHeight = sourceHeight;
+
+      return true;
     } catch (error) {
-      // Failed to scale game capture
+      // Rethrow IPC errors for boundary handler escalation
+      if (this.isObsIpcError(error)) {
+        throw error;
+      }
+      // Non-IPC errors: log and return false
+      console.warn('[OBSCaptureManager] Failed to scale game capture:', error);
       return false;
     }
-    return true;
   }
 
   /**
    * Check if window capture source is ready and scale if needed
    */
   private checkAndScaleWindowSource(attempts = 0): void {
-    if (!this.windowCapture) return;
+    // Early guard: no-op if shutdown or mode changed (handles untracked setTimeout callbacks)
+    if (
+      this.isShuttingDown ||
+      this.currentCaptureMode !== CaptureMode.WINDOW ||
+      !this.windowCapture
+    ) {
+      return;
+    }
 
-    if (this.windowCapture.width > 0 && this.windowCapture.height > 0) {
-      // Source hooked successfully
-      this.scaleWindowCaptureSource();
-    } else if (attempts < OBSCaptureManager.MAX_SCALE_ATTEMPTS) {
-      // Retry scaling check with attempt limit
-      setTimeout(
-        () => this.checkAndScaleWindowSource(attempts + 1),
-        OBSCaptureManager.SCALE_CHECK_DELAY_MS
-      );
-    } else {
-      // Failed to get source dimensions - scaling aborted
+    try {
+      if (this.windowCapture.width > 0 && this.windowCapture.height > 0) {
+        // Source hooked successfully
+        this.scaleWindowCaptureSource();
+      } else if (attempts < OBSCaptureManager.MAX_SCALE_ATTEMPTS) {
+        // Retry scaling check with attempt limit
+        setTimeout(
+          () => this.checkAndScaleWindowSource(attempts + 1),
+          OBSCaptureManager.SCALE_CHECK_DELAY_MS
+        );
+      } else {
+        // Failed to get source dimensions - scaling aborted
+      }
+    } catch (error) {
+      if (this.isObsIpcError(error)) {
+        // Fatal IPC error: stop polling and escalate
+        this.clearWindowCapturePolling();
+        try {
+          if (this.windowCapture) this.windowCapture.enabled = false;
+        } catch (disableErr) {
+          console.warn(
+            '[OBSCaptureManager] Best-effort window capture disable failed:',
+            disableErr
+          );
+        }
+        this.reportFatalObsError(error);
+      } else {
+        console.warn('[OBSCaptureManager] Error in checkAndScaleWindowSource:', error);
+      }
     }
   }
 
   /**
    * Scale window capture source to fit output resolution
    * @returns true if scaling succeeded, false otherwise
+   * @throws Fatal OBS IPC errors (callers must handle via boundary try/catch)
    */
   private scaleWindowCaptureSource(): boolean {
     if (!this.scene || !this.windowCapture || !this.context) return false;
@@ -429,36 +636,153 @@ export class OBSCaptureManager {
         (item: ISceneItem) => item.source.name === this.windowCapture!.name
       );
 
-      if (windowCaptureItem) {
-        const outputWidth = this.context.video.outputWidth;
-        const outputHeight = this.context.video.outputHeight;
-        const sourceWidth = this.windowCapture.width;
-        const sourceHeight = this.windowCapture.height;
-
-        // Calculate scale to fit (maintain aspect ratio)
-        const scaleX = outputWidth / sourceWidth;
-        const scaleY = outputHeight / sourceHeight;
-        const scale = Math.min(scaleX, scaleY);
-
-        // Apply scaling
-        windowCaptureItem.scale = { x: scale, y: scale };
-
-        // Center the scaled source in the scene canvas
-        const scaledWidth = sourceWidth * scale;
-        const scaledHeight = sourceHeight * scale;
-
-        windowCaptureItem.position = {
-          x: (outputWidth - scaledWidth) / 2,
-          y: (outputHeight - scaledHeight) / 2,
-        };
-
-        // Window capture centered in scene
+      if (!windowCaptureItem) {
+        console.warn('[OBSCaptureManager] Window capture scene item not found, cannot scale');
+        return false;
       }
+
+      const outputWidth = this.context.video.outputWidth;
+      const outputHeight = this.context.video.outputHeight;
+      const sourceWidth = this.windowCapture.width;
+      const sourceHeight = this.windowCapture.height;
+
+      // Calculate scale to fit (maintain aspect ratio)
+      const scaleX = outputWidth / sourceWidth;
+      const scaleY = outputHeight / sourceHeight;
+      const scale = Math.min(scaleX, scaleY);
+
+      // Apply scaling
+      windowCaptureItem.scale = { x: scale, y: scale };
+
+      // Center the scaled source in the scene canvas
+      const scaledWidth = sourceWidth * scale;
+      const scaledHeight = sourceHeight * scale;
+
+      windowCaptureItem.position = {
+        x: (outputWidth - scaledWidth) / 2,
+        y: (outputHeight - scaledHeight) / 2,
+      };
+
+      // Track dimensions for resize detection (only on success)
+      this.lastWindowCaptureWidth = sourceWidth;
+      this.lastWindowCaptureHeight = sourceHeight;
+
+      return true;
     } catch (error) {
-      // Failed to scale window capture
+      // Rethrow IPC errors for boundary handler escalation
+      if (this.isObsIpcError(error)) {
+        throw error;
+      }
+      // Non-IPC errors: log and return false
+      console.warn('[OBSCaptureManager] Failed to scale window capture:', error);
       return false;
     }
-    return true;
+  }
+
+  /**
+   * Check if monitor capture source is ready and scale if needed
+   */
+  private checkAndScaleMonitorSource(attempts = 0): void {
+    // Early guard: no-op if shutdown or mode changed (handles untracked setTimeout callbacks)
+    if (
+      this.isShuttingDown ||
+      this.currentCaptureMode !== CaptureMode.MONITOR ||
+      !this.monitorCapture
+    ) {
+      return;
+    }
+
+    try {
+      if (this.monitorCapture.width > 0 && this.monitorCapture.height > 0) {
+        // Source dimensions ready
+        this.scaleMonitorCaptureSource();
+      } else if (attempts < OBSCaptureManager.MAX_SCALE_ATTEMPTS) {
+        // Retry scaling check with attempt limit
+        setTimeout(
+          () => this.checkAndScaleMonitorSource(attempts + 1),
+          OBSCaptureManager.SCALE_CHECK_DELAY_MS
+        );
+      } else {
+        console.warn(
+          '[OBSCaptureManager] Failed to get monitor capture dimensions - scaling aborted'
+        );
+      }
+    } catch (error) {
+      if (this.isObsIpcError(error)) {
+        // Best-effort disable (may fail if IPC is broken)
+        try {
+          if (this.monitorCapture) this.monitorCapture.enabled = false;
+        } catch (disableErr) {
+          console.warn(
+            '[OBSCaptureManager] Best-effort monitor capture disable failed:',
+            disableErr
+          );
+        }
+        this.reportFatalObsError(error);
+      } else {
+        console.warn('[OBSCaptureManager] Error in checkAndScaleMonitorSource:', error);
+      }
+    }
+  }
+
+  /**
+   * Scale monitor capture source to fit output resolution
+   * @returns true if scaling succeeded, false otherwise
+   * @throws Fatal OBS IPC errors (callers must handle via boundary try/catch)
+   */
+  private scaleMonitorCaptureSource(): boolean {
+    if (!this.scene || !this.monitorCapture || !this.context) return false;
+
+    try {
+      // Only scale when source has valid dimensions
+      if (this.monitorCapture.width <= 0 || this.monitorCapture.height <= 0) {
+        // Source dimensions not ready, skipping scale
+        return false;
+      }
+
+      // Get scene item for the monitor capture
+      const sceneItems = this.scene.getItems();
+      const monitorCaptureItem = sceneItems.find(
+        (item: ISceneItem) => item.source.name === this.monitorCapture!.name
+      );
+
+      if (!monitorCaptureItem) {
+        console.warn('[OBSCaptureManager] Monitor capture scene item not found, cannot scale');
+        return false;
+      }
+
+      const outputWidth = this.context.video.outputWidth;
+      const outputHeight = this.context.video.outputHeight;
+      const sourceWidth = this.monitorCapture.width;
+      const sourceHeight = this.monitorCapture.height;
+
+      // Calculate scale to fit (maintain aspect ratio)
+      const scaleX = outputWidth / sourceWidth;
+      const scaleY = outputHeight / sourceHeight;
+      const scale = Math.min(scaleX, scaleY);
+
+      // Apply scaling
+      monitorCaptureItem.scale = { x: scale, y: scale };
+
+      // Center the scaled source in the scene canvas
+      const scaledWidth = sourceWidth * scale;
+      const scaledHeight = sourceHeight * scale;
+
+      monitorCaptureItem.position = {
+        x: (outputWidth - scaledWidth) / 2,
+        y: (outputHeight - scaledHeight) / 2,
+      };
+
+      return true;
+    } catch (error) {
+      // Rethrow IPC errors for boundary handler escalation
+      if (this.isObsIpcError(error)) {
+        throw error;
+      }
+      // Non-IPC errors: log and return false
+      console.warn('[OBSCaptureManager] Failed to scale monitor capture:', error);
+      return false;
+    }
   }
 
   /**
@@ -468,12 +792,24 @@ export class OBSCaptureManager {
    */
   public releaseAll(): boolean {
     this.isShuttingDown = true;
-    // Stop polling and release persistent dummy
+    // Stop all timers deterministically
     this.clearWindowCapturePolling();
+    this.clearGameDimensionMonitoring();
+    this.clearDetectionTimer();
+    // Reset state to prevent any further operations
+    this.isGameCaptureEnabled = false;
+    this.isWoWAttached = false;
+    // Note: fatalIpcReported is NOT reset here to maintain idempotency within session;
+    // it's only reset in initialize() for new sessions
     if (this.dummyWindowCapture) {
       try {
         this.dummyWindowCapture.release();
-      } catch (_) {}
+      } catch (releaseErr) {
+        console.warn(
+          '[OBSCaptureManager] Best-effort dummy window capture release failed:',
+          releaseErr
+        );
+      }
       this.dummyWindowCapture = null;
     }
 
@@ -519,6 +855,7 @@ export class OBSCaptureManager {
       // All sources released
     } catch (error) {
       // Error during release - non-critical during shutdown
+      console.warn('[OBSCaptureManager] releaseAll failed:', error);
       return false;
     }
     return true;
@@ -539,23 +876,58 @@ export class OBSCaptureManager {
   }
 
   /**
-   * Enable or disable game capture mode
+   * Enable or disable game capture mode (SSoT for game capture lifecycle).
+   * On invariant violation (enabling when not in GAME mode), logs warning and enforces disabled state.
+   * Note: IPC errors during enable are handled by tryAttachToWoWWindow; callers should handle
+   * IPC errors during disable if needed.
    */
   public setGameCaptureEnabled(enabled: boolean): void {
+    if (enabled && this.currentCaptureMode !== CaptureMode.GAME) {
+      // Invariant violation: game capture can only be enabled when in GAME mode
+      console.warn(
+        `[OBSCaptureManager] setGameCaptureEnabled(true) rejected: currentCaptureMode=${this.currentCaptureMode}, expected=${CaptureMode.GAME}`
+      );
+      // Enforce deterministic disabled state
+      this.isGameCaptureEnabled = false;
+      this.isWoWAttached = false;
+      this.lastGameCaptureWidth = 0;
+      this.lastGameCaptureHeight = 0;
+      this.clearDetectionTimer();
+      this.clearGameDimensionMonitoring();
+      try {
+        if (this.gameCapture) this.gameCapture.enabled = false;
+      } catch (disableErr) {
+        if (this.isObsIpcError(disableErr)) {
+          this.handleGameCaptureFatalIpc(disableErr);
+        } else {
+          console.warn('[OBSCaptureManager] Best-effort game capture disable failed:', disableErr);
+        }
+      }
+      return;
+    }
+
     this.isGameCaptureEnabled = enabled;
 
     if (enabled) {
       // Reset backoff and immediately try to attach
       this.resetBackoff();
       this.tryAttachToWoWWindow();
-      // If not attached, scheduleNextAttempt() will be called from tryAttachToWoWWindow()
+      // IPC errors are handled inside tryAttachToWoWWindow
     } else {
-      // Stop detection and disable game capture
+      // Stop detection, dimension monitoring, and disable game capture
       this.clearDetectionTimer();
-      if (this.gameCapture) {
-        this.gameCapture.enabled = false;
-        this.isWoWAttached = false;
-        // Game capture disabled
+      this.clearGameDimensionMonitoring();
+      this.isWoWAttached = false;
+      this.lastGameCaptureWidth = 0;
+      this.lastGameCaptureHeight = 0;
+      try {
+        if (this.gameCapture) this.gameCapture.enabled = false;
+      } catch (disableErr) {
+        if (this.isObsIpcError(disableErr)) {
+          this.handleGameCaptureFatalIpc(disableErr);
+        } else {
+          console.warn('[OBSCaptureManager] Error disabling game capture:', disableErr);
+        }
       }
     }
   }
@@ -608,7 +980,9 @@ export class OBSCaptureManager {
             console.warn('[OBSCaptureManager] Failed to add mic suppression filter', e);
             try {
               filter.release?.();
-            } catch (_) {}
+            } catch (releaseErr) {
+              console.warn('[OBSCaptureManager] Best-effort filter release failed:', releaseErr);
+            }
           }
         }
       } else {
@@ -654,114 +1028,185 @@ export class OBSCaptureManager {
   }
 
   /**
-   * Stop WoW detection (public method for shutdown)
+   * Stop all WoW-related detection/monitoring (public method for shutdown/mode switches).
+   * Delegates game lifecycle shutdown to SSoT (setGameCaptureEnabled), handles window cleanup directly.
    */
   public stopWoWDetection(): void {
-    this.clearDetectionTimer();
-    // WoW detection stopped
+    // Delegate game capture lifecycle shutdown to SSoT (best-effort, ignore return)
+    // This handles: detection timer, dimension monitoring, state reset, and source disable
+    this.setGameCaptureEnabled(false);
+
+    // Handle window capture cleanup directly (no window capture SSoT exists)
+    this.clearWindowCapturePolling();
+    this.lastWindowCaptureWidth = 0;
+    this.lastWindowCaptureHeight = 0;
+
+    // Best-effort disable window capture
+    try {
+      if (this.windowCapture) this.windowCapture.enabled = false;
+    } catch (disableErr) {
+      if (this.isObsIpcError(disableErr)) {
+        this.reportFatalObsError(disableErr);
+      } else {
+        console.warn('[OBSCaptureManager] Best-effort window capture disable failed:', disableErr);
+      }
+    }
   }
 
   /**
-   * Apply capture mode - enables selected source, disables others
+   * Apply capture mode - enables selected source, disables others.
+   * On failure: fails closed (restores previous mode, stops all detection/monitoring, disables sources).
+   * @returns true if mode applied successfully, false if failed (callers should not update settings on false)
    */
-  public applyCaptureMode(mode: CaptureMode): void {
+  public applyCaptureMode(mode: CaptureMode): boolean {
+    const previousMode = this.currentCaptureMode;
+
+    // Helper to fail closed: restore mode, stop detection, disable monitor (game+window handled by stopWoWDetection)
+    const failClosed = (ipcError?: Error) => {
+      this.currentCaptureMode = previousMode;
+      this.stopWoWDetection(); // Handles game + window cleanup
+      // Best-effort disable monitor (not covered by stopWoWDetection)
+      try {
+        if (this.monitorCapture) this.monitorCapture.enabled = false;
+      } catch (disableErr) {
+        console.warn('[OBSCaptureManager] failClosed: monitor capture disable failed:', disableErr);
+      }
+      if (ipcError) {
+        this.reportFatalObsError(ipcError);
+      }
+    };
+
+    // FIRST: Stop all mode-specific timers/monitors to prevent async re-enable during transition
+    this.setGameCaptureEnabled(false); // Stops detection timer, dimension monitoring, resets state
+    this.clearWindowCapturePolling(); // Stops window polling
+
+    // Disable each source (one failure shouldn't skip others)
+    let ipcError: Error | null = null;
+    let nonIpcDisableFailed = false;
+
+    if (this.gameCapture) {
+      try {
+        this.gameCapture.enabled = false;
+      } catch (error) {
+        if (this.isObsIpcError(error)) {
+          ipcError = error;
+        } else {
+          console.warn('[OBSCaptureManager] Error disabling game capture:', error);
+          nonIpcDisableFailed = true;
+        }
+      }
+    }
+    if (this.windowCapture) {
+      try {
+        this.windowCapture.enabled = false;
+      } catch (error) {
+        if (this.isObsIpcError(error)) {
+          ipcError = error;
+        } else {
+          console.warn('[OBSCaptureManager] Error disabling window capture:', error);
+          nonIpcDisableFailed = true;
+        }
+      }
+    }
+    if (this.monitorCapture) {
+      try {
+        this.monitorCapture.enabled = false;
+      } catch (error) {
+        if (this.isObsIpcError(error)) {
+          ipcError = error;
+        } else {
+          console.warn('[OBSCaptureManager] Error disabling monitor capture:', error);
+          nonIpcDisableFailed = true;
+        }
+      }
+    }
+
+    // If IPC error during disable, fail closed with escalation
+    if (ipcError) {
+      failClosed(ipcError);
+      return false;
+    }
+
+    // If non-IPC error during disable, fail closed (avoid partial state)
+    if (nonIpcDisableFailed) {
+      console.warn('[OBSCaptureManager] Mode switch aborted due to non-IPC disable failure');
+      failClosed();
+      return false;
+    }
+
+    // Update mode (timers already stopped at start of function)
     this.currentCaptureMode = mode;
 
-    // Disable all capture sources first
-    if (this.gameCapture) this.gameCapture.enabled = false;
-    if (this.windowCapture) this.windowCapture.enabled = false;
-    if (this.monitorCapture) this.monitorCapture.enabled = false;
-
-    // Stop WoW detection if switching away from game capture
-    if (mode !== CaptureMode.GAME) {
-      this.stopWoWDetection();
-      this.isGameCaptureEnabled = false;
-    }
-    // Stop window polling if switching away from window mode
+    // Reset window dimension tracking when leaving WINDOW mode
     if (mode !== CaptureMode.WINDOW) {
-      this.clearWindowCapturePolling();
+      this.lastWindowCaptureWidth = 0;
+      this.lastWindowCaptureHeight = 0;
     }
 
     // Enable the selected capture mode
-    switch (mode) {
-      case CaptureMode.GAME:
-        if (this.gameCapture) {
-          this.isGameCaptureEnabled = true;
-          // Apply cursor preference to game capture
+    try {
+      switch (mode) {
+        case CaptureMode.GAME: {
+          if (!this.gameCapture) {
+            console.warn('[OBSCaptureManager] GAME mode requested but gameCapture unavailable');
+            failClosed();
+            return false;
+          }
+          // Apply cursor preference to game capture before enabling
           const gameSettings = this.gameCapture.settings;
           gameSettings.capture_cursor = this.captureCursorEnabled;
           this.gameCapture.update(gameSettings);
-          // Game capture will be enabled when WoW is detected
-          this.tryAttachToWoWWindow();
+          // Enable game capture (resets backoff, starts detection)
+          this.setGameCaptureEnabled(true);
+          break;
         }
-        break;
 
-      case CaptureMode.WINDOW:
-        if (this.windowCapture) {
-          // Begin polling to attach to WoW (handles minimized/restored and OSN cache refresh)
-          this.startWindowCapturePolling();
+        case CaptureMode.WINDOW: {
+          if (!this.windowCapture) {
+            console.warn('[OBSCaptureManager] WINDOW mode requested but windowCapture unavailable');
+            failClosed();
+            return false;
+          }
+          // Begin polling to attach to WoW (fail closed if polling can't start)
+          if (!this.startWindowCapturePolling()) {
+            failClosed();
+            return false;
+          }
+          break;
         }
-        break;
 
-      case CaptureMode.MONITOR:
-        if (this.monitorCapture) {
+        case CaptureMode.MONITOR: {
+          if (!this.monitorCapture) {
+            console.warn(
+              '[OBSCaptureManager] MONITOR mode requested but monitorCapture unavailable'
+            );
+            failClosed();
+            return false;
+          }
           // Apply cursor preference to monitor capture
           const monitorSettings = this.monitorCapture.settings;
           monitorSettings.capture_cursor = this.captureCursorEnabled;
           this.monitorCapture.update(monitorSettings);
           this.monitorCapture.enabled = true;
-        }
-        break;
-    }
-  }
-
-  /**
-   * Select a default window for window capture
-   * Selects only WoW window
-   * @returns true if window selected, false otherwise
-   */
-  private selectDefaultWindow(): boolean {
-    if (!this.windowCapture) return false;
-
-    try {
-      // Get window capture properties to find available windows
-      const props = this.windowCapture.properties;
-      const windowProp = props?.get('window');
-
-      if (windowProp && this.isObsListProperty(windowProp)) {
-        const windows = windowProp.details.items || [];
-
-        // Only select WoW window
-        const selectedWindow = windows.find((w: any) =>
-          OBSCaptureManager.isWoWWindowName(w.name || '')
-        );
-
-        if (selectedWindow) {
-          const settings = this.windowCapture.settings;
-          settings.window = selectedWindow.value;
-          settings.method = 2; // Windows Graphics Capture - fixes black screen
-          settings.cursor = this.captureCursorEnabled; // Apply cursor preference
-          this.windowCapture.update(settings);
-          this.windowCapture.save();
-
-          // Wait briefly then check and scale the window capture
-          setTimeout(() => {
-            this.checkAndScaleWindowSource();
-          }, this.wowHookCheckDelay);
-
-          return true;
+          setTimeout(() => this.checkAndScaleMonitorSource(), this.wowHookCheckDelay);
+          break;
         }
       }
+      return true;
     } catch (error) {
-      // Window selection failed - will show desktop
+      if (this.isObsIpcError(error)) {
+        failClosed(error);
+      } else {
+        failClosed();
+        console.warn('[OBSCaptureManager] Error enabling capture mode:', error);
+      }
       return false;
     }
-    return false;
   }
 
   /**
    * Ensure persistent dummy window capture exists
-   * @returns true if exists/created, false on failure
+   * @returns true if exists/created, false on failure (including fatal IPC error)
    */
   private ensureDummyWindowCapture(): boolean {
     if (this.isShuttingDown) return false;
@@ -770,39 +1215,54 @@ export class OBSCaptureManager {
       this.dummyWindowCapture = osn.InputFactory.create('window_capture', 'temp_window_dummy');
       return true;
     } catch (e) {
-      console.warn('[OBSCaptureManager] Failed to create dummy window capture', e);
+      if (this.isObsIpcError(e)) {
+        // Fatal IPC error: escalate (idempotent)
+        this.reportFatalObsError(e);
+      } else {
+        console.warn('[OBSCaptureManager] Failed to create dummy window capture:', e);
+      }
       return false;
     }
   }
 
-  /** Start polling using a dummy window_capture source to find WoW window */
-  private startWindowCapturePolling(): void {
+  /**
+   * Start polling using a dummy window_capture source to find WoW window.
+   * @returns true if polling started successfully, false on failure (fail closed, no fallback)
+   */
+  private startWindowCapturePolling(): boolean {
     this.clearWindowCapturePolling();
-    if (this.isShuttingDown || !this.windowCapture) return;
+    if (this.isShuttingDown || !this.windowCapture) return false;
 
     // Ensure we start from a clean state (avoid stale hook)
     try {
       this.windowCapture.enabled = false;
-    } catch (_) {}
+    } catch (disableErr) {
+      if (this.isObsIpcError(disableErr)) {
+        this.reportFatalObsError(disableErr);
+        return false;
+      }
+      console.warn('[OBSCaptureManager] Best-effort window capture disable failed:', disableErr);
+    }
 
-    // Use persistent dummy
+    // Use persistent dummy - fail closed if this fails (no fallback chain)
     if (!this.ensureDummyWindowCapture()) {
-      // Failed to create dummy, fallback to single-shot selection
-      this.selectDefaultWindow();
-      return;
+      console.warn('[OBSCaptureManager] Dummy window capture failed; WINDOW mode unavailable');
+      return false;
     }
 
     // Immediate attempt, then interval
     this.windowPollTick();
 
-    // If a fatal error triggered shutdown or windowCapture was released, do not start a new timer
-    if (this.isShuttingDown || !this.windowCapture) {
-      return;
+    // If a fatal error triggered shutdown, IPC reported, or windowCapture was released, do not start interval
+    if (this.isShuttingDown || this.fatalIpcReported || !this.windowCapture) {
+      return false;
     }
 
     this.windowPollIntervalId = setInterval(() => {
       this.windowPollTick();
     }, OBSCaptureManager.WINDOW_POLL_INTERVAL_MS);
+
+    return true;
   }
 
   /** Stop polling (does NOT release dummy source) */
@@ -819,15 +1279,20 @@ export class OBSCaptureManager {
    */
   private isObsIpcError(error: unknown): error is Error {
     if (!(error instanceof Error)) return false;
-    // Match explicit OBS IPC failure signature from obs-studio-node
-    return error.message.includes('Failed to make IPC call');
+    return error.message.includes(OBSCaptureManager.OBS_IPC_ERROR_SIGNATURE);
   }
 
   /**
-   * Report a fatal OBS IPC error to the supervisor.
-   * If no supervisor is configured, logs a warning.
+   * Report a fatal OBS IPC error to the supervisor (idempotent - reports only once per session).
+   * If no supervisor is configured, logs an error.
    */
   private reportFatalObsError(error: Error): void {
+    if (this.fatalIpcReported) {
+      // Already reported this session - avoid duplicate notifications
+      return;
+    }
+    this.fatalIpcReported = true;
+
     if (this.supervisor) {
       this.supervisor.onObsFatalIpcError(error);
     } else {
@@ -835,30 +1300,47 @@ export class OBSCaptureManager {
     }
   }
 
-  /** Force-refresh dummy properties and find WoW window token */
-  private findWoWWindowViaDummy(): string | undefined {
-    if (this.isShuttingDown || !this.dummyWindowCapture) return undefined;
+  /**
+   * Handle fatal IPC error for game capture: stop all game-related timers/state,
+   * best-effort disable source, and escalate to supervisor.
+   * SSoT for game capture fatal IPC cleanup (avoids duplicated blocks).
+   */
+  private handleGameCaptureFatalIpc(error: Error): void {
+    this.clearGameDimensionMonitoring();
+    this.clearDetectionTimer();
+    this.isGameCaptureEnabled = false;
+    this.isWoWAttached = false;
     try {
-      const s = this.dummyWindowCapture.settings;
-      (s as any).refresh = `${Math.random().toString(36).slice(2)}-${Date.now()}`;
-      this.dummyWindowCapture.update(s);
-
-      let prop = this.dummyWindowCapture.properties.first();
-      while (prop && prop.name !== 'window') {
-        prop = prop.next();
-      }
-      if (!prop || prop.name !== 'window' || !this.isObsListProperty(prop)) {
-        return undefined;
-      }
-      const items = prop.details.items || [];
-      const match = items.find((it: any) => OBSCaptureManager.isWoWWindowName(it.name || ''));
-      return match ? String(match.value) : undefined;
-    } catch (_) {
-      return undefined;
+      if (this.gameCapture) this.gameCapture.enabled = false;
+    } catch (disableErr) {
+      console.warn('[OBSCaptureManager] Best-effort game capture disable failed:', disableErr);
     }
+    this.reportFatalObsError(error);
   }
 
-  /** Poll tick: re-find WoW token, apply to real source, stop when dimensions are non-zero */
+  /** Force-refresh dummy properties and find WoW window token
+   * @throws Errors bubble to caller (windowPollTick handles IPC classification)
+   */
+  private findWoWWindowViaDummy(): string | undefined {
+    if (this.isShuttingDown || !this.dummyWindowCapture) return undefined;
+
+    const s = this.dummyWindowCapture.settings;
+    (s as any).refresh = String(++this.monotonic);
+    this.dummyWindowCapture.update(s);
+
+    let prop = this.dummyWindowCapture.properties.first();
+    while (prop && prop.name !== 'window') {
+      prop = prop.next();
+    }
+    if (!prop || prop.name !== 'window' || !this.isObsListProperty(prop)) {
+      return undefined;
+    }
+    const items = prop.details.items || [];
+    const match = items.find((it: any) => OBSCaptureManager.isWoWWindowName(it.name || ''));
+    return match ? String(match.value) : undefined;
+  }
+
+  /** Poll tick: find WoW token, apply to real source, and monitor for dimension changes */
   private windowPollTick(): void {
     try {
       if (
@@ -870,17 +1352,25 @@ export class OBSCaptureManager {
         return;
       }
 
-      // If already hooked (dimensions ready), stop polling
+      // If already hooked (dimensions ready), check for dimension changes
       if (
         this.windowCapture.enabled &&
         this.windowCapture.width > 0 &&
         this.windowCapture.height > 0
       ) {
-        // Scale and stop
-        try {
+        const currentWidth = this.windowCapture.width;
+        const currentHeight = this.windowCapture.height;
+
+        // Check if dimensions changed from last successful scale
+        if (
+          currentWidth !== this.lastWindowCaptureWidth ||
+          currentHeight !== this.lastWindowCaptureHeight
+        ) {
+          // Attempt re-scale (scale method updates last*Width/Height on success)
+          // On failure, last dims unchanged so next poll retries naturally
           this.scaleWindowCaptureSource();
-        } catch (_) {}
-        this.clearWindowCapturePolling();
+        }
+        // Continue polling to detect future resizes
         return;
       }
 
@@ -893,7 +1383,7 @@ export class OBSCaptureManager {
       const settings = this.windowCapture.settings;
       settings.method = 2; // Windows Graphics Capture
       settings.cursor = this.captureCursorEnabled;
-      settings.window = token;
+      settings.window = String(token);
       this.windowCapture.enabled = false;
       this.windowCapture.update(settings);
       this.windowCapture.save();
@@ -908,7 +1398,12 @@ export class OBSCaptureManager {
         // Best-effort disable (may fail if IPC is broken)
         try {
           if (this.windowCapture) this.windowCapture.enabled = false;
-        } catch (_) {}
+        } catch (disableErr) {
+          console.warn(
+            '[OBSCaptureManager] Best-effort window capture disable failed:',
+            disableErr
+          );
+        }
         // Escalate to supervisor
         this.reportFatalObsError(error);
       } else {
@@ -965,13 +1460,7 @@ export class OBSCaptureManager {
           });
         }
 
-        // If no monitors found, add at least the primary
-        if (monitors.length === 0) {
-          monitors.push({
-            id: '0',
-            name: 'Primary Monitor',
-          });
-        }
+        // Return whatever OBS provides (may be empty)
       } finally {
         // Clean up temp source if we created one
         if (!this.monitorCapture) {
@@ -980,11 +1469,7 @@ export class OBSCaptureManager {
       }
     } catch (error) {
       console.error('[OBSCaptureManager] Error listing monitors:', error);
-      // Return primary monitor as fallback
-      monitors.push({
-        id: '0',
-        name: 'Primary Monitor',
-      });
+      // Return empty on error - no synthesized fallbacks
     }
 
     return monitors;
@@ -1021,40 +1506,35 @@ export class OBSCaptureManager {
         return false;
       }
 
-      // Check if monitor exists in available list
-      const monitors = this.listMonitors();
-      const monitorIndex = monitors.findIndex(m => m.id === monitorId);
-      const monitorExists = monitorIndex !== -1;
+      // Use monitorProp.details.items as SSoT for validation and mapping
+      // Require list property for validation - no unverified applications
+      if (!this.isObsListProperty(monitorProp)) {
+        console.warn('[OBSCaptureManager] Monitor property is not a list type');
+        return false;
+      }
 
-      if (!monitorExists) {
-        // Fall back to primary monitor
-        if (monitorPropName === 'monitor_id') {
-          settings.monitor_id = monitors[0]?.id || '0';
-        } else {
-          settings.monitor = 0;
+      const monitorList = monitorProp.details.items || [];
+
+      if (monitorPropName === 'monitor_id') {
+        // For monitor_id property, validate against OBS list then use ID directly
+        const exists = monitorList.some((item: any) => String(item.value) === monitorId);
+        if (!exists) {
+          console.warn(
+            `[OBSCaptureManager] Monitor not found: ${monitorId}. Available: ${monitorList.map((i: any) => String(i.value)).join(', ')}`
+          );
+          return false;
         }
+        settings.monitor_id = monitorId;
       } else {
-        // Set based on the property type
-        if (monitorPropName === 'monitor_id') {
-          // Use the ID string directly for monitor_id property
-          settings.monitor_id = monitorId;
-        } else {
-          // Use numeric index for monitor property
-          // Get the actual list from the property to find the correct index
-          if (this.isObsListProperty(monitorProp)) {
-            const monitorList = monitorProp.details.items || [];
-            const listIndex = monitorList.findIndex(
-              (item: any) => String(item.value) === monitorId
-            );
-            if (listIndex !== -1) {
-              settings.monitor = listIndex;
-            } else {
-              settings.monitor = 0;
-            }
-          } else {
-            settings.monitor = monitorIndex;
-          }
+        // For monitor property, find index in OBS list
+        const listIndex = monitorList.findIndex((item: any) => String(item.value) === monitorId);
+        if (listIndex === -1) {
+          console.warn(
+            `[OBSCaptureManager] Monitor not found: ${monitorId}. Available: ${monitorList.map((i: any) => String(i.value)).join(', ')}`
+          );
+          return false;
         }
+        settings.monitor = listIndex;
       }
 
       this.monitorCapture.update(settings);
@@ -1064,9 +1544,10 @@ export class OBSCaptureManager {
       if (this.currentCaptureMode === CaptureMode.MONITOR && this.monitorCapture.enabled) {
         this.monitorCapture.enabled = false;
         this.monitorCapture.enabled = true;
+        setTimeout(() => this.checkAndScaleMonitorSource(), this.wowHookCheckDelay);
       }
 
-      return monitorExists;
+      return true;
     } catch (error) {
       console.error('[OBSCaptureManager] Error setting monitor:', error);
       return false;
@@ -1111,6 +1592,7 @@ export class OBSCaptureManager {
         activeCapture.save();
       } catch (error) {
         // Cursor setting failed - non-critical
+        console.warn('[OBSCaptureManager] Failed to set capture cursor:', error);
         return false;
       }
       return true;
@@ -1160,7 +1642,10 @@ export class OBSCaptureManager {
         break;
 
       case CaptureMode.MONITOR:
-        // Monitor capture doesn't need scaling typically
+        if (this.monitorCapture?.enabled) {
+          // Directly trigger re-scaling for monitor capture
+          this.checkAndScaleMonitorSource();
+        }
         break;
     }
   }

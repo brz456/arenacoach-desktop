@@ -1,4 +1,4 @@
-## Interface: 110005
+## Interface: 120001
 ## Title: ArenaCoach
 ## Notes: Enables combat logging during arena matches for ArenaCoach desktop app
 ## Author: ArenaCoach Team

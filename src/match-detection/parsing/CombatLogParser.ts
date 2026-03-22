@@ -1,4 +1,34 @@
-import CombatLogLine from './CombatLogLine';
+// =============================================================================
+// ARCHITECTURE NOTE: DESKTOP-OWNED PARSING
+// =============================================================================
+//
+// This file is part of desktop's OWN combat log parsing stack, separate from
+// the shared @packages/combat-log-parser/ library used by the backend.
+//
+// Desktop's parsing stack:
+//   - CombatLogLine.ts             - Line tokenizer/parser
+//   - CombatLogParser.ts (this file) - Match-level state machine
+//
+// Shared package (backend):
+//   - @packages/combat-log-parser/ - Has its own line + match parsing
+//
+// WHY TWO IMPLEMENTATIONS?
+// Desktop evolved independently with different requirements (real-time streaming,
+// match detection, recording triggers) vs backend (batch processing, full analysis).
+//
+// FUTURE UNIFICATION:
+// If we unify parsing, BOTH CombatLogLine.ts AND CombatLogParser.ts would be
+// replaced by the shared @packages/combat-log-parser/ package. The adapter
+// pattern used in parseCombatantInfo() (converting CombatLogLine → ParsedLogLine
+// for schema consumption) demonstrates how this bridge would work.
+//
+// CURRENT INTEGRATION:
+// We use @wow/combat-log-schema for field indices (the SSoT for schema definitions)
+// via schema.extractCombatantInfo(), avoiding manual index management.
+//
+// =============================================================================
+
+import CombatLogLine, { CombatLogParseError } from './CombatLogLine';
 import {
   MatchEvent,
   MatchEventType,
@@ -12,9 +42,13 @@ import {
   parseBracketFromArenaType,
   formatBracket,
   isSoloShuffleBracket,
+  isSkirmishBracket,
 } from '../utils/BracketUtils';
 import { ShuffleRoundTracker } from './ShuffleRoundTracker';
 import { extractDeathEvent } from '../utils/DeathEventUtils';
+import { isPlayerGuid } from '../utils/PlayerUtils';
+import { schema, CombatLogEvent } from '@wow/combat-log-schema';
+import type { ParsedLogLine } from '@wow/combat-log-schema';
 
 /**
  * Current match context needed for parsing match end events
@@ -52,6 +86,8 @@ export class CombatLogParser {
 
   // Kill tracking for non-shuffle matches (2v2/3v3)
   private playerDeathCount: number = 0;
+
+  constructor(private readonly isSkirmishTrackingEnabled?: () => boolean) {}
 
   /**
    * Parse a combat log line and extract match events if present.
@@ -182,9 +218,12 @@ export class CombatLogParser {
       }
 
       return null;
-    } catch {
-      // Invalid log line - ignore and let caller continue
-      return null;
+    } catch (error) {
+      // Only swallow expected parse errors; rethrow everything else
+      if (error instanceof CombatLogParseError) {
+        return null;
+      }
+      throw error;
     }
   }
 
@@ -258,9 +297,14 @@ export class CombatLogParser {
       // Solo Shuffle is always ranked (we only parse "Rated Solo Shuffle")
       isRanked = true;
     } else {
-      // Regular 2v2/3v3 - check ranked flag
+      // Non-shuffle arena - check ranked flag
       isRanked = rankedFlag;
-      if (!isRanked) {
+      const isSkirmish = isSkirmishBracket(bracket);
+      if (isSkirmish && this.isSkirmishTrackingEnabled && !this.isSkirmishTrackingEnabled()) {
+        console.info('[CombatLogParser] Skipping disabled skirmish match');
+        return null;
+      }
+      if (!isRanked && !isSkirmish) {
         console.info('[CombatLogParser] Skipping unranked arena match:', bracketString);
         return null;
       }
@@ -440,7 +484,7 @@ export class CombatLogParser {
         timestamp: line.getTimestamp(),
         zoneId,
         zoneName: zoneName || `Zone ${zoneId}`,
-        sourceGUID: line.getField(0) || undefined, // Player GUID if available
+        // Note: ZONE_CHANGE events don't include a player GUID in the combat log format
       };
 
       console.debug('[CombatLogParser] Parsed zone change:', {
@@ -451,8 +495,11 @@ export class CombatLogParser {
 
       return zoneChangeEvent;
     } catch (error) {
-      console.warn('[CombatLogParser] Failed to parse ZONE_CHANGE event:', error);
-      return null;
+      // Only swallow expected parse errors; rethrow everything else
+      if (error instanceof CombatLogParseError) {
+        return null;
+      }
+      throw error;
     }
   }
 
@@ -478,14 +525,35 @@ export class CombatLogParser {
 
   /**
    * Parse COMBATANT_INFO event to extract player metadata.
+   * Uses CombatLogSchema.extractCombatantInfo() from @wow/combat-log-schema SSoT.
    */
   private parseCombatantInfo(line: CombatLogLine): void {
     try {
-      const playerGuid = line.getField(1);
-      const teamId = parseInt(line.getField(2), 10);
-      const specId = parseInt(line.getField(24), 10);
-      const personalRating = parseInt(line.getField(31), 10);
-      const highestPvpTier = parseInt(line.getField(32), 10);
+      // Build minimal ParsedLogLine adapter for schema consumption
+      const parsedLine: ParsedLogLine = {
+        id: '',
+        timestamp: line.getTimestamp().getTime(),
+        event: CombatLogEvent.COMBATANT_INFO,
+        parameters: line.getParameters(),
+      };
+
+      // Use schema to extract combatant info (SSoT for field indices)
+      const info = schema.extractCombatantInfo(parsedLine);
+      if (!info) {
+        console.warn('[CombatLogParser] Schema failed to extract COMBATANT_INFO');
+        return;
+      }
+
+      // Validate playerGuid is a valid player GUID string
+      if (!isPlayerGuid(info.guid)) {
+        console.warn('[CombatLogParser] Invalid player GUID in COMBATANT_INFO:', {
+          guid: info.guid,
+        });
+        return;
+      }
+
+      const teamId = parseInt(info.teamId, 10);
+      const { specId, personalRating, highestPvpTier } = info;
 
       // Validate critical numeric values
       if (!Number.isFinite(teamId) || !Number.isFinite(specId)) {
@@ -500,7 +568,7 @@ export class CombatLogParser {
       const classId = getClassIdFromSpec(specId);
 
       const playerMetadata: PlayerMetadata = {
-        id: playerGuid,
+        id: info.guid,
         teamId,
         specId,
         classId,
@@ -508,22 +576,26 @@ export class CombatLogParser {
         highestPvpTier: Number.isFinite(highestPvpTier) ? highestPvpTier : 0,
       };
 
-      this.combatants.set(playerGuid, playerMetadata);
+      this.combatants.set(info.guid, playerMetadata);
 
-      // NEW: Track for shuffle rounds
+      // Track for shuffle rounds
       if (this.shuffleTracker.isShuffleActive()) {
-        this.shuffleTracker.addCombatant(playerGuid, teamId, playerMetadata.name);
+        this.shuffleTracker.addCombatant(info.guid, teamId, playerMetadata.name);
       }
 
       console.debug('[CombatLogParser] Parsed combatant:', {
-        guid: playerGuid,
+        guid: info.guid,
         teamId,
         specId,
         classId,
         personalRating,
       });
     } catch (error) {
-      console.warn('[CombatLogParser] Failed to parse COMBATANT_INFO:', error);
+      // Only swallow expected parse errors; rethrow everything else
+      if (error instanceof CombatLogParseError) {
+        return;
+      }
+      throw error;
     }
   }
 
@@ -569,14 +641,17 @@ export class CombatLogParser {
           const srcGUID = logLine.getField(1);
           const srcFlags = parseInt(logLine.getField(3), 16);
 
-          if (this.isUnitSelf(srcFlags)) {
+          if (this.isUnitSelf(srcFlags) && isPlayerGuid(srcGUID)) {
             console.debug('[CombatLogParser] Identified player:', srcGUID);
             return srcGUID;
           }
         }
-      } catch {
-        // Skip invalid lines
-        continue;
+      } catch (error) {
+        // Only skip expected parse errors; rethrow everything else
+        if (error instanceof CombatLogParseError) {
+          continue;
+        }
+        throw error;
       }
     }
 
@@ -642,13 +717,16 @@ export class CombatLogParser {
         const srcGUID = logLine.getField(1);
         const srcFlags = parseInt(logLine.getField(3), 16);
 
-        if (this.isUnitSelf(srcFlags)) {
+        if (this.isUnitSelf(srcFlags) && isPlayerGuid(srcGUID)) {
           console.debug('[CombatLogParser] Early player identification:', srcGUID);
           return srcGUID;
         }
       }
-    } catch {
-      // Skip invalid lines silently
+    } catch (error) {
+      // Only skip expected parse errors; rethrow everything else
+      if (!(error instanceof CombatLogParseError)) {
+        throw error;
+      }
     }
 
     return null;

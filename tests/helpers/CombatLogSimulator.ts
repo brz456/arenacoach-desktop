@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { EventEmitter } from 'events';
+import { activeFlavor } from '../../src/config/wowFlavor';
 
 /**
  * Simulates real combat log creation by streaming lines from an existing log file.
@@ -114,7 +115,7 @@ export default class CombatLogSimulator extends EventEmitter {
   private async getWindowsWoWLogsDirectory(): Promise<string> {
     // Construct Windows path accessible from WSL
     // WoW is typically installed in Program Files (x86)
-    const windowsPath = `/mnt/c/Program Files (x86)/World of Warcraft/_retail_/Logs`;
+    const windowsPath = `/mnt/c/Program Files (x86)/World of Warcraft/${activeFlavor.dirName}/Logs`;
 
     // Validate the directory exists
     try {
@@ -611,7 +612,6 @@ export default class CombatLogSimulator extends EventEmitter {
 
 export interface CombatLogSimulatorOptions {
   productionMode?: boolean;
-  wowLogsPath?: string;
   seed?: number;
 }
 
@@ -639,12 +639,23 @@ export interface TestMode {
 
 // Allow running the simulator directly for production testing
 if (require.main === module) {
+  // Load desktop/.env so WOW_FLAVOR (and other dev overrides) are available
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  require('dotenv').config({ path: path.resolve(__dirname, '../../.env') });
+
   const runProductionSimulation = async (): Promise<void> => {
     console.info('🚀 WoW Combat Log Simulator - Production Mode');
     console.info('='.repeat(60));
 
     // Default source log path - can be overridden with command line argument
-    const defaultSourceLog = path.resolve(__dirname, '../fixtures/logs/shuffle-single-match.txt');
+    const defaultSourceLog = path.resolve(
+      __dirname,
+      '../../..',
+      'combat-logs',
+      'midnight',
+      'matches',
+      'shuffle-single-match.txt'
+    );
 
     const sourceLogPath = process.argv[2] || defaultSourceLog;
 
@@ -686,7 +697,7 @@ if (require.main === module) {
       console.error('❌ Failed to start simulation:', (error as Error).message);
       console.info('\n💡 Usage:');
       console.info(
-        '   PRODUCTION_MODE=true node -r ts-node/register src/match-detection/test/CombatLogSimulator.ts [source-log-path]'
+        '   PRODUCTION_MODE=true npx tsx desktop/tests/helpers/CombatLogSimulator.ts [source-log-path]'
       );
       console.info(`   Default source log: ${defaultSourceLog}`);
       process.exit(1);

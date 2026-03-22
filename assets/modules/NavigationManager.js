@@ -1,4 +1,7 @@
 class NavigationManager {
+    // Constants
+    static FAVOURITES_FILTER = 'favourites';
+
     constructor(matchUI, settingsUI, sceneUI) {
         this.matchUI = matchUI; // Dependency injection instead of global coupling
         this.settingsUI = settingsUI; // Dependency injection for settings UI
@@ -17,6 +20,21 @@ class NavigationManager {
         this.settingsTab = document.getElementById('settings-nav-tab');
         this.settingsContent = document.getElementById('settings-content');
         this.recentMatchesList = document.getElementById('recent-matches-list');
+
+        // Set bracket filter values from SSoT (game-data via preload)
+        const gameData = window.arenaCoach?.gameData;
+        if (!gameData) {
+            throw new Error('[NavigationManager] gameData not available - preload may not have loaded');
+        }
+        const labels = gameData.BRACKET_LABELS;
+        const soloBtn = document.getElementById('bracket-solo-btn');
+        const threeBtn = document.getElementById('bracket-3v3-btn');
+        const skirmishBtn = document.getElementById('bracket-skirmish-btn');
+        const twoBtn = document.getElementById('bracket-2v2-btn');
+        if (soloBtn) soloBtn.dataset.bracket = labels.SoloShuffle;
+        if (threeBtn) threeBtn.dataset.bracket = labels.ThreeVThree;
+        if (skirmishBtn) skirmishBtn.dataset.bracket = labels.Skirmish;
+        if (twoBtn) twoBtn.dataset.bracket = labels.TwoVTwo;
 
         // Add click handler to scene tab
         if (this.sceneTab) {
@@ -292,19 +310,24 @@ class NavigationManager {
     applyBracketFilter(bracket) {
         // Apply filter through the injected match UI dependency
         if (this.matchUI) {
-            // Reset all filters first
+            // Always clear active brackets first
             this.matchUI.activeBrackets.clear();
 
             // Set the active filter for message display
             this.matchUI.activeFilter = bracket;
 
-            // Apply new filter (unless it's "all")
-            if (bracket !== 'all') {
+            // If favourites filter, do not add to activeBrackets (special filter type)
+            if (bracket === NavigationManager.FAVOURITES_FILTER) {
+                // Just call applyFilters - favourites is handled as activeFilter, not bracket
+                this.matchUI.applyFilters();
+            } else if (bracket !== 'all') {
+                // Apply new bracket filter
                 this.matchUI.activeBrackets.add(bracket);
+                this.matchUI.applyFilters();
+            } else {
+                // Apply all brackets filter
+                this.matchUI.applyFilters();
             }
-
-            // Re-apply filters and render
-            this.matchUI.applyFilters();
         }
     }
 }

@@ -1,3 +1,40 @@
+// =============================================================================
+// ARCHITECTURE NOTE: DESKTOP-OWNED PARSING
+// =============================================================================
+//
+// This file is part of desktop's OWN combat log parsing stack, separate from
+// the shared @packages/combat-log-parser/ library used by the backend.
+//
+// Desktop's parsing stack:
+//   - CombatLogLine.ts (this file) - Line tokenizer/parser
+//   - CombatLogParser.ts           - Match-level state machine
+//
+// Shared package (backend):
+//   - @packages/combat-log-parser/ - Has its own line + match parsing
+//
+// WHY TWO IMPLEMENTATIONS?
+// Desktop evolved independently with different requirements (real-time streaming,
+// match detection, recording triggers) vs backend (batch processing, full analysis).
+//
+// FUTURE UNIFICATION:
+// If we unify parsing, BOTH CombatLogLine.ts AND CombatLogParser.ts would be
+// replaced by the shared @packages/combat-log-parser/ package. The adapter
+// pattern used in parseCombatantInfo() (converting CombatLogLine → ParsedLogLine
+// for schema consumption) demonstrates how this bridge would work.
+//
+// =============================================================================
+
+/**
+ * Error thrown when a combat log line cannot be parsed due to malformed input.
+ * Distinguishes expected parse failures from programmer bugs.
+ */
+export class CombatLogParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CombatLogParseError';
+  }
+}
+
 /**
  * Combat log line parser for WoW TWW format.
  *
@@ -57,12 +94,20 @@ export default class CombatLogLine {
   }
 
   /**
+   * Get all parameters (fields after event type).
+   * Returns 0-indexed array matching schema parameter indices.
+   */
+  getParameters(): unknown[] {
+    return this.fields.slice(1);
+  }
+
+  /**
    * Parse timestamp to Date. TWW format: M/D/YYYY HH:MM:SS.mmmm
    */
   getTimestamp(): Date {
     const parts = this.rawTimestamp.match(/(\d+)\/(\d+)\/(\d+)\s+(\d+):(\d+):(\d+)\.(\d+)/);
     if (!parts) {
-      throw new Error(`Invalid timestamp: "${this.rawTimestamp}"`);
+      throw new CombatLogParseError(`Invalid timestamp: "${this.rawTimestamp}"`);
     }
 
     const month = parseInt(parts[1]!, 10);
@@ -82,7 +127,7 @@ export default class CombatLogLine {
       !Number.isFinite(sec) ||
       year < 2000
     ) {
-      throw new Error(`Invalid TWW timestamp: "${this.rawTimestamp}"`);
+      throw new CombatLogParseError(`Invalid TWW timestamp: "${this.rawTimestamp}"`);
     }
 
     const date = new Date();
@@ -105,6 +150,7 @@ export default class CombatLogLine {
     const len = this.payload.length;
 
     while (pos < len) {
+      const startPos = pos;
       const result = this.parseValue(pos);
       this.fields.push(result.value);
       pos = result.nextPos;
@@ -112,6 +158,12 @@ export default class CombatLogLine {
       // Skip comma
       if (pos < len && this.payload[pos] === ',') {
         pos++;
+      }
+
+      // Enforce forward progress to prevent infinite loops on malformed input
+      if (pos === startPos) {
+        const context = this.payload.slice(pos, pos + 20);
+        throw new CombatLogParseError(`Parser stuck at position ${pos}: "${context}"`);
       }
     }
   }
@@ -148,6 +200,7 @@ export default class CombatLogLine {
     pos++; // skip opening quote
     let result = '';
     const len = this.payload.length;
+    let foundClosingQuote = false;
 
     while (pos < len) {
       const ch = this.payload[pos];
@@ -159,12 +212,17 @@ export default class CombatLogLine {
           pos++;
         } else {
           // End of string
+          foundClosingQuote = true;
           break;
         }
       } else {
         result += ch;
         pos++;
       }
+    }
+
+    if (!foundClosingQuote) {
+      throw new CombatLogParseError('Unclosed "');
     }
 
     return { value: result, nextPos: pos };
@@ -186,7 +244,7 @@ export default class CombatLogLine {
       while (pos < len && this.payload[pos] === ' ') pos++;
 
       if (pos >= len) {
-        throw new Error(`Unclosed ${open}`);
+        throw new CombatLogParseError(`Unclosed ${open}`);
       }
 
       const ch = this.payload[pos];

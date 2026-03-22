@@ -1,3 +1,5 @@
+import { app } from 'electron';
+
 /**
  * Centralized configuration for combat log expiration
  * Single source of truth for expiration timing across the entire system
@@ -27,8 +29,8 @@ export class ExpirationConfig {
    * @returns True if the timestamp is older than the expiration window
    */
   public static isExpired(timestamp: number, currentTime: number = Date.now()): boolean {
-    // Disable expiration in development mode
-    if (process.env.NODE_ENV !== 'production') {
+    // Disable expiration in development mode (unpackaged app)
+    if (!app.isPackaged) {
       return false;
     }
 

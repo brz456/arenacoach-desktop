@@ -1,6 +1,6 @@
 {
   "name": "arenacoach-desktop",
-  "version": "0.1.7",
+  "version": "0.1.47",
   "description": "ArenaCoach Desktop App - Official desktop companion app for ArenaCoach",
   "main": "dist/main.js",
   "engines": {
@@ -12,7 +12,7 @@
   "license": "GPL-2.0-or-later",
   "private": true,
   "scripts": {
-    "build": "tsc --noEmit false",
+    "build": "tsc --noEmit false && esbuild dist/main.js dist/preload.js --bundle --platform=node --outdir=dist --allow-overwrite --external:electron --external:electron-updater --external:obs-studio-node --external:ffmpeg-static",
     "check": "tsc --noEmit",
     "lint": "eslint src/**/*.ts assets/**/*.js",
     "lint:fix": "eslint src/**/*.ts assets/**/*.js --fix",
@@ -26,18 +26,24 @@
     "test:watch": "vitest"
   },
   "devDependencies": {
+    "@wow/combat-log-schema": "*",
+    "@wow/game-data": "*",
     "@electron/asar": "^3.4.1",
+    "@types/archiver": "^7.0.0",
     "@types/node": "^20.19.9",
     "@types/pg": "^8.10.0",
     "concurrently": "^8.0.0",
     "electron": "36.8.1",
     "electron-builder": "25.1.8",
+    "esbuild": "^0.24.2",
     "pg": "^8.11.0",
     "rimraf": "^5.0.0",
     "typescript": "^5.8.2",
     "vitest": "^4.0.15"
   },
   "dependencies": {
+    "archiver": "^7.0.1",
+    "archiver-utils": "^5.0.2",
     "async-mutex": "^0.5.0",
     "axios": "^1.6.0",
     "check-disk-space": "^3.4.0",

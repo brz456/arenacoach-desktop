@@ -7,14 +7,14 @@ import { MetadataService } from '../../src/services/MetadataService';
 import { MetadataStorageService } from '../../src/services/MetadataStorageService';
 
 /**
- * Path to the fixtures directory
+ * Path to the canonical combat-logs directory at repo root
  */
-export const FIXTURES_DIR = path.join(__dirname, '..', 'fixtures');
-export const FIXTURES_LOGS_DIR = path.join(FIXTURES_DIR, 'logs');
+export const FIXTURES_DIR = path.resolve(__dirname, '../../..', 'combat-logs');
+export const FIXTURES_LOGS_DIR = path.resolve(FIXTURES_DIR, 'midnight', 'matches');
 
 /**
  * Load a fixture log file into an array of non-empty lines.
- * @param relativePath - Path relative to tests/fixtures/logs/
+ * @param relativePath - Path relative to combat-logs/midnight/matches/
  */
 export async function loadFixtureLog(relativePath: string): Promise<string[]> {
   const fullPath = path.join(FIXTURES_LOGS_DIR, relativePath);

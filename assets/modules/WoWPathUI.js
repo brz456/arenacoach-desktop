@@ -13,22 +13,37 @@ class WoWPathUI {
         this.browseWowBtn?.addEventListener('click', () => this.handleBrowseWoW());
     }
 
+    setWoWPathText(text) {
+        if (!this.wowPath) {
+            console.error('[WoWPathUI] #wow-path element not found');
+            return;
+        }
+        this.wowPath.textContent = text;
+    }
+
     async initializeWoWPath() {
         try {
             const installations = await window.arenaCoach.wow.detectInstallations();
             this.updateWoWPath(installations);
         } catch (error) {
             console.error('Failed to detect WoW installations:', error);
-            this.wowPath.textContent = 'Detection Failed';
+            this.setWoWPathText('Detection Failed');
         }
     }
 
     updateWoWPath(installations) {
         if (installations && installations.length > 0) {
-            const primaryInstall = installations[0];
-            this.wowPath.textContent = primaryInstall.path;
+            const { combatLogPath } = installations[0];
+            const logsSuffix = /[\\/]Logs[\\/]?$/;
+            if (logsSuffix.test(combatLogPath)) {
+                // Show flavor path (e.g., ...\World of Warcraft\_retail_)
+                this.setWoWPathText(combatLogPath.replace(logsSuffix, ''));
+            } else {
+                console.warn('[WoWPathUI] combatLogPath does not match expected pattern:', combatLogPath);
+                this.setWoWPathText(combatLogPath);
+            }
         } else {
-            this.wowPath.textContent = 'No WoW Installation Found';
+            this.setWoWPathText('No WoW Installation Found');
         }
     }
 

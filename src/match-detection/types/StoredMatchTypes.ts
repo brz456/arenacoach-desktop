@@ -14,6 +14,7 @@ export enum UploadStatus {
 }
 
 import { MatchMetadata } from './MatchMetadata';
+import type { WowFlavorId } from '../../config/wowFlavor';
 
 /**
  * Match completion status for progressive metadata system
@@ -27,7 +28,9 @@ export type MatchCompletionStatus = 'in_progress' | 'complete' | 'incomplete';
  * - 'completed': Recording finished successfully with canonical filename
  * - 'completed_with_warning': Recording exists but rename failed; temp path used
  * - 'failed_io': OBS failed to write file or FS operation failed
+ * - 'failed_timeout': OBS stop did not complete within hard timeout (unresponsive)
  * - 'failed_unknown': Unexpected error during recording
+ * - 'deleted_quota': Recording existed but was deleted by retention/quota policy
  */
 export type RecordingStatusType =
   | 'not_applicable'
@@ -35,7 +38,9 @@ export type RecordingStatusType =
   | 'completed'
   | 'completed_with_warning'
   | 'failed_io'
-  | 'failed_unknown';
+  | 'failed_timeout'
+  | 'failed_unknown'
+  | 'deleted_quota';
 
 /**
  * Metadata enrichment phase tracking
@@ -123,7 +128,7 @@ export interface StoredMatchMetadata {
   // Error tracking for failed uploads
   /** Error message if upload/analysis failed */
   errorMessage?: string;
-  /** Canonical backend error code (e.g., 'INVALID_LOG_FORMAT', 'QUOTA_EXHAUSTED') */
+  /** Error code from backend or parser (e.g., 'MISSING_HP_DATA', 'QUOTA_EXHAUSTED') */
   errorCode?: string;
   /** Whether the failure is permanent (non-retryable) */
   isPermanent?: boolean;
@@ -131,14 +136,22 @@ export interface StoredMatchMetadata {
   failedAt?: string;
 
   // Freemium quota state (persisted for video view status bar)
-  /** Entitlement mode at completion: 'skillcapped' | 'freemium' | 'none' */
-  entitlementMode?: 'skillcapped' | 'freemium' | 'none';
+  /** Entitlement mode at completion: 'premium' | 'freemium' | 'free' | 'none' */
+  entitlementMode?: 'premium' | 'freemium' | 'free' | 'none';
   /** Whether free quota was exhausted when this match completed */
   freeQuotaExhausted?: boolean;
 
   // Storage metadata (preserved)
   /** Timestamp when this file was created/stored (added by storage layer) */
   storedAt?: number;
+
+  // Game flavor metadata
+  /** WoW game flavor (e.g., 'retail', 'beta') - identifies client flavor only. */
+  wowFlavor?: WowFlavorId;
+
+  // Favourite status (user-controlled, exempt from automatic deletion)
+  /** Whether this match is marked as a favourite by the user */
+  isFavourite?: boolean;
 }
 
 /**

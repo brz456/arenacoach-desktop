@@ -231,6 +231,10 @@ interface JobStatusResponse {
   uuid: string | null;
   hasData: boolean;
   analysisData?: unknown;
+  // Standardized error shape (WI-02)
+  error?: { code: string; message: string; details?: unknown };
+  errorCode?: string;
+  isPermanent?: boolean;
 }
 ```
 
@@ -472,23 +476,24 @@ interface MatchSessionState {
 - Loads stored metadata by bufferId
 - Applies structural validation:
   - Solo Shuffle: exactly 6 rounds, W-L consistent with round count
-  - 2v2/3v3: no extra checks (must have MATCH_ENDED)
+  - 2v2/3v3: no duplicate starts, exact combatant count (4/6), at least one kill
 - If valid:
   - Calls `metadataService.finalizeCompleteMatch(event)` → matchHash
   - Calls `recordingService.handleMatchEnded(bufferId)`
   - Marks session `complete`
 - If invalid:
-  - Routes to `handleMatchValidationFailed` with reason
+  - Hard invalidation (INSUFFICIENT_COMBATANTS, NO_PLAYER_DEATH): routes to `handleMatchEndedIncomplete`
+  - Soft invalidation (other failures): routes to `handleMatchValidationFailed`
 
 **handleMatchEndedIncomplete(event):**
 - Marks session `incomplete`
 - Calls `metadataService.markMatchIncomplete(bufferId, trigger, buffer.metadata)`
 - Calls `recordingService.handleEarlyEnd(bufferId, reason)`
-- For `CANCEL_INSTANT_MATCH` trigger: calls `metadataService.deleteMatchByBufferId(bufferId)` to remove all persisted state
+- Hard-deletes metadata and video for triggers: `CANCEL_INSTANT_MATCH`, `INSUFFICIENT_COMBATANTS`, `NO_PLAYER_DEATH`, `NEW_MATCH_START`
 
 **handleMatchValidationFailed(event):**
 - Marks session `incomplete`
-- Calls `metadataService.markMatchValidationFailed(bufferId, trigger, reason, metadata)`
+- Calls `metadataService.markMatchValidationFailed(bufferId, trigger, reason, metadata?)` (metadata optional)
 - Calls `recordingService.handleEarlyEnd(bufferId, reason)`
 
 **Validation Rules (SSoT):**
@@ -500,7 +505,9 @@ validateMatchCompleteness(incoming: MatchMetadata):
     • Exactly 6 rounds required
     • Recording player W-L must equal round count
   - 2v2/3v3:
-    • No structural checks (having MATCH_ENDED is sufficient)
+    • Reject duplicate ARENA_MATCH_START events (reload anomaly)
+    • Exact combatant count: 4 for 2v2, 6 for 3v3 → INSUFFICIENT_COMBATANTS
+    • At least one player death required → NO_PLAYER_DEATH
 ```
 
 **Invariants:**
@@ -537,7 +544,7 @@ markMatchValidationFailed(
   trigger: string,
   reason: string,
   metadata?: MatchMetadata
-): Promise<void>
+): Promise<boolean>  // true if persisted, false if not found; throws on catastrophic/save failures
 
 // Phase 3: Finalize complete matches with hash generation
 finalizeCompleteMatch(event: MatchEndedEvent): Promise<string>
@@ -587,7 +594,7 @@ updateVideoMetadataByBufferId(bufferId: string, videoData: VideoMetadataUpdate):
 
 - Called by `MatchLifecycleService.handleMatchValidationFailed`
 - For structural validation failures (e.g., Solo Shuffle < 6 rounds)
-- Always enriches with full parsed metadata (preserves data for inspection)
+- If metadata provided, enriches with full parsed metadata (preserves data for inspection)
 - Updates:
   - `matchCompletionStatus = 'incomplete'`
   - `enrichmentPhase = 'finalized'`
@@ -633,6 +640,8 @@ loadMatch(matchHash: string): Promise<StoredMatchMetadata | null>
 findMatchByJobId(jobId: string): Promise<StoredMatchMetadata | null>
 updateMatchStatus(matchHash: string, status: UploadStatus, additionalData?: {}): Promise<void>
 updateVideoMetadataByBufferId(bufferId: string, videoData: VideoMetadataUpdate): Promise<void>
+updateFavouriteByBufferId(bufferId: string, isFavourite: boolean): Promise<void>
+listFavouriteVideoPathsWithDiagnostics(): Promise<{ paths: Set<string>; scanErrors: Array<{ file: string; error: string }> }>
 deleteMatch(bufferId: string): Promise<boolean>
 listMatches(limit?: number, offset?: number): Promise<StoredMatchMetadata[]>
 getMatchesCount(): Promise<number>
@@ -659,8 +668,11 @@ cleanupOldMatches(): Promise<number>
 
 - `initialized`
 - `matchSaved: { matchHash, bufferId, filepath }`
-- `matchUpdated: { matchHash, status, additionalData? }`
-- `matchDeleted: { matchHash, hadVideo }`
+- `matchUpdated` (variants):
+  - `{ matchHash, bufferId, status, additionalData }` - status updates
+  - `{ bufferId, videoData }` - video metadata updates
+  - `{ bufferId, isFavourite }` - favourite toggle
+- `matchDeleted: { bufferId, hadVideo }`
 - `cleanupCompleted: { deletedCount }`
 - `error: { context, error }`
 
@@ -791,16 +803,22 @@ interface RecordingSession {
 **stopRecordingForMatch(options) - Unified Stop Helper:**
 - Validates session exists and bufferId matches
 - Idempotency: returns same promise if already stopping
-- Calls `obsRecorder.stopRecording()` → filePath or null
-- If file exists:
+- Calls `obsRecorder.stopRecording()` → `StopRecordingResult`
+  - `{ ok: true, filePath, durationSeconds }` on success
+  - `{ ok: false, reason, durationSeconds }` on failure (`no_active_session`, `write_error`, `stop_error`, `stop_timeout`)
+- If `ok: true`:
   - Renames to `{bufferId}.mp4` (complete) or `Incomplete_{bufferId}_{timestamp}.mp4` (incomplete)
   - Generates thumbnail via FFmpeg
   - Updates metadata: `metadataService.updateVideoMetadataByBufferId(bufferId, videoData)`
-  - Enforces disk quota: `obsRecorder.enforceStorageQuota(maxDiskStorage)`
+  - Enforces disk quota: `obsRecorder.enforceStorageQuota(maxDiskStorage, protectedVideoPaths?)`
+    - Scans favourite matches via `listFavouriteVideoPathsWithDiagnostics()` to build protected paths set
+    - Skips deletion of favourited recordings (may leave storage over quota if only favourites remain)
+    - Updates deleted recordings to `recordingStatus: 'deleted_quota'` via `markRecordingDeletedByQuotaByVideoPath`
+    - Emits `recordingRetentionCleanup({ deletedCount, freedGB, maxGB })` if recordings were deleted
   - Emits events:
     - Complete: `recordingCompleted({ matchHash, bufferId, path, duration })`
     - Incomplete: `recordingInterrupted({ bufferId, path, duration, reason })`
-- If null: marks session failed, no rename
+- If `ok: false`: marks session failed with appropriate `recordingStatus` (`failed_io`, `failed_timeout`, etc.), no rename
 
 **Events:**
 
@@ -811,6 +829,7 @@ emit('disabled')
 emit('recordingStarted', { bufferId, path })
 emit('recordingCompleted', { matchHash, bufferId, path, duration })
 emit('recordingInterrupted', { bufferId, path, duration, reason })
+emit('recordingRetentionCleanup', { deletedCount, freedGB, maxGB })
 emit('error', error)
 emit('shutdown')
 ```
@@ -892,7 +911,7 @@ getStatus(): { isAvailable, lastCheckTime, hasAuth }
 
 - `apiBaseUrl: string`
 - `headersProvider: ApiHeadersProvider`
-- `jobStatusEndpoint?: string`
+- `healthCheckEndpoint?: string` (defaults to `/health`)
 
 **External:**
 
@@ -911,13 +930,13 @@ getStatus(): { isAvailable, lastCheckTime, hasAuth }
 **Configuration:**
 
 - Health check timeout: 5 seconds
-- Check endpoint: `/api/upload/job-status/{randomJobId}`
-- 404 is acceptable (means service is up)
+- Check endpoint: `/health`
+- 2xx is acceptable (means service is up)
 
 **Key Patterns:**
 
 - **Event-driven health** - No background polling
-- **4xx tolerance** - Client errors don't mark service down
+- **Real API 4xx tolerance** - Normal client errors don't mark service down, but `/health` expects 2xx
 - **5xx + network failures** - Mark service unavailable
 - **Idle health checks** - Optional one-time check when no active jobs
 - **Status transition only** - Only emits on changes
@@ -980,17 +999,19 @@ resetToDefaults(): AppSettings
 
 **File:** `ChunkCleanupService.ts`
 
-**Responsibility:** Manages lifecycle of temporary chunk files, cleaning up
-after successful uploads and identifying orphans.
+**Responsibility:** Manages chunk file lifecycle via periodic maintenance.
+Chunks are retained for a code-defined window (SSoT: ChunkRetentionConfig, 7 days) and
+deleted via aged retention cleanup during periodic maintenance passes.
 
 **Key APIs:**
 
 ```typescript
 initialize(): Promise<void>
-cleanupChunksForInstance(bufferId: string, jobId?: string): Promise<void>
-findChunkFiles(bufferId: string): Promise<string[]>
-findOrphanedChunks(validBufferIds: Set<string>): Promise<string[]>
-cleanupFiles(filePaths: string[]): Promise<CleanupResult>
+cleanupChunksForInstance(bufferId: string, jobId?: string): Promise<CleanupChunksForInstanceResult>
+findAgedChunks(maxAgeMs: number, currentTimeMs: number): Promise<FindAgedChunksResult>
+findOrphanedChunks(validBufferIds: Set<string>): Promise<FindOrphanedChunksResult>
+deleteChunkForBufferId(bufferId: string): Promise<{ chunkDeleted: boolean; errors: string[] }>
+cleanupFiles(filePaths: string[]): Promise<CleanupFilesResult>  // throws if not initialized; validates paths
 getChunkStats(): Promise<{
   totalChunkFiles: number;
   totalSizeBytes: number;
@@ -1002,7 +1023,7 @@ cleanup(): void
 
 **Dependencies:**
 
-- `config: ChunkCleanupServiceConfig` (chunksDir, autoCleanupEnabled)
+- `config: ChunkCleanupServiceConfig` (chunksDir)
 
 **External:**
 
@@ -1011,20 +1032,17 @@ cleanup(): void
 
 **State:**
 
-- Chunks directory path
-- Auto-cleanup flag
+- Chunks directory path (absolute, normalized)
 - Initialization flag
 
 **Events:**
 
-- `cleanupCompleted: { bufferId, jobId?, totalFiles, successCount, failureCount, deletedFiles }`
-- `cleanupErrors: { bufferId, jobId?, failureCount, failedFiles }`
-- `error: { message, bufferId, jobId?, error }`
+- `cleanupCompleted: { bufferId, jobId?, totalFiles, deletedCount, missingCount, failureCount, deletedFiles }`
+- `cleanupErrors: { bufferId, jobId?, failureCount, failedFiles: Array<{ file, error }> }`
 
 **Configuration:**
 
-- Auto-cleanup enabled by default
-- Chunks directory: `{userDataPath}/logs/chunks/`
+- Chunks directory: `{userDataPath}/logs/chunks/` (or `{cwd}/data/logs/chunks/` in non-Electron)
 - Chunk file naming: `{bufferId}.txt`
 
 **Key Patterns:**
@@ -1061,7 +1079,7 @@ cleanup(): void
 4. Polling
    ├─ CompletionPollingService.trackJob(jobId, matchHash)
    ├─ Polls /api/upload/job-status/:jobId with backoff
-   ├─ Backend queries DB for entitlements, returns isSkillCappedViewer + conditional payload
+   ├─ Backend queries DB for entitlements, returns isPremiumViewer + conditional payload
    ├─ Desktop trusts backend response (no local entitlement inference)
    └─ Emits analysisCompleted (with/without payload) or analysisFailed
 
@@ -1071,8 +1089,8 @@ cleanup(): void
    ├─ Auth path: Enrich with events + Mark COMPLETED
    └─ MetadataStorageService.updateMatchStatus()
 
-6. Cleanup
-   └─ ChunkCleanupService.cleanupChunksForInstance(bufferId, jobId)
+6. Retention
+   └─ Chunks retained for 7 days (ChunkRetentionConfig); deleted by periodic maintenance
 ```
 
 ### Recording Flow (Lifecycle-Driven, BufferId-First)
@@ -1092,11 +1110,11 @@ cleanup(): void
    │   ├─ MetadataService.finalizeCompleteMatch(event) → generates matchHash
    │   └─ RecordingService.handleMatchEnded(bufferId)
    │       └─ stopRecordingForMatch({ bufferId, outcome: 'complete' })
-   │           ├─ OBSRecorder.stopRecording() → filePath or null
+   │           ├─ OBSRecorder.stopRecording() → StopRecordingResult
    │           ├─ Rename: {bufferId}.mp4
    │           ├─ Thumbnail: Thumbnails/{bufferId}.jpg
    │           ├─ MetadataService.updateVideoMetadataByBufferId(bufferId, videoData)
-   │           ├─ Enforce quota: RecordingStorageManager.enforceStorageQuota(maxDiskStorage)
+   │           ├─ Enforce quota: OBSRecorder.enforceStorageQuota(maxDiskStorage, protectedVideoPaths?)
    │           └─ Emit: recordingCompleted({ matchHash, bufferId, path, duration })
 
 3. Match Ended (Incomplete/Validation Failed)
@@ -1105,7 +1123,7 @@ cleanup(): void
    │   ├─ MetadataService.markMatchIncomplete/markMatchValidationFailed
    │   └─ RecordingService.handleEarlyEnd(bufferId, reason)
    │       └─ stopRecordingForMatch({ bufferId, outcome: 'incomplete', reason })
-   │           ├─ OBSRecorder.stopRecording()
+   │           ├─ OBSRecorder.stopRecording() → StopRecordingResult
    │           ├─ Rename: Incomplete_{bufferId}_{timestamp}.mp4
    │           ├─ Thumbnail: Thumbnails/Incomplete_{bufferId}_{timestamp}.jpg
    │           ├─ MetadataService.updateVideoMetadataByBufferId(bufferId, videoData)
@@ -1205,7 +1223,7 @@ cleanup(): void
 | SettingsService        | `{userData}/config.json`          | JSON           | App settings                         |
 | RecordingService       | `{recordingLocation}/`            | MP4 videos     | Match recordings                     |
 | OBSRecorder            | `{userData}/osn-data/`            | OBS cache      | OBS configuration                    |
-| ChunkCleanupService    | `{userData}/logs/chunks/`         | TXT chunks     | Temporary upload chunks              |
+| ChunkCleanupService    | `{userData}/logs/chunks/`         | TXT chunks     | Retained 7 days for export/diagnostics |
 
 ### Atomic Write Patterns
 
@@ -1297,7 +1315,8 @@ App Start
 - **File rename retry:** 1 second between attempts
 - **WoW detection backoff:** 500ms → 30s max
 - **Health check timeout:** 5 seconds
-- **OBS stop timeout:** 10 seconds
+- **OBS stop warn timeout:** 30 seconds (logs warning, does not resolve)
+- **OBS stop hard timeout:** 120 seconds (resolves `stop_timeout`, clears session)
 
 ---
 

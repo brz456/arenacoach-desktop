@@ -185,13 +185,13 @@ describe('Match Detection Accuracy', () => {
         shouldBeSkipped: false,
       },
       {
-        name: 'Skirmish Match (should be filtered)',
+        name: 'Skirmish Match',
         startLine: '6/22/2025 14:05:33.222  ARENA_MATCH_START,1552,21,Skirmish,0',
         endLine: '6/22/2025 14:08:15.777  ARENA_MATCH_END,0,5,1829,1824',
         expectedCategory: 'Skirmish',
         expectedZoneId: 1552,
         expectedDuration: 5,
-        shouldBeSkipped: true, // Parser filters unranked matches
+        shouldBeSkipped: false,
       },
       {
         name: 'Solo Shuffle Match',
@@ -243,16 +243,22 @@ describe('Match Detection Accuracy', () => {
       }
     );
 
-    it('filters Skirmish matches (unranked)', () => {
-      const skirmishScenario = testScenarios.find(s => s.shouldBeSkipped);
+    it('detects Skirmish matches (unranked)', () => {
+      const skirmishScenario = testScenarios.find(s => s.expectedCategory === 'Skirmish');
       const startEvents: MatchStartedEvent[] = [];
+      const endEvents: MatchEndedEvent[] = [];
 
       watcher.on('matchStarted', (e: MatchStartedEvent) => startEvents.push(e));
+      watcher.on('matchEnded', (e: MatchEndedEvent) => endEvents.push(e));
 
       watcher.handleLogLine(skirmishScenario!.startLine);
+      watcher.handleLogLine(skirmishScenario!.endLine);
 
-      // Skirmish (isRanked=0) should be filtered out
-      expect(startEvents).toHaveLength(0);
+      expect(startEvents).toHaveLength(1);
+      expect(startEvents[0].isRanked).toBe(false);
+      expect(startEvents[0].bracket).toBe('Skirmish');
+      expect(endEvents).toHaveLength(1);
+      expect(endEvents[0].metadata.bracket).toBe('Skirmish');
     });
 
     it('meets accuracy target across all valid scenarios', () => {

@@ -175,13 +175,32 @@ export class MatchLifecycleService extends EventEmitter {
       this.emit('matchLifecycle:completed', { bufferId, matchHash });
       console.info('[MatchLifecycle] Match session completed:', { bufferId, matchHash });
     } catch (error) {
-      console.error('[MatchLifecycle] Error finalizing complete match:', error);
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      console.error('[MatchLifecycle] Error finalizing complete match:', normalizedError);
 
       // Mark session incomplete due to finalization error
       session.state = 'incomplete';
-      session.completionReason = `Metadata finalization error: ${(error as Error).message}`;
+      session.completionReason = `Metadata finalization error: ${normalizedError.message}`;
 
-      // Stop recording early (best-effort)
+      // Persist incomplete status to disk (critical: prevents stuck 'in_progress' state)
+      // Do NOT pass event.metadata here - it may be invalid and break the recovery path
+      let persisted = false;
+      let persistError: Error | undefined;
+      try {
+        persisted = await this.metadataService.markMatchValidationFailed(
+          bufferId,
+          'FINALIZATION_ERROR',
+          session.completionReason
+        );
+        if (!persisted) {
+          persistError = new Error('Metadata not found for bufferId');
+        }
+      } catch (e) {
+        console.error('[MatchLifecycle] Failed to persist incomplete status:', e);
+        persistError = e instanceof Error ? e : new Error(String(e));
+      }
+
+      // Stop recording early (best-effort, non-fatal)
       if (this.recordingService) {
         try {
           await this.recordingService.handleEarlyEnd(bufferId, session.completionReason);
@@ -190,14 +209,29 @@ export class MatchLifecycleService extends EventEmitter {
         }
       }
 
-      this.emit('matchLifecycle:incomplete', { bufferId, reason: session.completionReason });
-      throw error;
+      // Only emit incomplete if persistence succeeded; otherwise disk state is inconsistent
+      if (persisted) {
+        this.emit('matchLifecycle:incomplete', {
+          bufferId,
+          trigger: 'FINALIZATION_ERROR',
+          reason: session.completionReason,
+        });
+      }
+
+      // Propagate both errors if persistence failed (critical failure not swallowed)
+      if (persistError) {
+        throw new AggregateError(
+          [normalizedError, persistError],
+          `Finalization failed and could not persist incomplete status: ${persistError.message}`
+        );
+      }
+      throw normalizedError;
     }
   }
 
   /**
    * Handle match ended incomplete event - mark session incomplete
-   * Kill-aware: 2v2/3v3 early ends with no kills are classified as NO_PLAYER_DEATH
+   * Kill-aware: structured arena early ends with no kills are classified as NO_PLAYER_DEATH
    */
   public async handleMatchEndedIncomplete(event: MatchEndedIncompleteEvent): Promise<void> {
     const { bufferId, trigger, buffer } = event;
@@ -212,9 +246,10 @@ export class MatchLifecycleService extends EventEmitter {
       const { bracket, playerDeathCount } = bufferMetadata;
       const is2v2 = bracket === BRACKET_STRINGS.TWO_V_TWO;
       const is3v3 = bracket === BRACKET_STRINGS.THREE_V_THREE;
+      const isSkirmish = bracket === BRACKET_STRINGS.SKIRMISH;
       const deathCount = typeof playerDeathCount === 'number' ? playerDeathCount : 0;
 
-      if ((is2v2 || is3v3) && deathCount <= 0) {
+      if ((is2v2 || is3v3 || isSkirmish) && deathCount <= 0) {
         effectiveTrigger = EarlyEndTrigger.NO_PLAYER_DEATH;
       }
     }
@@ -254,7 +289,7 @@ export class MatchLifecycleService extends EventEmitter {
     // Hard-delete structurally invalid matches (not real matches, no value to keep):
     // - CANCEL_INSTANT_MATCH: Too short to be a real match
     // - INSUFFICIENT_COMBATANTS: Wrong player count for bracket
-    // - NO_PLAYER_DEATH: 2v2/3v3 with no kills (timeout/abandon)
+    // - NO_PLAYER_DEATH: structured arena with no kills (timeout/abandon)
     // - NEW_MATCH_START: Overwritten by new match before any end event (no metadata available)
     if (
       effectiveTrigger === EarlyEndTrigger.CANCEL_INSTANT_MATCH ||
@@ -346,7 +381,7 @@ export class MatchLifecycleService extends EventEmitter {
     let hardInvalidationTrigger: EarlyEndTrigger | undefined;
     const { bracket, shuffleRounds, players, playerId } = incoming;
 
-    const isSoloShuffle = bracket === 'Solo Shuffle' || bracket === 'Rated Solo Shuffle';
+    const isSoloShuffle = bracket === BRACKET_STRINGS.SOLO_SHUFFLE;
 
     if (isSoloShuffle) {
       if (!Array.isArray(shuffleRounds) || shuffleRounds.length === 0) {
@@ -376,10 +411,11 @@ export class MatchLifecycleService extends EventEmitter {
         );
       }
 
-      // Enforce exact player counts for 2v2/3v3
+      // Enforce exact player counts for structured arena brackets
       const playerCount = Array.isArray(players) ? players.length : 0;
       const is2v2 = bracket === BRACKET_STRINGS.TWO_V_TWO;
       const is3v3 = bracket === BRACKET_STRINGS.THREE_V_THREE;
+      const isSkirmish = bracket === BRACKET_STRINGS.SKIRMISH;
 
       if (is2v2 && playerCount !== 4) {
         errors.push(`2v2 requires exactly 4 combatants (got ${playerCount})`);
@@ -387,17 +423,22 @@ export class MatchLifecycleService extends EventEmitter {
       } else if (is3v3 && playerCount !== 6) {
         errors.push(`3v3 requires exactly 6 combatants (got ${playerCount})`);
         hardInvalidationTrigger = EarlyEndTrigger.INSUFFICIENT_COMBATANTS;
+      } else if (isSkirmish && playerCount !== 4 && playerCount !== 6) {
+        errors.push(`Skirmish requires exactly 4 or 6 combatants (got ${playerCount})`);
+        hardInvalidationTrigger = EarlyEndTrigger.INSUFFICIENT_COMBATANTS;
       }
 
-      // Enforce at least one kill for 2v2/3v3 (only if combatant count is valid)
-      if ((is2v2 || is3v3) && hardInvalidationTrigger === undefined) {
-        const expectedCount = is2v2 ? 4 : 6;
-        if (playerCount === expectedCount) {
+      // Enforce at least one kill for structured arena brackets (only if combatant count is valid)
+      if ((is2v2 || is3v3 || isSkirmish) && hardInvalidationTrigger === undefined) {
+        const hasValidKillCheckRoster = isSkirmish ? playerCount === 4 || playerCount === 6 : playerCount === (is2v2 ? 4 : 6);
+        if (hasValidKillCheckRoster) {
           const deathCount =
             typeof incoming.playerDeathCount === 'number' ? incoming.playerDeathCount : 0;
 
           if (deathCount <= 0) {
-            errors.push('2v2/3v3 matches require at least one player death (no kills detected)');
+            errors.push(
+              `${isSkirmish ? 'Skirmish' : '2v2/3v3'} matches require at least one player death (no kills detected)`
+            );
             hardInvalidationTrigger = EarlyEndTrigger.NO_PLAYER_DEATH;
           }
         }

@@ -20,7 +20,7 @@
                 <div class="header-left">
                     <div class="app-branding">
                         <img class="app-logo" src="favicon.ico" alt="ArenaCoach" width="20" height="20">
-                        <span class="app-title">SKILL CAPPED | ArenaCoach.gg</span>
+                        <span class="app-title">ArenaCoach</span>
                     </div>
                 </div>
 
@@ -89,17 +89,28 @@
                                 </svg>
                                 <span class="filter-label">All Brackets</span>
                             </button>
-                            <button class="filter-btn" id="bracket-solo-btn" data-bracket="Solo Shuffle">
+                            <button class="filter-btn" id="bracket-solo-btn" data-bracket="">
                                 <img class="filter-icon-img" src="images/crossed-swords.svg" alt="Solo Shuffle">
                                 <span class="filter-label">Solo Shuffle</span>
                             </button>
-                            <button class="filter-btn" id="bracket-3v3-btn" data-bracket="3v3">
-                                <img class="filter-icon-img" src="images/crossed-swords.svg" alt="3v3">
+                            <button class="filter-btn" id="bracket-3v3-btn" data-bracket="">
+                                <img class="filter-icon-img" src="images/three-people.png" alt="3v3">
                                 <span class="filter-label">3v3</span>
                             </button>
-                            <button class="filter-btn" id="bracket-2v2-btn" data-bracket="2v2">
-                                <img class="filter-icon-img" src="images/crossed-swords.svg" alt="2v2">
+                            <button class="filter-btn" id="bracket-2v2-btn" data-bracket="">
+                                <img class="filter-icon-img" src="images/two-people.png" alt="2v2">
                                 <span class="filter-label">2v2</span>
+                            </button>
+                            <button class="filter-btn" id="bracket-skirmish-btn" data-bracket="">
+                                <img class="filter-icon-img" src="images/target-dummy.svg" alt="Skirmish">
+                                <span class="filter-label">Skirmish</span>
+                            </button>
+                            <button class="filter-btn" id="favourites-btn" data-bracket="favourites">
+                                <svg class="filter-icon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                    <path
+                                        d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" />
+                                </svg>
+                                <span class="filter-label">Favourites</span>
                             </button>
                         </div>
                     </div>
@@ -120,8 +131,16 @@
                             </svg>
                             <span class="filter-label">Scene</span>
                         </button>
+                        <button class="filter-btn" id="export-logs-btn">
+                            <svg class="filter-icon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                <path
+                                    d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
+                            </svg>
+                            <span class="filter-label">Export Logs</span>
+                        </button>
                         <button class="filter-btn" id="skillcapped-verify-btn" title="Verify Skill Capped Account">
-                            <img class="filter-icon" src="favicon.ico" width="20" height="20" alt="Skill Capped">
+                            <img class="filter-icon" src="images/skillcapped-logo.png" width="20" height="20"
+                                alt="Skill Capped">
                             <span class="filter-label">Verify Skill Capped</span>
                         </button>
                         <button class="filter-btn" id="auth-action-btn">
@@ -212,8 +231,8 @@
                                             <div class="scene-setting-group">
                                                 <label class="scene-setting-label">Frame Rate</label>
                                                 <div class="button-group" id="fps-group">
-                                                    <button class="button-option" data-value="30">30 FPS</button>
-                                                    <button class="button-option active" data-value="60">60 FPS</button>
+                                                    <button class="button-option active" data-value="30">30 FPS</button>
+                                                    <button class="button-option" data-value="60">60 FPS</button>
                                                 </div>
                                             </div>
 
@@ -223,8 +242,15 @@
                                                 <select id="resolution" class="scene-setting scene-select">
                                                     <option value="1280x720">1280x720</option>
                                                     <option value="1920x1080">1920x1080</option>
+                                                    <option value="1920x1200">1920x1200</option>
+                                                    <option value="2560x1080">2560x1080</option>
                                                     <option value="2560x1440">2560x1440</option>
+                                                    <option value="2560x1600">2560x1600</option>
+                                                    <option value="3440x1200">3440x1200</option>
                                                     <option value="3440x1440">3440x1440</option>
+                                                    <option value="3840x1080">3840x1080</option>
+                                                    <option value="3840x1600">3840x1600</option>
+                                                    <option value="3840x2160">3840x2160</option>
                                                 </select>
                                             </div>
 
@@ -319,6 +345,7 @@
                             <div class="settings-tabs">
                                 <button class="settings-tab active" data-tab="storage">Storage</button>
                                 <button class="settings-tab" data-tab="detection">Detection</button>
+                                <button class="settings-tab" data-tab="application">Application</button>
                             </div>
 
                             <!-- Tab content panels -->
@@ -408,6 +435,20 @@
                                         </div>
                                     </div>
 
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="enable-skirmish-tracking">Track skirmish matches</label>
+                                            <div class="setting-description">When disabled, skirmishes are ignored and
+                                                never recorded or uploaded</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <label class="toggle-switch">
+                                                <input type="checkbox" id="enable-skirmish-tracking">
+                                                <span class="toggle-slider"></span>
+                                            </label>
+                                        </div>
+                                    </div>
+
                                     <!-- Match Detection Control -->
                                     <div class="setting-item">
                                         <div class="setting-info">
@@ -453,7 +494,10 @@
                                             </div>
                                         </div>
                                     </div>
+                                </div>
 
+                                <!-- Application Tab -->
+                                <div class="settings-panel" data-panel="application">
                                     <!-- Run at Startup Control -->
                                     <div class="setting-item">
                                         <div class="setting-info">
@@ -464,6 +508,50 @@
                                         <div class="setting-control">
                                             <label class="toggle-switch">
                                                 <input type="checkbox" id="auto-startup">
+                                                <span class="toggle-slider"></span>
+                                            </label>
+                                        </div>
+                                    </div>
+
+                                    <!-- Minimize to Tray Control -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="minimize-to-tray">Minimize to tray on close</label>
+                                            <div class="setting-description">When disabled, clicking the close button
+                                                will exit the application</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <label class="toggle-switch">
+                                                <input type="checkbox" id="minimize-to-tray">
+                                                <span class="toggle-slider"></span>
+                                            </label>
+                                        </div>
+                                    </div>
+
+                                    <!-- Show MMR Badge Control -->
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="show-mmr-badge">Show MMR badge</label>
+                                            <div class="setting-description">Display MMR rating badge on match cards
+                                            </div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <label class="toggle-switch">
+                                                <input type="checkbox" id="show-mmr-badge">
+                                                <span class="toggle-slider"></span>
+                                            </label>
+                                        </div>
+                                    </div>
+
+                                    <div class="setting-item">
+                                        <div class="setting-info">
+                                            <label for="default-mistake-view">Show only my mistakes by default</label>
+                                            <div class="setting-description">When disabled, event filters open with all
+                                                players enabled</div>
+                                        </div>
+                                        <div class="setting-control">
+                                            <label class="toggle-switch">
+                                                <input type="checkbox" id="default-mistake-view">
                                                 <span class="toggle-slider"></span>
                                             </label>
                                         </div>
@@ -481,7 +569,6 @@
 
 
     <script src="MatchDataService.js"></script>
-    <script src="constants/assetMappings.js"></script>
     <script src="VideoPlayer.js"></script>
     <!-- Modules -->
     <script src="modules/AssetManager.js"></script>

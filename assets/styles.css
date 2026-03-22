@@ -14,6 +14,7 @@
     --background-pure-black: #000000; /* For video/preview areas */
     --text-secondary: #9ca3af;
     --card-background: rgba(25, 25, 25, 0.8);
+    --context-menu-background: rgb(25, 25, 25);
     --sidebar-background: rgba(18, 18, 18, 0.95);
     --border-color: rgba(79, 70, 229, 0.1); /* indigo border */
     --status-connected-color: #22c55e; /* green-500 */
@@ -393,6 +394,12 @@ body.update-banner-shown .notification {
     display: flex;
     align-items: center;
     justify-content: center;
+}
+
+#favourites-btn .filter-icon {
+    width: 18px;
+    height: 18px;
+    opacity: 0.8;
 }
 
 .filter-icon-img {
@@ -1523,9 +1530,9 @@ body.update-banner-shown .notification {
 
 .analysis-button-inline.status-not_found,
 .analysis-button-inline.status-not_found:hover {
-    background: rgba(252, 165, 165, 0.9); /* Light red for not found */
+    background: rgba(108, 117, 125, 0.9); /* Match expired color */
     cursor: default; /* No pointer cursor for display-only */
-    opacity: 0.8;
+    opacity: 0.6;
     transition: opacity 0.2s ease;
 }
 
@@ -2329,10 +2336,9 @@ body.update-banner-shown .notification {
 
 .video-player-element {
     flex: 1;
+    min-height: 0;            /* height driven by flex container, not intrinsic size */
     width: 100%;
-    height: 100%;
-    max-width: 100%;          /* belt-and-suspenders */
-    max-height: 100%;         /* belt-and-suspenders */
+    max-width: 100%;
     object-fit: contain;      /* Letterbox */
     object-position: center;  /* Center content */
     background: var(--background-pure-black); /* Black bars */
@@ -2644,6 +2650,65 @@ body.update-banner-shown .notification {
 .match-checkbox:focus-visible {
     outline: 2px solid var(--primary-accent);
     outline-offset: 2px;
+}
+
+/* Favourite star button */
+.match-favourite-btn {
+    position: absolute;
+    top: 5.5px;
+    left: 7px;
+    width: 21px;
+    height: 21px;
+    padding: 0;
+    background: none;
+    border: none;
+    cursor: pointer;
+    z-index: 4;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Offset star when checkbox is present */
+.match-favourite-btn.has-checkbox {
+    left: 29px; /* Position after checkbox (8px + 18px checkbox + 3px spacing) */
+}
+
+/* Show star on hover, when favourited, or when focused */
+.match-card:hover .match-favourite-btn:not(:disabled),
+.match-favourite-btn.is-favourite,
+.match-favourite-btn:focus-visible {
+    opacity: 1;
+}
+
+/* Star icon styling - outline by default (color matches checkbox border) */
+.match-favourite-btn svg {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.2;
+    color: rgba(255, 255, 255, 0.55);
+}
+
+/* Star icon styling - filled gold when favourited */
+.match-favourite-btn.is-favourite svg {
+    fill: #ffc107;
+    stroke: none;
+    color: #ffc107;
+}
+
+/* Focus outline for accessibility */
+.match-favourite-btn:focus-visible {
+    outline: 2px solid var(--primary-accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+/* Disabled state */
+.match-favourite-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
 }
 
 .match-card.selected::before {
@@ -3034,4 +3099,40 @@ body.update-banner-shown .notification {
 
 .modal-dialog p a:hover {
     color: #a5b4fc; /* indigo-300 */
+}
+
+/* Match Context Menu */
+.match-context-menu {
+    position: fixed;
+    z-index: 9000;
+    background: var(--context-menu-background);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 4px 0;
+    min-width: 180px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.match-context-menu .context-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 0.875rem;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.match-context-menu .context-menu-item:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.match-context-menu .context-menu-item svg {
+    opacity: 0.7;
+    flex-shrink: 0;
+}
+
+.match-context-menu .context-menu-item:hover svg {
+    opacity: 1;
 }

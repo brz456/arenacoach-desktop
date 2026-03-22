@@ -36,11 +36,17 @@ export interface JobStatusResponse extends FreemiumQuotaFields {
     retryCount: number; // Changed from attemptsMade to retryCount
     output: string | null; // Changed from failedReason to output
   };
-  error?: string;
+  // Standardized error shape
+  error?: {
+    code: string;
+    message: string;
+    details?: unknown;
+  };
   errorCode?: string;
   isPermanent?: boolean;
   // Entitlement fields (DB-backed, added for transparency)
-  isSkillCappedViewer?: boolean;
+  isPremiumViewer?: boolean;
+  premiumSources?: Array<'skillcapped' | 'stripe'>;
   entitlementSource?: string; // e.g., 'db'
 }
 
@@ -172,11 +178,6 @@ export class CompletionPollingService extends EventEmitter {
         trackedJob.timer = undefined;
       }
 
-      // Decrement active poll count if job was polling
-      if (trackedJob.isPolling) {
-        this.activePollCount = Math.max(0, this.activePollCount - 1);
-      }
-
       this.trackedJobs.delete(jobId);
       console.info('[CompletionPollingService] Stopped tracking job:', jobId);
       this.emit('trackingStopped', { jobId });
@@ -213,15 +214,12 @@ export class CompletionPollingService extends EventEmitter {
     this.isServicePaused = true;
 
     // Clear all timers but keep jobs tracked
+    // Note: in-flight polls continue to completion; their finally blocks handle counter decrement
     for (const trackedJob of this.trackedJobs.values()) {
       trackedJob.isPaused = true;
       if (trackedJob.timer) {
         clearTimeout(trackedJob.timer);
         trackedJob.timer = undefined;
-      }
-      if (trackedJob.isPolling) {
-        trackedJob.isPolling = false;
-        this.activePollCount = Math.max(0, this.activePollCount - 1);
       }
     }
   }
@@ -247,6 +245,11 @@ export class CompletionPollingService extends EventEmitter {
    * Schedule a poll for a specific job with backoff and jitter
    */
   private scheduleJobPoll(trackedJob: TrackedJob): void {
+    // Guard: job may have been untracked by a stale callback
+    if (this.trackedJobs.get(trackedJob.jobId) !== trackedJob) {
+      return;
+    }
+
     if (trackedJob.isPaused || this.isServicePaused || trackedJob.timer) {
       return;
     }
@@ -264,6 +267,10 @@ export class CompletionPollingService extends EventEmitter {
     trackedJob.timer = setTimeout(
       () => {
         trackedJob.timer = undefined;
+        // Guard: job may have been untracked while timer was pending
+        if (this.trackedJobs.get(trackedJob.jobId) !== trackedJob) {
+          return;
+        }
         this.executeJobPoll(trackedJob);
       },
       Math.max(1000, delayWithJitter)
@@ -274,6 +281,11 @@ export class CompletionPollingService extends EventEmitter {
    * Execute polling for a specific job with concurrency control
    */
   private async executeJobPoll(trackedJob: TrackedJob): Promise<void> {
+    // Guard: job may have been untracked by a stale callback
+    if (this.trackedJobs.get(trackedJob.jobId) !== trackedJob) {
+      return;
+    }
+
     if (trackedJob.isPaused || this.isServicePaused) {
       return;
     }
@@ -285,7 +297,13 @@ export class CompletionPollingService extends EventEmitter {
         trackedJob.jobId
       );
       // Add small delay to avoid tight re-queue loops under sustained load
-      setTimeout(() => this.scheduleJobPoll(trackedJob), 250);
+      setTimeout(() => {
+        // Guard: job may have been untracked while waiting for concurrency slot
+        if (this.trackedJobs.get(trackedJob.jobId) !== trackedJob) {
+          return;
+        }
+        this.scheduleJobPoll(trackedJob);
+      }, 250);
       return;
     }
 
@@ -296,7 +314,7 @@ export class CompletionPollingService extends EventEmitter {
     try {
       await this.pollJob(trackedJob);
     } finally {
-      // Always decrement counter and mark not polling
+      // Always decrement - executeJobPoll exclusively owns the counter lifecycle
       trackedJob.isPolling = false;
       this.activePollCount = Math.max(0, this.activePollCount - 1);
     }
@@ -340,25 +358,14 @@ export class CompletionPollingService extends EventEmitter {
       );
 
       if (!response.data.success) {
-        throw new Error(response.data.error || 'API request failed');
+        // Error is now { code, message, details? }
+        throw new Error(response.data.error?.message || 'API request failed');
       }
 
       const statusData = response.data;
 
       // Report successful API call to health check
       this.config.healthCheck?.reportSuccess();
-
-      // Check for progress - reset backoff on status change
-      if (statusData.analysisStatus !== trackedJob.lastStatus) {
-        trackedJob.currentDelayMs = this.config.baseIntervalMs!; // Reset to base
-        trackedJob.lastStatus = statusData.analysisStatus;
-      } else {
-        // No progress - increase backoff with cap
-        trackedJob.currentDelayMs = Math.min(
-          trackedJob.currentDelayMs * 2,
-          this.config.maxBackoffMs!
-        );
-      }
 
       // Emit successful poll status
       this.emit('serviceStatusChanged', {
@@ -374,6 +381,53 @@ export class CompletionPollingService extends EventEmitter {
         message: this.getStatusMessage(statusData),
         matchHash,
       });
+
+      const warmUpMs =
+        this.config.warmUpNotFoundMs ?? CompletionPollingService.DEFAULT_WARMUP_NOTFOUND_MS;
+
+      // Check for not_found status (backend 200 OK but job doesn't exist in mappings)
+      // Use same warmup/backoff logic as HTTP 404 to handle eventual consistency
+      if (statusData.analysisStatus === 'not_found') {
+        const ageMs = Date.now() - trackedJob.startTime;
+        if (ageMs < warmUpMs) {
+          // Still in warm-up period - continue polling
+          console.debug(
+            '[CompletionPollingService] analysisStatus not_found but still in warm-up period:',
+            { jobId, ageMs, warmUpMs }
+          );
+          trackedJob.lastStatus = statusData.analysisStatus;
+          this.increaseBackoff(trackedJob);
+          this.scheduleJobPoll(trackedJob);
+        } else {
+          // Past warm-up - job doesn't exist, treat as terminal
+          console.warn(
+            '[CompletionPollingService] analysisStatus not_found after warm-up period:',
+            jobId
+          );
+          this.emit('analysisFailed', {
+            jobId,
+            matchHash,
+            error: 'Job not found - may have been cleaned up',
+            errorCode: 'JOB_NOT_FOUND',
+            isPermanent: true,
+            isNotFound: true,
+          });
+          this.stopTrackingJob(jobId);
+        }
+        return;
+      }
+
+      // Check for progress - reset backoff on status change
+      if (statusData.analysisStatus !== trackedJob.lastStatus) {
+        trackedJob.currentDelayMs = this.config.baseIntervalMs!; // Reset to base
+        trackedJob.lastStatus = statusData.analysisStatus;
+      } else {
+        // No progress - increase backoff with cap
+        trackedJob.currentDelayMs = Math.min(
+          trackedJob.currentDelayMs * 2,
+          this.config.maxBackoffMs!
+        );
+      }
 
       // Check for completion
       if (this.isJobCompleted(statusData)) {
@@ -416,6 +470,9 @@ export class CompletionPollingService extends EventEmitter {
         const normalizedAnalysisId =
           statusData.analysisId != null ? String(statusData.analysisId) : undefined;
 
+        // analysisData validated as array by contract guard above
+        const events = statusData.analysisData as unknown[];
+
         this.emit('analysisCompleted', {
           jobId,
           matchHash,
@@ -423,14 +480,13 @@ export class CompletionPollingService extends EventEmitter {
           analysisPayload: normalizedAnalysisId
             ? {
                 uuid: statusData.uuid as string,
-                events: Array.isArray(statusData.analysisData)
-                  ? (statusData.analysisData as any)
-                  : [],
+                events,
               }
             : undefined,
           // Freemium metadata (entitlement-agnostic, for UI display)
           entitlementMode: statusData.entitlementMode,
-          isSkillCappedViewer: statusData.isSkillCappedViewer,
+          isPremiumViewer: statusData.isPremiumViewer,
+          premiumSources: statusData.premiumSources,
           freeQuotaLimit: statusData.freeQuotaLimit,
           freeQuotaUsed: statusData.freeQuotaUsed,
           freeQuotaRemaining: statusData.freeQuotaRemaining,
@@ -449,7 +505,7 @@ export class CompletionPollingService extends EventEmitter {
           output: statusData.jobDetails?.output,
         });
 
-        const message = statusData.jobDetails?.output || statusData.error || 'Job failed';
+        const message = statusData.jobDetails?.output || statusData.error?.message || 'Job failed';
 
         this.emit('analysisFailed', {
           jobId,
@@ -482,12 +538,14 @@ export class CompletionPollingService extends EventEmitter {
       // 404 - Handle with warm-up window
       if (status === 404) {
         const ageMs = Date.now() - trackedJob.startTime;
-        if (ageMs < this.config.warmUpNotFoundMs!) {
+        const warmUpMs =
+          this.config.warmUpNotFoundMs ?? CompletionPollingService.DEFAULT_WARMUP_NOTFOUND_MS;
+        if (ageMs < warmUpMs) {
           // Still in warm-up period - continue polling
           console.debug('[CompletionPollingService] Job not found but still in warm-up period:', {
             jobId,
             ageMs,
-            warmUpMs: this.config.warmUpNotFoundMs,
+            warmUpMs,
           });
           this.increaseBackoff(trackedJob);
           this.scheduleJobPoll(trackedJob);
@@ -500,6 +558,7 @@ export class CompletionPollingService extends EventEmitter {
             error: 'Job not found - may have been cleaned up',
             errorCode: 'JOB_NOT_FOUND',
             isPermanent: true,
+            isNotFound: true,
           });
           this.stopTrackingJob(jobId);
         }

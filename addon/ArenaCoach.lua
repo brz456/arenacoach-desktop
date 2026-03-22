@@ -1,36 +1,65 @@
--- ArenaCoach Addon - Minimal Combat Logging Enabler
--- Only enables combat logging when entering arena/PvP zones
+local addonName = ...
+local CHAT_PREFIX = "|cff4cc9f0ArenaCoach|r"
+local STARTUP_MESSAGE = CHAT_PREFIX .. ": Advanced combat logging is enabled."
+local ARENA_LOGGING_MESSAGE = CHAT_PREFIX .. ": Combat log started for this arena match."
 
-local function OnEvent(self, event, ...)
-  if event == "ZONE_CHANGED_NEW_AREA" then
-    local type = select(2, IsInInstance())
-    
-    -- Enable combat logging in arena zones
-    if type == "arena" then
-      LoggingCombat(true)
-      print("ArenaCoach: Combat logging enabled for arena. Good luck!")
-      return
+local ArenaLogRuntime = {
+    frame = CreateFrame("Frame"),
+}
+
+function ArenaLogRuntime.ApplyStartupConfiguration()
+    SetCVar("advancedCombatLogging", "1")
+end
+
+function ArenaLogRuntime.PrintStartupMessage()
+    print(STARTUP_MESSAGE)
+end
+
+function ArenaLogRuntime.IsArenaContext()
+    local inInstance = IsInInstance()
+    if not inInstance then
+        return false
     end
-    
-    -- Enable combat logging for PvP zones (battlegrounds, etc.)
+
     local _, instanceType = GetInstanceInfo()
-    if instanceType == "pvp" then
-      LoggingCombat(true)
-      print("ArenaCoach: Combat logging enabled for PvP. Good luck!")
-      return
+    return instanceType == "arena"
+end
+
+function ArenaLogRuntime.EnableCombatLogging()
+    local loggingState = LoggingCombat()
+    if loggingState ~= true and loggingState ~= 1 then
+        LoggingCombat(true)
+        print(ARENA_LOGGING_MESSAGE)
     end
-  end
 end
 
-local function OnInitialize()
-  SetCVar("advancedCombatLogging", "1")
-  print("ArenaCoach: Loaded. Your arena combats will be automatically logged.")
+function ArenaLogRuntime.HandleRuntimeTransition()
+    if ArenaLogRuntime.IsArenaContext() then
+        ArenaLogRuntime.EnableCombatLogging()
+    end
 end
 
-local loadFrame = CreateFrame("Frame")
-loadFrame:RegisterEvent("PLAYER_LOGIN")
-loadFrame:SetScript("OnEvent", OnInitialize)
+ArenaLogRuntime.frame:RegisterEvent("ADDON_LOADED")
+ArenaLogRuntime.frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+ArenaLogRuntime.frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
 
-local eventFrame = CreateFrame("Frame")
-eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
-eventFrame:SetScript("OnEvent", OnEvent)
+ArenaLogRuntime.frame:SetScript("OnEvent", function(_, event, ...)
+    if event == "ADDON_LOADED" then
+        local loadedAddonName = ...
+        if loadedAddonName == addonName then
+            ArenaLogRuntime.ApplyStartupConfiguration()
+            ArenaLogRuntime.frame:UnregisterEvent("ADDON_LOADED")
+        end
+
+        return
+    end
+
+    if event == "PLAYER_ENTERING_WORLD" then
+        local isInitialLogin, isReloadingUi = ...
+        if isInitialLogin and not isReloadingUi then
+            ArenaLogRuntime.PrintStartupMessage()
+        end
+    end
+
+    ArenaLogRuntime.HandleRuntimeTransition()
+end)

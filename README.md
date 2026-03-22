@@ -4,7 +4,7 @@
 detection, analysis, and video recording.**
 
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue)](#platform-requirements)
-[![Electron](https://img.shields.io/badge/Electron-32.x-47848F?logo=electron)](https://www.electronjs.org/)
+[![Electron](https://img.shields.io/badge/Electron-36.x-47848F?logo=electron)](https://www.electronjs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript)](https://www.typescriptlang.org/)
 [![OBS](https://img.shields.io/badge/OBS-Integration-302E31?logo=obsstudio)](https://obsproject.com/)
 
@@ -347,6 +347,10 @@ interface JobStatusResponse {
   hasData: boolean;
   analysisData?: unknown;
   jobDetails?: { ... };
+  // Standardized error shape (WI-02)
+  error?: { code: string; message: string; details?: unknown };
+  errorCode?: string;
+  isPermanent?: boolean;
 }
 ```
 
@@ -411,7 +415,7 @@ storage location management
 // Complete definition from RecordingTypes.ts
 interface RecordingSettings {
   captureMode: CaptureMode; // 'game_capture' | 'window_capture' | 'monitor_capture'
-  resolution: Resolution; // '1280x720' | '1920x1080' | '2560x1440' | '3440x1440'
+  resolution: Resolution; // keyof RESOLUTION_DIMENSIONS (see RecordingTypes.ts)
   fps: 30 | 60;
   quality: RecordingQuality; // 'low' | 'medium' | 'high' | 'ultra'
   encoder?: EncoderType; // 'x264' | 'nvenc' | 'amd' (optional; defaults to x264)
@@ -545,6 +549,9 @@ interface CorrelationData {
 ```bash
 cd desktop
 npm install
+
+# First-time Windows setup (required for OBS + native module rebuild)
+npm run dev:setup
 ```
 
 ### Development Commands
@@ -556,15 +563,15 @@ npm run dev:desktop
 # TypeScript compilation
 npm run build
 
-# Run built application
-npm run start
+# Run built application (Windows)
+./launch-windows.sh
 
 # Sync changes to running app
 npm run dev:sync
 
 # Code quality
 npm run lint
-npm run type-check
+npm run check
 
 # Package for distribution
 npm run dist
@@ -947,7 +954,7 @@ docs: update API documentation
 Run type checking before commits:
 
 ```bash
-npm run type-check
+npm run check
 npm run lint
 ```
 
@@ -993,4 +1000,4 @@ third-party software.
 For issues and feature requests, please contact support through the ArenaCoach
 platform.
 
-**Version**: 0.1.3 **Last Updated**: December 2025 **License**: GPL-2.0-or-later
+**Version**: 0.1.45 **Last Updated**: March 2026 **License**: GPL-2.0-or-later

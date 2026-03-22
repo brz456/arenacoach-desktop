@@ -63,13 +63,15 @@ describe('MatchLogWatcher - event emission', () => {
     expect(events).toHaveLength(0);
   });
 
-  it('does not emit events for skirmish (unranked) matches', () => {
-    const events: any[] = [];
+  it('emits events for skirmish (unranked) matches', () => {
+    const events: MatchStartedEvent[] = [];
     watcher.on('matchStarted', event => events.push(event));
 
     watcher.handleLogLine('6/22/2025 14:05:33.222  ARENA_MATCH_START,1552,21,Skirmish,0');
 
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0].bracket).toBe('Skirmish');
+    expect(events[0].isRanked).toBe(false);
   });
 
   it('emits zoneChange events', () => {

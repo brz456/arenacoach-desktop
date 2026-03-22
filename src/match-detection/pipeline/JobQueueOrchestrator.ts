@@ -9,6 +9,8 @@ import { ExpirationConfig } from '../../config/ExpirationConfig';
 import { CombatLogExpiredError } from '../types/PipelineErrors';
 import { AnalysisPayload } from '../../services/AnalysisEnrichmentService';
 import { FreemiumQuotaFields } from '../../Freemium';
+import { toSafeAxiosErrorLog } from '../../utils/errorRedaction';
+import { isAxiosError } from 'axios';
 
 /**
  * Analysis completion event payload
@@ -18,7 +20,7 @@ interface AnalysisCompletedData extends FreemiumQuotaFields {
   matchHash: string;
   analysisId?: string; // Normalized to string at emission boundary
   analysisPayload?: AnalysisPayload;
-  isSkillCappedViewer?: boolean;
+  isPremiumViewer?: boolean;
 }
 
 /**
@@ -229,6 +231,7 @@ export class JobQueueOrchestrator extends EventEmitter {
       } catch (error) {
         this.uploadInProgress = false;
         lastError = error instanceof Error ? error : new Error('Unknown error');
+        const safeErrorLog = toSafeAxiosErrorLog(lastError);
 
         // Check if error is retryable (5xx or network error)
         const isRetryable = this.isRetryableError(lastError);
@@ -240,7 +243,7 @@ export class JobQueueOrchestrator extends EventEmitter {
             matchHash,
             attempt,
             isRetryable,
-            error: lastError.message,
+            ...safeErrorLog,
           });
 
           // Remove from pending uploads on permanent failure
@@ -250,16 +253,17 @@ export class JobQueueOrchestrator extends EventEmitter {
           // Emit upload failed event
           this.emit('uploadFailed', {
             matchHash,
-            error: lastError.message,
+            ...safeErrorLog,
           });
 
           throw lastError;
         }
 
-        // Calculate exponential backoff delay
-        const baseDelay = this.INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        const jitter = Math.random() * 0.2 * baseDelay; // Add 20% jitter
-        const delay = Math.min(baseDelay + jitter, this.MAX_RETRY_DELAY_MS);
+        // Calculate deterministic exponential backoff delay
+        const delay = Math.min(
+          this.INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1),
+          this.MAX_RETRY_DELAY_MS
+        );
 
         console.warn('[JobQueueOrchestrator] Upload failed (retryable), will retry indefinitely:', {
           jobId,
@@ -267,7 +271,7 @@ export class JobQueueOrchestrator extends EventEmitter {
           attempt,
           nextAttempt: attempt + 1,
           delayMs: Math.round(delay),
-          error: lastError.message,
+          ...safeErrorLog,
           note: 'Retrying indefinitely - server expiration provides natural termination',
         });
 
@@ -277,7 +281,7 @@ export class JobQueueOrchestrator extends EventEmitter {
           attempt,
           nextAttempt: attempt + 1,
           delayMs: Math.round(delay),
-          error: lastError.message,
+          ...safeErrorLog,
         });
 
         // Check again before sleeping in case shutdown happened during error handling
@@ -344,6 +348,11 @@ export class JobQueueOrchestrator extends EventEmitter {
   private isRetryableError(error: Error): boolean {
     const message = error.message.toLowerCase();
 
+    // Axios timeout errors (ECONNABORTED)
+    if (isAxiosError(error) && error.code === 'ECONNABORTED') {
+      return true;
+    }
+
     // Network errors
     if (
       message.includes('econnrefused') ||
@@ -351,6 +360,7 @@ export class JobQueueOrchestrator extends EventEmitter {
       message.includes('etimedout') ||
       message.includes('econnreset') ||
       message.includes('network') ||
+      message.includes('timeout of') || message.includes('timed out') ||
       message.includes('socket hang up')
     ) {
       return true;
@@ -368,8 +378,8 @@ export class JobQueueOrchestrator extends EventEmitter {
     // Check for fetch errors
     if ('code' in error) {
       const code = (error as any).code;
-      // Common network error codes
-      if (['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE'].includes(code)) {
+      // Common network error codes including timeout
+      if (['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ECONNABORTED'].includes(code)) {
         return true;
       }
     }

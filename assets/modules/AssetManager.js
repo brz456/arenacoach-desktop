@@ -1,40 +1,38 @@
 // Asset Mapping Utilities for Card-Based UI
 class AssetManager {
+    static getGameData() {
+        const gameData = window.arenaCoach?.gameData;
+        if (!gameData) {
+            throw new Error('[AssetManager] gameData not available - preload may not have loaded');
+        }
+        return gameData;
+    }
+
     static getMapImagePath(mapId) {
         if (!mapId) return null;
 
-        const mapKey = window.AssetMappings?.getMapImageFilename?.(mapId);
+        const mapKey = AssetManager.getGameData().getMapImageFilename(mapId);
         return mapKey ? `images/maps/${mapKey}.webp` : null;
     }
 
     static getSpecIconPath(specId) {
         if (!specId) return null;
 
-        const specKey = window.AssetMappings?.getSpecIconFilename?.(specId);
+        const specKey = AssetManager.getGameData().getSpecIconFilename(specId);
         return specKey ? `images/specs/${specKey}.jpg` : null;
     }
 
     static getClassIconPath(className) {
         if (!className) return 'images/classes/wow_icon.png';
 
-        const classMapping = {
-            'deathknight': 'dk',
-            'demonhunter': 'dh'
-        };
-
-        const classKey = classMapping[className.toLowerCase()] || className.toLowerCase();
+        const lowerClassName = className.toLowerCase();
+        const classKey = AssetManager.getGameData().CLASS_ICON_SLUGS[lowerClassName] || lowerClassName;
         return `images/classes/${classKey}.webp`;
     }
 
     static getRatingIconPath(rating) {
-        const numRating = Number(rating);
-        if (!Number.isFinite(numRating) || numRating < 1400) return null;
-
-        if (numRating >= 2400) return 'images/ranks/elite.webp';
-        if (numRating >= 2100) return 'images/ranks/duelist.webp';
-        if (numRating >= 1800) return 'images/ranks/rival.webp';
-        if (numRating >= 1600) return 'images/ranks/challenger.webp';
-        return 'images/ranks/combatant.webp';
+        const iconSlug = AssetManager.getGameData().getRatingIconSlug(Number(rating));
+        return iconSlug ? `images/ranks/${iconSlug}.webp` : null;
     }
 
     /**

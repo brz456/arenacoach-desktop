@@ -14,7 +14,8 @@ class HeaderStatusUI {
                 used: null,
                 remaining: null,
                 exhausted: false,
-                entitlementMode: 'unknown', // 'skillcapped' | 'freemium' | 'unavailable' | 'unknown'
+                resetsAt: null, // ISO timestamp for next reset
+                entitlementMode: 'unknown', // 'premium' | 'freemium' | 'unavailable' | 'unknown'
             },
         };
 
@@ -241,17 +242,17 @@ class HeaderStatusUI {
 
         if (statusDot && statusIndicator) {
             try {
-                // Check if user is authenticated and Skill Capped verified
+                // Check if user is authenticated and premium
                 const isAuthenticated = await window.arenaCoach.auth.isAuthenticated();
-                let isSkillCappedVerified = false;
+                let isPremium = false;
 
                 if (isAuthenticated) {
                     const user = await window.arenaCoach.auth.getCurrentUser();
-                    isSkillCappedVerified = user?.is_skill_capped_verified === true;
+                    isPremium = user?.is_premium === true;
                 }
 
-                if (isSkillCappedVerified) {
-                    // Skill Capped verified - show service connection status
+                if (isPremium) {
+                    // Premium user - show service connection status
                     const actualServiceStatus = serviceStatus || await window.arenaCoach.service.getStatus();
                     const isConnected = !!actualServiceStatus?.connected;
 
@@ -265,20 +266,31 @@ class HeaderStatusUI {
                         if (statusText) statusText.textContent = 'Service Disconnected';
                     }
                 } else {
-                    // Non-SC user (logged in or not) - show quota status
-                    const { remaining, limit, exhausted, entitlementMode } = this.rendererState.quota;
+                    // Non-premium user (logged in or not) - show quota status
+                    const { remaining, limit, exhausted, resetsAt, entitlementMode } = this.rendererState.quota;
+
+                    // Format reset time in user's local timezone
+                    let resetLabel = 'Resets weekly';
+                    if (resetsAt) {
+                        const resetDate = new Date(resetsAt);
+                        if (!isNaN(resetDate.getTime())) {
+                            resetLabel = `Resets ${resetDate.toLocaleString(undefined, { weekday: 'long', hour: 'numeric', minute: '2-digit' })}`;
+                        } else {
+                            console.error('Invalid resetsAt timestamp from backend:', resetsAt);
+                        }
+                    }
 
                     if (limit !== null && remaining !== null) {
                         const displayRemaining = Math.max(remaining, 0);
 
                         if (exhausted || displayRemaining === 0) {
                             statusDot.className = 'status-dot not-authenticated';
-                            statusIndicator.title = 'Resets at midnight UTC';
-                            if (statusText) statusText.textContent = `0 of ${limit} free today - verify Skill Capped for unlimited`;
+                            statusIndicator.title = resetLabel;
+                            if (statusText) statusText.textContent = `0 of ${limit} free shuffle/3v3 analyses remaining this week - upgrade for unlimited`;
                         } else {
                             statusDot.className = 'status-dot connected';
-                            statusIndicator.title = 'Resets at midnight UTC';
-                            if (statusText) statusText.textContent = `${displayRemaining} of ${limit} free analyses remaining today`;
+                            statusIndicator.title = resetLabel;
+                            if (statusText) statusText.textContent = `${displayRemaining} of ${limit} free shuffle/3v3 analyses remaining this week`;
                         }
                     } else if (entitlementMode === 'unavailable') {
                         // Service unavailable (fetch failed)
@@ -298,7 +310,7 @@ class HeaderStatusUI {
                 const { remaining, limit } = this.rendererState.quota;
                 if (limit !== null && remaining !== null) {
                     statusDot.className = 'status-dot not-authenticated';
-                    if (statusText) statusText.textContent = `${Math.max(remaining, 0)} of ${limit} free analyses remaining today`;
+                    if (statusText) statusText.textContent = `${Math.max(remaining, 0)} of ${limit} free shuffle/3v3 analyses remaining this week`;
                 } else {
                     statusDot.className = 'status-dot not-authenticated';
                     if (statusText) statusText.textContent = 'Unavailable';
@@ -336,23 +348,24 @@ class HeaderStatusUI {
     }
 
     /**
-     * Fetches the current daily enrichment quota status from the backend.
+     * Fetches the current weekly enrichment quota status from the backend.
      * Updates renderer state and refreshes service status indicator.
      */
     async fetchQuotaStatus() {
         try {
-            // Check if user is authenticated and skill-capped first
+            // Check if user is authenticated and premium first
             const isAuthenticated = await window.arenaCoach.auth.isAuthenticated();
             if (isAuthenticated) {
                 const user = await window.arenaCoach.auth.getCurrentUser();
-                if (user?.is_skill_capped_verified) {
-                    // Skill Capped user - unlimited events, no quota needed
+                if (user?.is_premium) {
+                    // Premium user - unlimited events, no quota needed
                     this.rendererState.quota = {
                         limit: null,
                         used: null,
                         remaining: null,
                         exhausted: false,
-                        entitlementMode: 'skillcapped',
+                        resetsAt: null,
+                        entitlementMode: 'premium',
                     };
                     await this.updateServiceStatusIndicator();
                     return;
@@ -367,6 +380,7 @@ class HeaderStatusUI {
                     used: result.data.used,
                     remaining: result.data.remaining,
                     exhausted: result.data.exhausted,
+                    resetsAt: typeof result.data.resetsAt === 'string' && result.data.resetsAt ? result.data.resetsAt : null,
                     entitlementMode: 'freemium',
                 };
             } else {
@@ -376,6 +390,7 @@ class HeaderStatusUI {
                     used: null,
                     remaining: null,
                     exhausted: false,
+                    resetsAt: null,
                     entitlementMode: 'unavailable',
                 };
             }
@@ -388,6 +403,7 @@ class HeaderStatusUI {
                 used: null,
                 remaining: null,
                 exhausted: false,
+                resetsAt: null,
                 entitlementMode: 'unavailable',
             };
             await this.updateServiceStatusIndicator();

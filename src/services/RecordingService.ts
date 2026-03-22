@@ -7,7 +7,17 @@ import { EventEmitter } from 'events';
 import * as path from 'path';
 import * as fs from 'fs';
 import { app, BrowserWindow } from 'electron';
-import { OBSRecorder, RecordingStatus, ObsFatalIpcError, RecordingErrorEvent } from './OBSRecorder';
+import {
+  OBSRecorder,
+  RecordingStatus,
+  ObsFatalIpcError,
+  RecordingErrorEvent,
+  StopRecordingResult,
+  ObsRecorderAvailabilityError,
+  OBS_RECORDING_DIRECTORY_UNAVAILABLE,
+  OBS_RECORDER_RECOVERING,
+  OBS_RECORDER_UNAVAILABLE,
+} from './OBSRecorder';
 import { RecordingSettings } from './RecordingTypes';
 import type { OBSRecorderConfig } from './obs/OBSSettingsManager';
 import type { PreviewBounds } from './obs/OBSPreviewManager';
@@ -15,6 +25,11 @@ import { MetadataService } from './MetadataService';
 import { MatchStartedEvent } from '../match-detection/types/MatchEvent';
 import { SettingsService } from './SettingsService';
 import { Resolution, RECORDING_EXTENSION, THUMBNAIL_EXTENSION } from './RecordingTypes';
+import {
+  DEFAULT_RECORDING_SUBDIR,
+  getEffectiveRecordingDirectory,
+} from '../utils/recordingPathUtils';
+import { isNodeError } from '../utils/errors';
 import type {
   VideoMetadataUpdate,
   RecordingStatusType,
@@ -69,13 +84,14 @@ export class RecordingService extends EventEmitter {
   private isEnabled = false;
   private currentSession: RecordingSession | null = null;
   private currentStopPromise: Promise<{ finalPath: string | null; deleted: boolean }> | null = null;
+  private recorderFailureMetadataWrites = new Map<string, Promise<boolean>>();
   private recordingsDir: string;
   private thumbnailsDir: string;
 
   constructor(
     config: RecordingServiceConfig = {},
     metadataService: MetadataService,
-    settingsService?: SettingsService
+    settingsService: SettingsService
   ) {
     super();
 
@@ -90,8 +106,8 @@ export class RecordingService extends EventEmitter {
     // Store required metadata service (no fallback)
     this.metadataService = metadataService;
 
-    // Store settings service with proper initialization
-    this.settingsService = settingsService || new SettingsService();
+    // Store required settings service (no fallback)
+    this.settingsService = settingsService;
 
     // Set up recordings directory - check settings first
     this.recordingsDir = this.getRecordingsDirectory();
@@ -150,6 +166,7 @@ export class RecordingService extends EventEmitter {
     try {
       // Re-initialize OBS if it was shut down
       if (this.obsRecorder && !(await this.obsRecorder.getStatus()).isInitialized) {
+        this.refreshEncoderIntentFromSettings();
         console.log('[RecordingService] Re-initializing OBS...');
         await this.obsRecorder.initialize();
       }
@@ -162,6 +179,16 @@ export class RecordingService extends EventEmitter {
       this.isEnabled = false;
       this.emit('error', error);
     }
+  }
+
+  private refreshEncoderIntentFromSettings(): void {
+    const recordingSettings = this.settingsService.getSettings().recording;
+    const encoderMode = recordingSettings.encoderMode || 'auto';
+    const encoder = recordingSettings.encoder || 'x264';
+
+    this.config.encoderMode = encoderMode;
+    this.config.encoder = encoder;
+    this.obsRecorder.updateEncoderIntent(encoderMode, encoder);
   }
 
   /**
@@ -233,6 +260,8 @@ export class RecordingService extends EventEmitter {
         event.bufferId
       );
 
+      await this.ensureRecordingDirectoryReadyForStart();
+
       // Generate temp directory for match recording
       const tempDir = path.join(this.recordingsDir, 'temp');
 
@@ -268,9 +297,138 @@ export class RecordingService extends EventEmitter {
         path: recordingPath,
       });
     } catch (error) {
+      if (error instanceof ObsRecorderAvailabilityError) {
+        const availabilityCode =
+          error.code === OBS_RECORDER_RECOVERING
+            ? OBS_RECORDER_RECOVERING
+            : error.code === OBS_RECORDER_UNAVAILABLE
+              ? OBS_RECORDER_UNAVAILABLE
+              : OBS_RECORDING_DIRECTORY_UNAVAILABLE;
+        await this.handleRecorderUnavailableStartFailure(event.bufferId, availabilityCode);
+        return;
+      }
+
+      if (this.isRecordingPathUnavailableStartError(error)) {
+        await this.handleRecorderUnavailableStartFailure(
+          event.bufferId,
+          OBS_RECORDING_DIRECTORY_UNAVAILABLE
+        );
+        return;
+      }
+
       console.error('[RecordingService] Failed to start recording:', error);
       this.emit('error', error);
     }
+  }
+
+  private async handleRecorderUnavailableStartFailure(
+    bufferId: string,
+    code:
+      | typeof OBS_RECORDER_RECOVERING
+      | typeof OBS_RECORDER_UNAVAILABLE
+      | typeof OBS_RECORDING_DIRECTORY_UNAVAILABLE
+  ): Promise<void> {
+    const failureDetails =
+      code === OBS_RECORDER_RECOVERING
+        ? {
+            recordingErrorCode: OBS_RECORDER_RECOVERING,
+            recordingErrorMessage:
+              'Recording did not start because the OBS recorder is recovering from a previous output failure.',
+            userMessage:
+              'Recording did not start because OBS is recovering from a previous recording failure.',
+          }
+        : code === OBS_RECORDER_UNAVAILABLE
+          ? {
+              recordingErrorCode: OBS_RECORDER_UNAVAILABLE,
+              recordingErrorMessage:
+                'Recording did not start because the OBS recorder is unavailable after a failed recovery.',
+              userMessage:
+                'Recording did not start because OBS is unavailable after a previous recording failure.',
+            }
+          : {
+              recordingErrorCode: OBS_RECORDING_DIRECTORY_UNAVAILABLE,
+              recordingErrorMessage:
+                'Recording did not start because the preferred recording directory is unavailable.',
+              userMessage:
+                'Recording did not start because the recording folder is unavailable. Reconnect the drive or choose a different recording folder.',
+            };
+
+    if (this.config.metadataIntegration) {
+      try {
+        await this.metadataService.updateVideoMetadataByBufferId(bufferId, {
+          recordingStatus: 'failed_unknown' as RecordingStatusType,
+          recordingErrorCode: failureDetails.recordingErrorCode,
+          recordingErrorMessage: failureDetails.recordingErrorMessage,
+        });
+      } catch (metadataError) {
+        console.warn(
+          '[RecordingService] Failed to persist recorder-unavailable start failure:',
+          metadataError
+        );
+      }
+    }
+
+    this.emit('recordingError', failureDetails.userMessage);
+  }
+
+  private persistRecorderFailureMetadata(
+    bufferId: string,
+    update: {
+      recordingStatus: RecordingStatusType;
+      recordingErrorCode: string;
+      recordingErrorMessage: string;
+    }
+  ): Promise<boolean> {
+    if (!this.config.metadataIntegration) {
+      return Promise.resolve(true);
+    }
+
+    return this.metadataService
+      .updateVideoMetadataByBufferId(bufferId, update)
+      .then(() => true)
+      .catch(metaError => {
+        console.warn('[RecordingService] Failed to persist recording failure:', metaError);
+        return false;
+      });
+  }
+
+  private async consumeRecorderFailureMetadataWrite(bufferId: string): Promise<boolean> {
+    const writePromise = this.recorderFailureMetadataWrites.get(bufferId);
+
+    if (!writePromise) {
+      return false;
+    }
+
+    try {
+      return await writePromise;
+    } finally {
+      this.recorderFailureMetadataWrites.delete(bufferId);
+    }
+  }
+
+  private async ensureRecordingDirectoryReadyForStart(): Promise<void> {
+    const unavailableRoot = this.getUnavailableRecordingRoot(this.recordingsDir);
+
+    if (!unavailableRoot) {
+      return;
+    }
+
+    console.warn(
+      `[RecordingService] Recording root unavailable during start: "${this.recordingsDir}" (missing root: "${unavailableRoot}")`
+    );
+
+    throw new ObsRecorderAvailabilityError(
+      OBS_RECORDING_DIRECTORY_UNAVAILABLE,
+      'Recording directory root is unavailable.'
+    );
+  }
+
+  private isRecordingPathUnavailableStartError(error: unknown): boolean {
+    if (!isNodeError(error)) {
+      return false;
+    }
+
+    return ['ENOENT', 'ENODEV', 'EIO'].includes(error.code);
   }
 
   /**
@@ -295,6 +453,11 @@ export class RecordingService extends EventEmitter {
     bufferId: string,
     reason: string
   ): Promise<{ finalPath: string | null; deleted: boolean }> {
+    if (!this.isEnabled || !this.config.autoStop) {
+      console.log('[RecordingService] Skipping early end stop (disabled)');
+      return { finalPath: null, deleted: false };
+    }
+
     return this.stopRecordingForMatch({
       bufferId,
       outcome: 'incomplete',
@@ -348,47 +511,127 @@ export class RecordingService extends EventEmitter {
     // Transition to stopping
     this.currentSession.status = 'stopping';
 
+    // Capture session data BEFORE any async operation (race-condition fix)
+    const sessionRef = this.currentSession;
+    const sessionStartTime = this.currentSession.startTime;
+    const sessionBufferId = this.currentSession.bufferId;
+
     // Create promise and cache it for idempotency
     this.currentStopPromise = (async (): Promise<{
       finalPath: string | null;
       deleted: boolean;
     }> => {
       try {
-        // Call OBS stop
-        const recordedFile = await this.obsRecorder.stopRecording();
+        // Call OBS stop - returns typed result
+        const stopResult: StopRecordingResult = await this.obsRecorder.stopRecording();
 
-        // If no file returned, mark as failed_io (Case 1: OBS write failure)
-        if (!recordedFile) {
-          console.warn('[RecordingService] OBS stop returned no file for:', bufferId);
+        // Handle failure cases based on reason
+        if (!stopResult.ok) {
+          const { reason, error: errorMsg, durationSeconds } = stopResult;
+          const eventMetadataWriteSucceeded =
+            reason === 'write_error' || reason === 'stop_error'
+              ? await this.consumeRecorderFailureMetadataWrite(sessionBufferId)
+              : false;
 
-          // Persist recording failure status in metadata
-          if (this.config.metadataIntegration) {
-            await this.metadataService.updateVideoMetadataByBufferId(bufferId, {
-              recordingStatus: 'failed_io' as RecordingStatusType,
-              recordingErrorCode: 'OBS_WRITE_ERROR',
-              recordingErrorMessage:
-                'OBS could not write to the recording directory. Check folder permissions or Windows Controlled Folder Access.',
+          // Map reason to recordingStatus and error code
+          let recordingStatus: RecordingStatusType;
+          let recordingErrorCode: string;
+          let recordingErrorMessage: string;
+
+          // Handle no_active_session: best-effort metadata update + clear session
+          if (reason === 'no_active_session') {
+            console.warn('[RecordingService] OBS reported no active session for:', sessionBufferId);
+
+            // Best-effort metadata update: only if still in_progress (avoid clobbering better status)
+            if (this.config.metadataIntegration) {
+              try {
+                const currentMeta = await this.metadataService.loadMatchByBufferId(sessionBufferId);
+                if (
+                  !currentMeta?.recordingStatus ||
+                  currentMeta.recordingStatus === 'in_progress'
+                ) {
+                  await this.metadataService.updateVideoMetadataByBufferId(sessionBufferId, {
+                    recordingStatus: 'failed_unknown' as RecordingStatusType,
+                    recordingErrorCode: 'OBS_NO_ACTIVE_SESSION',
+                    recordingErrorMessage:
+                      'No active OBS recording session was found when stopping.',
+                  });
+                }
+              } catch (metaError) {
+                console.warn(
+                  '[RecordingService] Failed to update metadata for no_active_session:',
+                  metaError
+                );
+              }
+            }
+
+            // Clear session only if still the same session (race-safety)
+            if (this.currentSession === sessionRef) {
+              this.currentSession.status = 'failed';
+              this.currentSession = null;
+            }
+            return { finalPath: null, deleted: false };
+          }
+
+          // Determine failure status for other reasons - split deterministically
+          if (reason === 'stop_timeout') {
+            recordingStatus = 'failed_timeout';
+            recordingErrorCode = 'OBS_STOP_TIMEOUT';
+            recordingErrorMessage = 'Recording stop timed out; OBS may be unresponsive.';
+          } else if (reason === 'write_error') {
+            // write_error: OBS explicitly reported a write failure
+            recordingStatus = 'failed_io';
+            recordingErrorCode = 'OBS_WRITE_ERROR';
+            recordingErrorMessage =
+              'OBS could not write to the recording directory. Check folder permissions or Windows Controlled Folder Access.';
+          } else {
+            // stop_error: stop failed for unknown reason → failed_unknown (not failed_io)
+            recordingStatus = 'failed_unknown';
+            recordingErrorCode = 'OBS_STOP_ERROR';
+            recordingErrorMessage = 'Recording failed while stopping in OBS.';
+          }
+
+          // Log technical details separately (not persisted to user-facing metadata)
+          console.warn('[RecordingService] OBS stop failed:', {
+            bufferId: sessionBufferId,
+            reason,
+            technicalError: errorMsg,
+            duration: durationSeconds,
+            metadataOwner: eventMetadataWriteSucceeded ? 'recordingError_event' : 'stop_result',
+          });
+
+          // Signal-originated recorder failures only suppress fallback persistence after a
+          // confirmed successful event-path write.
+          if (this.config.metadataIntegration && !eventMetadataWriteSucceeded) {
+            await this.metadataService.updateVideoMetadataByBufferId(sessionBufferId, {
+              recordingStatus,
+              recordingErrorCode,
+              recordingErrorMessage,
             });
           }
 
-          this.currentSession!.status = 'failed';
-          this.currentSession = null;
+          // Clear session only if still the same session (race-safety)
+          if (this.currentSession === sessionRef) {
+            this.currentSession.status = 'failed';
+            this.currentSession = null;
+          }
           return { finalPath: null, deleted: false };
         }
 
-        // Compute session end time and duration
+        // Success case - extract file path and duration from result
+        const { filePath: recordedFile, durationSeconds } = stopResult;
+
+        // Compute session end time
         const endTime = new Date();
-        const durationSeconds =
-          (endTime.getTime() - this.currentSession!.startTime.getTime()) / 1000;
 
         // Determine target filename based on outcome
         let finalFilename: string;
         if (outcome === 'complete') {
-          finalFilename = this.sanitizeFilename(`${bufferId}${RECORDING_EXTENSION}`);
+          finalFilename = this.sanitizeFilename(`${sessionBufferId}${RECORDING_EXTENSION}`);
         } else {
-          const timestamp = this.currentSession!.startTime.toISOString().replace(/[:.]/g, '-');
+          const timestamp = sessionStartTime.toISOString().replace(/[:.]/g, '-');
           finalFilename = this.sanitizeFilename(
-            `Incomplete_${bufferId}_${timestamp}${RECORDING_EXTENSION}`
+            `Incomplete_${sessionBufferId}_${timestamp}${RECORDING_EXTENSION}`
           );
         }
 
@@ -454,30 +697,30 @@ export class RecordingService extends EventEmitter {
             videoMetadata.videoThumbnail = thumbnailPath;
           }
 
-          await this.metadataService.updateVideoMetadataByBufferId(bufferId, videoMetadata);
+          await this.metadataService.updateVideoMetadataByBufferId(sessionBufferId, videoMetadata);
 
-          console.log('[RecordingService] Updated video metadata for bufferId:', bufferId);
+          console.log('[RecordingService] Updated video metadata for bufferId:', sessionBufferId);
         }
 
         // Emit appropriate event based on outcome (use actualFinalPath so UI can open it)
         if (outcome === 'complete') {
           // Load metadata to get matchHash
-          const storedMetadata = await this.metadataService.loadMatchByBufferId(bufferId);
+          const storedMetadata = await this.metadataService.loadMatchByBufferId(sessionBufferId);
           const matchHash = storedMetadata?.matchHash;
 
           if (matchHash) {
             this.emit('recordingCompleted', {
               matchHash,
-              bufferId,
+              bufferId: sessionBufferId,
               path: actualFinalPath,
               duration: durationSeconds,
             });
           } else {
-            console.warn('[RecordingService] Complete match missing matchHash:', bufferId);
+            console.warn('[RecordingService] Complete match missing matchHash:', sessionBufferId);
           }
         } else {
           this.emit('recordingInterrupted', {
-            bufferId,
+            bufferId: sessionBufferId,
             path: actualFinalPath,
             duration: durationSeconds,
             reason: reason || 'incomplete',
@@ -485,17 +728,90 @@ export class RecordingService extends EventEmitter {
         }
 
         // Enforce disk quota if configured
+        // Wrapped in separate try/catch: quota failures should not mark the current recording as failed
         const settings = this.settingsService.getSettings();
         if (settings.maxDiskStorage && settings.maxDiskStorage > 0) {
-          await this.obsRecorder.enforceStorageQuota(settings.maxDiskStorage);
+          // Resolve protected paths for favourite recordings (metadata integration)
+          let protectedVideoPaths: Set<string> | undefined;
+          let shouldEnforceQuota = true;
+
+          if (this.config.metadataIntegration) {
+            try {
+              const { paths, scanErrors } =
+                await this.metadataService.listFavouriteVideoPathsWithDiagnostics();
+
+              if (scanErrors.length > 0) {
+                console.error(
+                  '[RecordingService] Metadata scan incomplete, skipping quota enforcement:',
+                  scanErrors
+                );
+                shouldEnforceQuota = false;
+              } else {
+                protectedVideoPaths = paths;
+              }
+            } catch (metadataError) {
+              console.error(
+                '[RecordingService] Failed to list favourite video paths (non-critical):',
+                metadataError
+              );
+              // Skip quota enforcement when protected path list is incomplete
+              shouldEnforceQuota = false;
+            }
+          }
+
+          if (shouldEnforceQuota) {
+            try {
+              const quotaResult = await this.obsRecorder.enforceStorageQuota(
+                settings.maxDiskStorage,
+                protectedVideoPaths
+              );
+
+              // Update metadata for each deleted recording (gated by metadataIntegration)
+              if (this.config.metadataIntegration) {
+                for (const deleted of quotaResult.deleted) {
+                  try {
+                    // Match by exact videoPath to update metadata
+                    await this.metadataService.markRecordingDeletedByQuotaByVideoPath(
+                      deleted.filePath
+                    );
+                  } catch (metaError) {
+                    console.warn(
+                      '[RecordingService] Failed to update metadata for quota-deleted recording:',
+                      { filePath: deleted.filePath, error: metaError }
+                    );
+                  }
+                }
+              }
+
+              // Emit retention cleanup event for renderer notification (unconditional)
+              if (quotaResult.deleted.length > 0) {
+                const deletedCount = quotaResult.deleted.length;
+                const freedGB = Number(
+                  quotaResult.deleted.reduce((sum, d) => sum + d.sizeGB, 0).toFixed(1)
+                );
+                this.emit('recordingRetentionCleanup', {
+                  deletedCount,
+                  freedGB,
+                  maxGB: settings.maxDiskStorage,
+                });
+              }
+            } catch (quotaError) {
+              // Quota enforcement failed - log but don't fail the current recording
+              console.warn('[RecordingService] Quota enforcement failed (non-critical):', quotaError);
+            }
+          }
         }
 
-        // Update session status and clear
-        this.currentSession!.finalPath = actualFinalPath;
-        this.currentSession!.endTime = endTime;
-        this.currentSession!.duration = durationSeconds;
-        this.currentSession!.status = 'completed'; // A usable recording exists
-        this.currentSession = null;
+        // Update session status and clear only if still the same session (race-safety)
+        if (this.currentSession === sessionRef) {
+          this.currentSession.finalPath = actualFinalPath;
+          this.currentSession.endTime = endTime;
+          this.currentSession.duration = durationSeconds;
+          this.currentSession.status = 'completed'; // A usable recording exists
+          this.currentSession = null;
+        }
+
+        this.recorderFailureMetadataWrites.delete(sessionBufferId);
 
         // Clean up temp files if configured
         if (!this.config.keepTemporaryFiles) {
@@ -513,7 +829,7 @@ export class RecordingService extends EventEmitter {
         // Persist failure status for all errors
         if (this.config.metadataIntegration) {
           try {
-            await this.metadataService.updateVideoMetadataByBufferId(bufferId, {
+            await this.metadataService.updateVideoMetadataByBufferId(sessionBufferId, {
               recordingStatus: 'failed_unknown' as RecordingStatusType,
               recordingErrorCode: 'RECORDING_STOP_ERROR',
               recordingErrorMessage: `Recording failed: ${(error as Error).message}`,
@@ -523,10 +839,13 @@ export class RecordingService extends EventEmitter {
           }
         }
 
-        if (this.currentSession) {
+        // Clear session only if still the same session (race-safety)
+        if (this.currentSession === sessionRef) {
           this.currentSession.status = 'failed';
           this.currentSession = null;
         }
+
+        this.recorderFailureMetadataWrites.delete(sessionBufferId);
 
         // Only rethrow non-OS I/O errors (programming/invariant violations)
         if (!isOsIoError) {
@@ -586,6 +905,14 @@ export class RecordingService extends EventEmitter {
     };
   }
 
+  public getCurrentEncoderId(): string | null {
+    if (!this.obsRecorder || !this.obsRecorder.getIsInitialized()) {
+      return null;
+    }
+
+    return this.obsRecorder.getCurrentEncoderId();
+  }
+
   /**
    * Clean up orphaned temporary files (from failed recordings only)
    * Preserves temp files that are referenced by match metadata (rename fallback case)
@@ -636,7 +963,7 @@ export class RecordingService extends EventEmitter {
         }
       }
     } catch (error: unknown) {
-      if (error instanceof Error && (error as any).code === 'ENOENT') {
+      if (isNodeError(error) && error.code === 'ENOENT') {
         // Directory doesn't exist, nothing to clean
         return;
       }
@@ -657,7 +984,7 @@ export class RecordingService extends EventEmitter {
       console.log('[RecordingService] OBS recording started:', path);
     });
 
-    this.obsRecorder.on('recordingStopped', (path: string, duration: number) => {
+    this.obsRecorder.on('recordingStopped', (path: string | null, duration: number) => {
       console.log('[RecordingService] OBS recording stopped:', {
         path,
         duration: `${duration.toFixed(1)}s`,
@@ -667,47 +994,66 @@ export class RecordingService extends EventEmitter {
     this.obsRecorder.on('error', (error: Error) => {
       console.error('[RecordingService] OBS error:', error);
       // Recognize fatal IPC errors and disable recording service
-      if (error instanceof ObsFatalIpcError || (error as any)?.code === 'OBS_IPC_FATAL') {
+      if (error instanceof ObsFatalIpcError) {
         console.warn('[RecordingService] Fatal OBS IPC error detected, disabling recording');
         this.isEnabled = false;
       }
       this.emit('obsError', error);
     });
 
-    // Handle user-facing recording errors (folder/permission issues)
-    // This handles Case 1: OBS emits stop with error code before stopRecording is called
+    // Handle user-facing recording errors
+    // Race-condition fix: capture session data before await, re-check after
     this.obsRecorder.on('recordingError', async (event: RecordingErrorEvent) => {
       console.warn('[RecordingService] OBS recording error:', {
         sessionId: event.sessionId,
         code: event.code,
         error: event.error,
+        stopInProgress: !!this.currentStopPromise,
       });
 
-      // Persist failure to metadata BEFORE clearing session (Case 1 requirement)
-      if (this.config.metadataIntegration && this.currentSession?.bufferId) {
-        try {
-          await this.metadataService.updateVideoMetadataByBufferId(this.currentSession.bufferId, {
-            recordingStatus: 'failed_io' as RecordingStatusType,
-            recordingErrorCode: 'OBS_WRITE_ERROR',
-            recordingErrorMessage:
-              'OBS could not write to the recording directory. Check folder permissions or Windows Controlled Folder Access.',
-          });
-          console.log(
-            '[RecordingService] Persisted recording failure for bufferId:',
-            this.currentSession.bufferId
-          );
-        } catch (metaError) {
-          console.warn('[RecordingService] Failed to persist recording failure:', metaError);
-        }
+      // Determine error classification based on event.code (deterministic)
+      // -1 = write_error (OBS write failure), -2 = stop_error (stop failed)
+      const isWriteError = event.code === -1;
+      const recordingErrorCode = isWriteError ? 'OBS_WRITE_ERROR' : 'OBS_STOP_ERROR';
+      // Deterministic status mapping: write_error → failed_io, stop_error → failed_unknown
+      const recordingStatus: RecordingStatusType = isWriteError ? 'failed_io' : 'failed_unknown';
+      const recordingErrorMessage = isWriteError
+        ? 'OBS could not write to the recording directory. Check folder permissions or Windows Controlled Folder Access.'
+        : 'Recording failed while stopping in OBS.';
+      // User message: don't assert specific cause for write errors
+      const userMessage = isWriteError
+        ? 'OBS could not write the recording. Check free disk space, folder permissions, and Windows Controlled Folder Access/antivirus.'
+        : 'Recording failed while stopping. Check OBS logs for details.';
 
-        // Clear local session so stopRecordingForMatch returns early cleanly
-        this.currentSession.status = 'failed';
-        this.currentSession = null;
+      // Capture session data BEFORE any await (race-condition fix)
+      const sessionRef = this.currentSession;
+      const capturedBufferId = sessionRef?.bufferId;
+
+      // If no active session or no bufferId: emit and return (don't mutate)
+      if (!capturedBufferId) {
+        this.emit('recordingError', userMessage);
+        return;
       }
 
-      // Build user-friendly message
-      const userMessage =
-        'Recording failed due to a folder/permission issue. Check your recording location and antivirus settings.';
+      const metadataWritePromise = this.persistRecorderFailureMetadata(capturedBufferId, {
+        recordingStatus,
+        recordingErrorCode,
+        recordingErrorMessage,
+      });
+      this.recorderFailureMetadataWrites.set(capturedBufferId, metadataWritePromise);
+
+      const metadataWriteSucceeded = await metadataWritePromise;
+      if (metadataWriteSucceeded) {
+        console.log('[RecordingService] Persisted recording failure for bufferId:', capturedBufferId);
+      }
+
+      // B-guard: Only mutate session if stop is NOT in progress AND session unchanged
+      // If stop IS in progress or session changed, the stop flow will handle cleanup
+      if (!this.currentStopPromise && this.currentSession === sessionRef) {
+        this.currentSession.status = 'failed';
+        this.currentSession = null;
+        this.recorderFailureMetadataWrites.delete(capturedBufferId);
+      }
 
       // Emit typed event for renderer notification
       this.emit('recordingError', userMessage);
@@ -746,6 +1092,10 @@ export class RecordingService extends EventEmitter {
     try {
       // Calculate thumbnail time: halfway through the recording
       const thumbnailTime = duration / 2;
+
+      // The recording root may have been removed/recreated since initialization.
+      // Re-ensure the thumbnails directory before spawning ffmpeg.
+      await fs.promises.mkdir(this.thumbnailsDir, { recursive: true });
 
       // Generate thumbnail path in Thumbnails folder (same name + THUMBNAIL_EXTENSION)
       const parsedPath = path.parse(videoPath);
@@ -828,19 +1178,15 @@ export class RecordingService extends EventEmitter {
         throw new Error('Invalid recording directory');
       }
 
-      // Normalize and validate path - don't use root directories
+      // Use SSoT for path resolution (handles root directory sanitization)
       const normalizedPath = path.normalize(newDirectory);
-      const isRootDir = normalizedPath === path.parse(normalizedPath).root;
+      const finalPath = getEffectiveRecordingDirectory(normalizedPath, app.getPath('videos'));
 
-      let finalPath = normalizedPath;
-      if (isRootDir) {
-        // If it's a root directory, create a subdirectory for recordings
-        finalPath = path.join(normalizedPath, 'ArenaCoach', 'Recordings');
+      // If path was sanitized (e.g., root dir), update settings so UI shows correct location
+      if (finalPath !== normalizedPath) {
         console.warn(
           `[RecordingService] Root directory "${normalizedPath}" not allowed, using "${finalPath}" instead`
         );
-
-        // Update the settings with the sanitized path so UI shows the correct location
         try {
           this.settingsService.updateSettings({ recordingLocation: finalPath });
           console.log('[RecordingService] Updated settings with sanitized path:', finalPath);
@@ -849,26 +1195,10 @@ export class RecordingService extends EventEmitter {
             '[RecordingService] Failed to update settings with sanitized path:',
             updateError
           );
-          // Continue with the safe path even if settings update fails
         }
       }
 
-      // Update the directories
-      this.recordingsDir = finalPath;
-      this.thumbnailsDir = path.join(finalPath, 'Thumbnails');
-
-      // Ensure the recordings directory exists; thumbnails dir will be lazily ensured at thumbnail time
-      await fs.promises.mkdir(this.recordingsDir, { recursive: true });
-
-      // Update the OBS recorder output directory
-      if (this.obsRecorder) {
-        this.obsRecorder.updateOutputDirectory(this.recordingsDir);
-      }
-
-      console.log('[RecordingService] Recording directory updated:', {
-        recordingsDir: this.recordingsDir,
-        thumbnailsDir: this.thumbnailsDir,
-      });
+      await this.applyActiveRecordingDirectory(finalPath);
     } catch (error) {
       console.error('[RecordingService] Failed to update recording directory:', error);
       throw error;
@@ -876,51 +1206,84 @@ export class RecordingService extends EventEmitter {
   }
 
   /**
-   * Get recordings directory from settings or use default
+   * Get recordings directory from settings or use default.
+   * Uses SSoT from recordingPathUtils for path resolution.
    */
   private getRecordingsDirectory(): string {
-    try {
-      if (this.settingsService) {
-        const settings = this.settingsService.getSettings();
-        if (settings.recordingLocation) {
-          // Validate the path - don't use root directories
-          const normalizedPath = path.normalize(settings.recordingLocation);
+    const safeDefaultDir = this.getSafeDefaultRecordingDirectory();
+    const defaultDir = this.config.outputDir || safeDefaultDir;
 
-          // Check if it's a root directory (e.g., "E:\", "C:\", "/")
-          const isRootDir = normalizedPath === path.parse(normalizedPath).root;
+    const settings = this.settingsService.getSettings();
 
-          if (isRootDir) {
-            // If it's a root directory, create a subdirectory for recordings
-            const safePath = path.join(normalizedPath, 'ArenaCoach', 'Recordings');
-            console.warn(
-              `[RecordingService] Root directory "${normalizedPath}" not allowed, using "${safePath}" instead`
-            );
-
-            // Update the settings with the sanitized path so UI shows the correct location
-            try {
-              this.settingsService.updateSettings({ recordingLocation: safePath });
-              console.log('[RecordingService] Updated settings with sanitized path:', safePath);
-            } catch (updateError) {
-              console.warn(
-                '[RecordingService] Failed to update settings with sanitized path:',
-                updateError
-              );
-              // Continue with the safe path even if settings update fails
-            }
-
-            return safePath;
-          }
-
-          // Valid non-root directory
-          return normalizedPath;
-        }
-      }
-    } catch (error) {
-      console.warn('[RecordingService] Failed to get recording location from settings:', error);
+    // If no recording location in settings, use defaultDir (respects config.outputDir)
+    if (!settings.recordingLocation) {
+      return defaultDir;
     }
 
-    // Fall back to default
-    return this.config.outputDir || path.join(app.getPath('videos'), 'ArenaCoach', 'Recordings');
+    const effectiveDir = getEffectiveRecordingDirectory(
+      settings.recordingLocation,
+      app.getPath('videos')
+    );
+
+    // If directory was sanitized (any transformation), update settings so UI shows correct location
+    const normalizedInput = path.normalize(settings.recordingLocation);
+    const unavailableRoot = this.getUnavailableRecordingRoot(effectiveDir);
+
+    if (unavailableRoot) {
+      console.warn(
+        `[RecordingService] Recording directory root unavailable, temporarily using default: "${effectiveDir}" (missing root: "${unavailableRoot}")`
+      );
+      return safeDefaultDir;
+    }
+
+    if (normalizedInput !== effectiveDir) {
+      console.warn(
+        `[RecordingService] Sanitized recording directory: "${normalizedInput}" -> "${effectiveDir}"`
+      );
+      try {
+        this.settingsService.updateSettings({ recordingLocation: effectiveDir });
+        console.log('[RecordingService] Updated settings with sanitized path:', effectiveDir);
+      } catch (updateError) {
+        console.warn(
+          '[RecordingService] Failed to update settings with sanitized path:',
+          updateError
+        );
+      }
+    }
+
+    return effectiveDir;
+  }
+
+  private getSafeDefaultRecordingDirectory(): string {
+    return path.join(app.getPath('videos'), DEFAULT_RECORDING_SUBDIR);
+  }
+
+  private getUnavailableRecordingRoot(recordingDir: string): string | null {
+    const windowsRootMatch = recordingDir.match(/^[A-Za-z]:[\\/]/);
+    const root = windowsRootMatch?.[0] ?? path.parse(recordingDir).root;
+
+    if (!root) {
+      return null;
+    }
+
+    return fs.existsSync(root) ? null : root;
+  }
+
+  private async applyActiveRecordingDirectory(newDirectory: string): Promise<void> {
+    this.recordingsDir = newDirectory;
+    this.thumbnailsDir = path.join(newDirectory, 'Thumbnails');
+
+    await fs.promises.mkdir(this.recordingsDir, { recursive: true });
+    await fs.promises.mkdir(this.thumbnailsDir, { recursive: true });
+
+    if (this.obsRecorder) {
+      this.obsRecorder.updateOutputDirectory(this.recordingsDir);
+    }
+
+    console.log('[RecordingService] Recording directory updated:', {
+      recordingsDir: this.recordingsDir,
+      thumbnailsDir: this.thumbnailsDir,
+    });
   }
 
   /**

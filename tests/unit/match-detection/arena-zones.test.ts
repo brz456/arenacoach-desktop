@@ -1,12 +1,20 @@
 import { describe, it, expect } from 'vitest';
 import {
-  ARENA_ZONE_IDS,
+  ARENA_MAPS,
+  ARENA_MAP_BY_ID,
   ARENA_ZONE_NAMES,
-  isArenaZone,
-  getArenaName,
-} from '../../../src/match-detection/constants/ArenaZones';
+  getArenaZoneName,
+  getArenaMapInfo,
+} from '@wow/game-data';
 
-describe('ArenaZones', () => {
+/**
+ * Tests for arena zone SSoT from @wow/game-data.
+ * Validates arena zone names, ID lookups, and unknown-ID behavior.
+ */
+describe('ArenaZones (SSoT from @wow/game-data)', () => {
+  // Helper: check if ID is a known arena
+  const isArenaZone = (id: number): boolean => ARENA_MAP_BY_ID[id] !== undefined;
+
   describe('isArenaZone', () => {
     it('returns true for known arena zones', () => {
       const knownArenas = [
@@ -14,9 +22,9 @@ describe('ArenaZones', () => {
         { id: 617, name: 'Dalaran Sewers' },
         { id: 1505, name: 'Nagrand Arena' },
         { id: 572, name: 'Ruins of Lordaeron' },
-        { id: 2167, name: 'Robodrome' },
+        { id: 2167, name: 'The Robodrome' },
         { id: 1134, name: "Tiger's Peak" },
-        { id: 980, name: "Tol'viron Arena" },
+        { id: 980, name: "Tol'Viron Arena" },
         { id: 1504, name: 'Black Rook Hold Arena' },
         { id: 2373, name: 'Empyrean Domain' },
         { id: 1552, name: "Ashamane's Fall" },
@@ -47,43 +55,60 @@ describe('ArenaZones', () => {
     });
   });
 
-  describe('getArenaName', () => {
-    it('returns correct name for known arena IDs', () => {
-      expect(getArenaName(1672)).toBe("Blade's Edge Arena");
-      expect(getArenaName(617)).toBe('Dalaran Sewers');
-      expect(getArenaName(1505)).toBe('Nagrand Arena');
-      expect(getArenaName(1552)).toBe("Ashamane's Fall");
-      expect(getArenaName(1825)).toBe('Hook Point');
-      expect(getArenaName(2759)).toBe('Cage of Carnage');
+  describe('getArenaZoneName', () => {
+    it('returns correct zone name for known arena IDs', () => {
+      expect(getArenaZoneName(1672)).toBe("Blade's Edge Arena");
+      expect(getArenaZoneName(617)).toBe('Dalaran Sewers');
+      expect(getArenaZoneName(1505)).toBe('Nagrand Arena');
+      expect(getArenaZoneName(1552)).toBe("Ashamane's Fall");
+      expect(getArenaZoneName(1825)).toBe('Hook Point');
+      expect(getArenaZoneName(2759)).toBe('Cage of Carnage');
     });
 
-    it('returns fallback name for unknown zone IDs', () => {
-      expect(getArenaName(2222)).toBe('Unknown Arena (2222)');
-      expect(getArenaName(9999)).toBe('Unknown Arena (9999)');
-      expect(getArenaName(0)).toBe('Unknown Arena (0)');
+    it('returns null for unknown zone IDs', () => {
+      expect(getArenaZoneName(2222)).toBe(null);
+      expect(getArenaZoneName(9999)).toBe(null);
+      expect(getArenaZoneName(0)).toBe(null);
     });
   });
 
-  describe('ARENA_ZONE_IDS', () => {
-    it('contains all known arena IDs', () => {
+  describe('getArenaMapInfo', () => {
+    it('returns full info for known arena IDs', () => {
+      const info = getArenaMapInfo(1505);
+      expect(info).not.toBe(null);
+      expect(info?.id).toBe(1505);
+      expect(info?.name).toBe('Nagrand Arena');
+      expect(info?.zoneName).toBe('Nagrand Arena');
+      expect(info?.imageKey).toBe('nagrand');
+      expect(info?.bounds).toBeDefined();
+    });
+
+    it('returns null for unknown zone IDs', () => {
+      expect(getArenaMapInfo(9999)).toBe(null);
+    });
+  });
+
+  describe('ARENA_MAPS', () => {
+    it('contains all 16 known arena maps', () => {
       const expectedArenaIds = [
         1672, 617, 1505, 572, 2167, 1134, 980, 1504, 2373, 1552, 1911, 1825, 2509, 2547, 2563, 2759,
       ];
 
-      expect(ARENA_ZONE_IDS.size).toBe(expectedArenaIds.length);
+      expect(ARENA_MAPS.length).toBe(expectedArenaIds.length);
 
+      const actualIds = ARENA_MAPS.map(m => m.id);
       for (const id of expectedArenaIds) {
-        expect(ARENA_ZONE_IDS.has(id)).toBe(true);
+        expect(actualIds).toContain(id);
       }
     });
   });
 
   describe('ARENA_ZONE_NAMES', () => {
-    it('has a name entry for every arena zone ID', () => {
-      for (const zoneId of ARENA_ZONE_IDS) {
-        expect(ARENA_ZONE_NAMES[zoneId]).toBeDefined();
-        expect(typeof ARENA_ZONE_NAMES[zoneId]).toBe('string');
-        expect(ARENA_ZONE_NAMES[zoneId].length).toBeGreaterThan(0);
+    it('has a zone name entry for every arena map', () => {
+      for (const map of ARENA_MAPS) {
+        expect(ARENA_ZONE_NAMES[map.id]).toBeDefined();
+        expect(typeof ARENA_ZONE_NAMES[map.id]).toBe('string');
+        expect(ARENA_ZONE_NAMES[map.id].length).toBeGreaterThan(0);
       }
     });
   });

@@ -19,12 +19,12 @@ import {
 } from '../../helpers/matchDetectionTestUtils';
 
 /**
- * Insufficient Combatants Integration Tests (2v2 case)
+ * Insufficient Combatants Integration Tests
  *
- * Tests the production pipeline for 2v2 matches with wrong player counts.
+ * Tests the production pipeline for arena matches with wrong player counts.
  * Per the design, these matches should be treated as hard invalidations and
  * fully purged (metadata deleted). The same validation logic applies to 3v3
- * (requires exactly 6 combatants) via the same code path in validateMatchCompleteness.
+ * and skirmish via the same code path in validateMatchCompleteness.
  *
  * Production flow for insufficient combatants:
  * 1. MatchLogWatcher parses log → emits matchStarted, matchEnded
@@ -42,7 +42,7 @@ import {
  * - Metadata is created on matchStarted, then DELETED due to insufficient combatants
  * - Match never reaches 'complete' state
  */
-describe('Insufficient Combatants Hard Purge (2v2 with 3 players)', () => {
+describe('Insufficient Combatants Hard Purge', () => {
   let watcher: MatchLogWatcher;
   let chunker: MatchChunker;
   let metadataService: MetadataService;
@@ -313,6 +313,58 @@ describe('Insufficient Combatants Hard Purge (2v2 with 3 players)', () => {
     expect(incompleteBufferId).toBe(startBufferId);
 
     // Verify no unexpected lifecycle errors
+    const errors = getErrors();
+    expect(errors).toHaveLength(0);
+  });
+
+  it('purges skirmish match with invalid combatant count', async () => {
+    const lines = await loadFixtureLog('skirmish-insufficient-combatants.txt');
+    expect(lines.length).toBeGreaterThan(20);
+
+    const startEvents: MatchStartedEvent[] = [];
+    const endEvents: MatchEndedEvent[] = [];
+    const lifecycleIncomplete: Array<{ bufferId: string; trigger: EarlyEndTrigger }> = [];
+    const { enqueueOp, waitForAll, getErrors } = createLifecycleOpQueue();
+
+    watcher.on('matchStarted', (event: MatchStartedEvent) => {
+      startEvents.push(event);
+      enqueueOp(event.bufferId, () => lifecycleService.handleMatchStarted(event));
+    });
+    watcher.on('matchEnded', (event: MatchEndedEvent) => {
+      endEvents.push(event);
+      enqueueOp(event.bufferId, () => lifecycleService.handleMatchEnded(event));
+    });
+    chunker.on('matchEndedIncomplete', (event: MatchEndedIncompleteEvent) => {
+      enqueueOp(event.bufferId, () => lifecycleService.handleMatchEndedIncomplete(event));
+    });
+    lifecycleService.on('matchLifecycle:incomplete', data => {
+      lifecycleIncomplete.push({ bufferId: data.bufferId, trigger: data.trigger });
+    });
+
+    const watcherAny = watcher as any;
+    watcherAny.processChunkSynchronously(lines);
+    await waitForAll();
+
+    expect(startEvents).toHaveLength(1);
+    expect(startEvents[0].bracket).toBe('Skirmish');
+    expect(endEvents).toHaveLength(1);
+    expect(endEvents[0].metadata.bracket).toBe('Skirmish');
+    expect(endEvents[0].metadata.players).toHaveLength(5);
+
+    const bufferId = startEvents[0].bufferId;
+
+    expect(lifecycleIncomplete).toEqual([
+      { bufferId, trigger: EarlyEndTrigger.INSUFFICIENT_COMBATANTS },
+    ]);
+
+    const storedMetadata = await metadataStorageService.loadMatchByBufferId(bufferId);
+    expect(storedMetadata).toBeNull();
+
+    const session = lifecycleService.getSession(bufferId);
+    expect(session).toBeDefined();
+    expect(session!.state).toBe('incomplete');
+    expect(session!.completionReason).toContain('INSUFFICIENT_COMBATANTS');
+
     const errors = getErrors();
     expect(errors).toHaveLength(0);
   });

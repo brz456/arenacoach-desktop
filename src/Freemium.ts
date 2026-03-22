@@ -1,5 +1,5 @@
 export type FreemiumQuotaFields = {
-  entitlementMode: 'skillcapped' | 'freemium' | 'none';
+  entitlementMode: 'premium' | 'freemium' | 'free' | 'none';
   freeQuotaLimit: number | null;
   freeQuotaUsed: number | null;
   freeQuotaRemaining: number | null;

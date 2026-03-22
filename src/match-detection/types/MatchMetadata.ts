@@ -1,3 +1,5 @@
+import { BRACKET_BY_SLUG, BRACKET_LABEL_SKIRMISH } from '@wow/game-data';
+
 /**
  * Individual round summary for Solo Shuffle
  */
@@ -66,11 +68,12 @@ export interface MatchMetadata {
   events?: MatchEventCategory[]; // Event categories with timestamped items
 }
 
-// CRITICAL: Ensure exact bracket strings for consistency
+// Bracket strings derived from @wow/game-data (SSoT)
 export const BRACKET_STRINGS = {
-  TWO_V_TWO: '2v2',
-  THREE_V_THREE: '3v3',
-  SOLO_SHUFFLE: 'Solo Shuffle',
+  TWO_V_TWO: BRACKET_BY_SLUG['2v2'].label,
+  THREE_V_THREE: BRACKET_BY_SLUG['3v3'].label,
+  SOLO_SHUFFLE: BRACKET_BY_SLUG['shuffle'].label,
+  SKIRMISH: BRACKET_LABEL_SKIRMISH,
 } as const;
 
 /**

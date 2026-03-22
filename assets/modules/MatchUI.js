@@ -1,5 +1,57 @@
 // Match UI - Handles match display, filtering, and interactions
 class MatchUI {
+    /**
+     * Get bracket labels from SSoT (game-data via preload).
+     * Throws if preload not loaded - no silent fallbacks.
+     */
+    static getBracketLabels() {
+        const labels = window.arenaCoach?.gameData?.BRACKET_LABELS;
+        if (!labels) {
+            throw new Error('[MatchUI] BRACKET_LABELS not available - preload may not have loaded');
+        }
+        return labels;
+    }
+
+    static getBracketDisplayNames() {
+        const displayNames = window.arenaCoach?.gameData?.BRACKET_DISPLAY_NAMES;
+        if (!displayNames) {
+            throw new Error('[MatchUI] BRACKET_DISPLAY_NAMES not available - preload may not have loaded');
+        }
+        return displayNames;
+    }
+
+    /**
+     * Get match duration in seconds from match metadata.
+     * Solo Shuffle: derive total duration ONLY from shuffleRounds endTimestamp (ms relative to shuffle start).
+     * Non-shuffle: use matchDuration when present (server-authoritative seconds).
+     */
+    static getMatchDurationSeconds(matchData) {
+        if (!matchData) return undefined;
+
+        const soloShuffleLabel = MatchUI.getBracketLabels().SoloShuffle;
+        if (matchData.bracket === soloShuffleLabel) {
+            if (!Array.isArray(matchData.shuffleRounds)) return undefined;
+
+            const endTimestamps = matchData.shuffleRounds
+                .map(r => r?.endTimestamp)
+                .filter(ts => Number.isFinite(ts) && ts >= 0);
+
+            if (endTimestamps.length === 0) return undefined;
+
+            const maxEndTimestamp = Math.max(...endTimestamps);
+            return Math.round(maxEndTimestamp / 1000);
+        }
+
+        if (Number.isFinite(matchData.matchDuration) && matchData.matchDuration >= 0) {
+            return matchData.matchDuration;
+        }
+
+        return undefined;
+    }
+
+    // Filter constants
+    static FILTER_FAVOURITES = 'favourites';
+
     // Status constants for explicit state management
     static STATUS_PENDING = 'pending';
     static STATUS_UPLOADING = 'uploading';
@@ -13,15 +65,31 @@ class MatchUI {
     static STATUS_NOT_FOUND = 'not_found';
     static STATUS_UNKNOWN = 'unknown';
 
+    // Non-terminal statuses are not selectable (deletion is blocked for these states)
+    static NON_SELECTABLE_STATUSES = new Set([
+        MatchUI.STATUS_PENDING,
+        MatchUI.STATUS_UPLOADING,
+        MatchUI.STATUS_QUEUED,
+        MatchUI.STATUS_PROCESSING,
+        MatchUI.STATUS_IN_PROGRESS
+    ]);
+
+    static isSelectableStatus(status) {
+        if (!status || status === MatchUI.STATUS_UNKNOWN) {
+            return false;
+        }
+        return !MatchUI.NON_SELECTABLE_STATUSES.has(status);
+    }
+
     /**
      * Get current authentication state
-     * @returns {Object} Object with isAuthenticated and isSkillCapped boolean flags
+     * @returns {Object} Object with isAuthenticated and isPremium boolean flags
      */
     getAuthState() {
         const authState = window.app?.renderer?.authUI;
         return {
             isAuthenticated: !!authState?.isAuthenticated,
-            isSkillCapped: !!authState?.currentUser?.is_skill_capped_verified
+            isPremium: !!authState?.currentUser?.is_premium
         };
     }
 
@@ -76,7 +144,7 @@ class MatchUI {
         return status.charAt(0).toUpperCase() + status.slice(1);
     }
 
-    constructor(settingsUI = null) {
+    constructor() {
         this.isDetecting = false;
         this.currentMatch = null;
         this.recentMatches = []; // Cache for UI display
@@ -84,12 +152,15 @@ class MatchUI {
         this.isLoadingMatches = false;
         this.isRecording = false; // Track recording state for UI disabling
         this.isInMatch = false; // Track match state for UI disabling
+        this.showMmrBadge = undefined; // Loaded from SSoT (settings) during init
+        this.defaultMistakeView = 'all'; // Loaded from SSoT (settings) during init
         this.navigationManager = null; // Will be set by ArenaCoachRenderer
         // Infinite scroll state
         this.currentOffset = 0;
         this.hasMoreMatches = true;
         this.isLoadingMore = false;
         this.renderedMatchCount = 0; // Track how many matches have been rendered
+        this._renderVersion = 0; // Cancels stale renders on rapid filter clicks
 
         // Multi-select state management
         this.selectedMatchBufferIds = new Set(); // Track selected match bufferIds
@@ -98,7 +169,6 @@ class MatchUI {
 
         // Initialize the centralized MatchDataService to reduce coupling
         window.MatchDataService.initialize(this);
-        this.settingsUI = settingsUI; // Dependency injection for settings UI
         /*
          * Two-Map Race Condition Management System
          *
@@ -116,12 +186,16 @@ class MatchUI {
         this.unprocessedCompletions = new Map(); // Completion events waiting for job creation
         this.ipcListeners = []; // Store cleanup functions for IPC listeners
 
+        // Context menu state (explicit initialization for cleanup)
+        this._contextMenuCloseHandler = null;
+
         this.setupElements();
         this.setupEvents();
         this.setupMatchListeners();
         this.initializeStatus();
         this.startRecordingStateMonitoring(); // Start event-driven recording state monitoring
         this.startMatchActiveMonitoring(); // Start event-driven match state monitoring
+        this.setupSettingsListener(); // Listen for settings changes
     }
 
     setupElements() {
@@ -266,15 +340,26 @@ class MatchUI {
                     if (matchHash) {
                         try {
                             // Call IPC to persist status and progress message to JSON files
-                            // Don't handle 'failed' here - let onAnalysisFailed handle it with errorCode
-                            if (event.status === 'failed') {
-                                return; // Skip - analysisFailed event will handle this with error details
+                            // Skip failure/ambiguous statuses in progress events:
+                            // - 'failed': handled by analysisFailed event with error details
+                            // - 'not_found': transient during warmup, terminal after warmup triggers analysisFailed
+                            if (event.status === 'failed' || event.status === 'not_found') {
+                                return;
                             }
 
-                            const statusToUse = event.status === 'completed' ? MatchUI.STATUS_COMPLETED :
-                                event.status === 'queued' ? MatchUI.STATUS_QUEUED :
-                                    event.status === 'processing' ? MatchUI.STATUS_PROCESSING :
-                                        MatchUI.STATUS_PROCESSING; // fallback for unknown statuses
+                            // Map to UI status constants (no silent fallback)
+                            const statusMap = {
+                                'completed': MatchUI.STATUS_COMPLETED,
+                                'queued': MatchUI.STATUS_QUEUED,
+                                'processing': MatchUI.STATUS_PROCESSING,
+                                'pending': MatchUI.STATUS_PENDING,
+                                'uploading': MatchUI.STATUS_UPLOADING
+                            };
+                            const statusToUse = statusMap[event.status];
+                            if (!statusToUse) {
+                                console.warn('[MatchUI] Unknown analysisProgress status:', event.status);
+                                return; // Don't persist unknown status as processing
+                            }
 
                             await window.arenaCoach.match.updateLiveStatus(
                                 matchHash,
@@ -331,7 +416,7 @@ class MatchUI {
                             this.maybeShowQuotaExhaustedModal(event);
                         } else if (event.entitlementMode === 'freemium') {
                             NotificationManager.show(
-                                `This match used 1 of your free enriched matches today (${Math.max(event.freeQuotaRemaining, 0)} of ${event.freeQuotaLimit} left).`,
+                                `This match used 1 free shuffle/3v3 analysis this week (${Math.max(event.freeQuotaRemaining, 0)} of ${event.freeQuotaLimit} free shuffle/3v3 analyses remaining).`,
                                 'info'
                             );
                         }
@@ -471,15 +556,41 @@ class MatchUI {
     }
 
     async initializeStatus() {
+        // Load settings from SSoT - failure surfaces error (no silent default)
         try {
-            // Use getDetectionStatus() for consistent SSoT with header
+            const settings = await window.arenaCoach.settings.get();
+            if (typeof settings.showMmrBadge !== 'boolean') {
+                console.error('[MatchUI] Invalid showMmrBadge type from settings:', typeof settings.showMmrBadge);
+                NotificationManager.show('Settings error: invalid MMR badge preference', 'error');
+                // this.showMmrBadge remains undefined - badge won't render
+            } else {
+                this.showMmrBadge = settings.showMmrBadge;
+            }
+
+            if (settings.defaultMistakeView !== 'mine' && settings.defaultMistakeView !== 'all') {
+                console.error(
+                    '[MatchUI] Invalid defaultMistakeView from settings:',
+                    settings.defaultMistakeView
+                );
+                NotificationManager.show('Settings error: invalid events default preference', 'error');
+            } else {
+                this.defaultMistakeView = settings.defaultMistakeView;
+            }
+        } catch (error) {
+            console.error('[MatchUI] Failed to load settings:', error);
+            NotificationManager.show('Failed to load settings', 'error');
+            // this.showMmrBadge remains undefined - badge won't render
+        }
+
+        // Core initialization proceeds regardless of settings load
+        try {
             const detectionStatus = await window.arenaCoach.match.getDetectionStatus();
             this.isDetecting = !!detectionStatus?.running;
             this.currentMatch = await window.arenaCoach.match.getCurrentMatch();
             await window.MatchDataService.refresh();
             await this.updateUI();
         } catch (error) {
-            console.error('Failed to initialize match detection status:', error);
+            console.error('[MatchUI] Failed to initialize match detection status:', error);
         }
     }
 
@@ -555,6 +666,9 @@ class MatchUI {
         const matchData = storedMatch.matchData;
         const matchHash = storedMatch.matchHash;
 
+        // Match duration (seconds) - single source of truth helper
+        const matchDurationSeconds = MatchUI.getMatchDurationSeconds(matchData);
+
         // Helper function to get team players from SSoT structure
         const getTeamPlayers = (teamId) => {
             return matchData.players ? matchData.players.filter(p => p.teamId === teamId) : [];
@@ -588,9 +702,10 @@ class MatchUI {
             matchHash: matchHash,
             timestamp: matchData.timestamp,
             bracket: matchData.bracket, // For filtering
-            endEvent: matchData.matchDuration !== undefined ? {
+            isFavourite: storedMatch.isFavourite === true,
+            endEvent: matchDurationSeconds !== undefined ? {
                 timestamp: matchData.timestamp,
-                duration: matchData.matchDuration,
+                duration: matchDurationSeconds,
                 matchResult: getMatchResult(),
                 matchHash: matchHash
             } : null,
@@ -617,7 +732,7 @@ class MatchUI {
             // Analysis UUID
             uuid: storedMatch.uuid, // UUID for delete functionality
             // Match timing
-            durationSeconds: matchData.matchDuration,
+            durationSeconds: matchDurationSeconds,
             // Solo Shuffle round and round results
             // Use wins/losses from the recording player's metadata
             playerWins: recordingPlayer?.wins,
@@ -734,9 +849,9 @@ class MatchUI {
                 resultText = isVictory ? 'Victory!' : 'Defeat';
             }
 
-            // Use SSoT duration
-            if (event.metadata.matchDuration) {
-                durationText = this.formatDuration(event.metadata.matchDuration);
+            const durationSeconds = MatchUI.getMatchDurationSeconds(event.metadata);
+            if (durationSeconds !== undefined) {
+                durationText = this.formatDuration(durationSeconds);
             }
         }
 
@@ -912,22 +1027,31 @@ class MatchUI {
     }
 
     getFilterSpecificMessage() {
+        const labels = MatchUI.getBracketLabels();
         const filterMap = {
             'all': {
                 main: 'No matches found',
                 hint: ''
             },
-            '2v2': {
-                main: 'No 2v2 matches found',
+            [labels.TwoVTwo]: {
+                main: `No ${labels.TwoVTwo} matches found`,
                 hint: ''
             },
-            '3v3': {
-                main: 'No 3v3 matches found',
+            [labels.ThreeVThree]: {
+                main: `No ${labels.ThreeVThree} matches found`,
                 hint: ''
             },
-            'Rated Solo Shuffle': {
-                main: 'No Solo Shuffle matches found',
+            [labels.SoloShuffle]: {
+                main: `No ${labels.SoloShuffle} matches found`,
                 hint: ''
+            },
+            [labels.Skirmish]: {
+                main: `No ${labels.Skirmish} matches found`,
+                hint: ''
+            },
+            'favourites': {
+                main: 'No favourited matches yet',
+                hint: 'Click the star icon on any match to add it to favourites'
             },
         };
 
@@ -984,24 +1108,104 @@ class MatchUI {
         const cardImage = document.createElement('div');
         cardImage.className = 'match-card-image';
 
-        // Add checkbox for selection
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.className = 'match-checkbox';
-        checkbox.setAttribute('data-buffer-id', match.bufferId || '');
-        checkbox.setAttribute('aria-label', 'Select match');
-        checkbox.checked = this.selectedMatchBufferIds.has(match.bufferId);
+        // Add checkbox for selection (only for terminal statuses - not processing matches)
+        // Processing matches cannot be deleted, so they should not be selectable
+        const isSelectable =
+            typeof match.bufferId === 'string' &&
+            match.bufferId.length > 0 &&
+            MatchUI.isSelectableStatus(match.currentStatus);
 
-        // Get date label for this match
-        const dateLabel = this.getDateLabel(match);
+        if (isSelectable) {
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'match-checkbox';
+            checkbox.setAttribute('data-buffer-id', match.bufferId);
+            checkbox.setAttribute('aria-label', 'Select match');
+            checkbox.checked = this.selectedMatchBufferIds.has(match.bufferId);
 
-        checkbox.addEventListener('click', (e) => {
-            e.stopPropagation(); // Prevent card click
-            this.toggleSelectMatch(match.bufferId, dateLabel, checkbox.checked);
-            card.classList.toggle('selected', checkbox.checked);
+            // Get date label for this match
+            const dateLabel = this.getDateLabel(match);
+
+            checkbox.addEventListener('click', (e) => {
+                e.stopPropagation(); // Prevent card click
+                this.toggleSelectMatch(match.bufferId, dateLabel, checkbox.checked);
+                card.classList.toggle('selected', checkbox.checked);
+            });
+
+            cardImage.appendChild(checkbox);
+        }
+
+        // Add star button for favourite toggle (always present, positioned after checkbox)
+        const starBtn = document.createElement('button');
+        starBtn.className = 'match-favourite-btn';
+        if (isSelectable) {
+            starBtn.classList.add('has-checkbox'); // Offset when checkbox present
+        }
+        if (match.isFavourite) {
+            starBtn.classList.add('is-favourite');
+        }
+        starBtn.setAttribute('aria-label', match.isFavourite ? 'Remove from favourites' : 'Add to favourites');
+        starBtn.setAttribute('title', match.isFavourite ? 'Remove from favourites' : 'Add to favourites');
+
+        // Create star icon using AssetManager (21px)
+        const starIcon = AssetManager.createSvgIcon({
+            pathData: 'M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z',
+            width: 21,
+            height: 21,
+            viewBox: '0 0 24 24',
+            fill: 'currentColor'
         });
+        starBtn.appendChild(starIcon);
 
-        cardImage.appendChild(checkbox);
+        // Add click handler
+        if (match.bufferId) {
+            starBtn.addEventListener('click', async (e) => {
+                e.stopPropagation(); // Prevent card click
+
+                // In-flight guard to prevent rapid double-clicks
+                if (starBtn.disabled) return;
+                starBtn.disabled = true;
+
+                const nextValue = !match.isFavourite;
+
+                try {
+                    // Await IPC before updating UI state
+                    await window.arenaCoach.matches.setFavourite(match.bufferId, nextValue);
+
+                    // Update in-memory match state only after IPC succeeds
+                    match.isFavourite = nextValue;
+
+                    // Update corresponding entry in recentMatches
+                    const recentMatch = this.recentMatches.find(m => m.bufferId === match.bufferId);
+                    if (recentMatch) {
+                        recentMatch.isFavourite = nextValue;
+                    }
+
+                    // Update button state
+                    starBtn.classList.toggle('is-favourite', nextValue);
+                    starBtn.setAttribute('aria-label', nextValue ? 'Remove from favourites' : 'Add to favourites');
+                    starBtn.setAttribute('title', nextValue ? 'Remove from favourites' : 'Add to favourites');
+
+                    // Only re-apply filters when on favourites view (to remove unfavourited cards)
+                    // Otherwise, button state is already updated in-place - no re-render needed
+                    if (this.activeFilter === MatchUI.FILTER_FAVOURITES) {
+                        this.applyFilters();
+                    }
+                } catch (error) {
+                    console.error('[MatchUI] Failed to toggle favourite:', error);
+                    // Leave UI state unchanged on error
+                } finally {
+                    // Re-enable button after IPC completes
+                    starBtn.disabled = false;
+                }
+            });
+        } else {
+            // Disable button if bufferId is missing
+            starBtn.disabled = true;
+            starBtn.style.cursor = 'not-allowed';
+        }
+
+        cardImage.appendChild(starBtn);
 
         // Try to get video thumbnail first, then fall back to map image (use bufferId)
         let thumbnailPath = null;
@@ -1014,25 +1218,13 @@ class MatchUI {
         }
 
         if (thumbnailPath) {
-            // Check if thumbnail file exists via IPC before trying to use it
-            try {
-                const exists = await window.arenaCoach.recording.checkFileExists(thumbnailPath);
-                if (exists) {
-                    // Thumbnail exists, use it
-                    cardImage.style.backgroundImage = `url("file://${thumbnailPath.replace(/\\/g, '/')}")`;
-                    cardImage.style.backgroundSize = 'cover';
-                    cardImage.style.backgroundPosition = 'center';
-                    cardImage.classList.add('has-background');
-                } else {
-                    // Thumbnail doesn't exist, fall back to map image silently
-                    this._applyMapImageFallback(cardImage, match.mapId);
-                }
-            } catch (error) {
-                // If check fails, fall back to map image
-                this._applyMapImageFallback(cardImage, match.mapId);
-            }
+            // Thumbnail exists (validated in main process), use it
+            cardImage.style.backgroundImage = `url("file://${thumbnailPath.replace(/\\/g, '/')}")`;
+            cardImage.style.backgroundSize = 'cover';
+            cardImage.style.backgroundPosition = 'center';
+            cardImage.classList.add('has-background');
         } else {
-            // Fall back to map image
+            // Fall back to map image (thumbnail missing or doesn't exist)
             this._applyMapImageFallback(cardImage, match.mapId);
         }
 
@@ -1045,12 +1237,13 @@ class MatchUI {
 
         // Status overlay removed - we show victory/loss next to duration instead
 
-        // Create MMR overlay with rank icon (bottom left)
-        if (match.displayMMR) {
+        // Create MMR overlay with rank icon (bottom left) - respects showMmrBadge setting
+        // Only render when explicitly true (undefined = settings not loaded)
+        if (match.displayMMR && this.showMmrBadge === true) {
             const mmrOverlay = document.createElement('div');
             mmrOverlay.className = 'card-overlay bottom-left mmr-overlay';
 
-            // Add rank icon only if rating is 1400+ 
+            // Add rank icon only if rating is 1400+
             const rankIconPath = AssetManager.getRatingIconPath(match.displayMMR);
             if (rankIconPath) {
                 const rankIcon = document.createElement('img');
@@ -1073,8 +1266,9 @@ class MatchUI {
         const hasDuration = duration != null;
 
         // Show overlay if we have duration OR Solo Shuffle W-L
+        const soloShuffleLabel = MatchUI.getBracketLabels().SoloShuffle;
         const shouldShowOverlay = hasDuration ||
-            (match.bracket === 'Solo Shuffle' && match.playerWins != null && match.playerLosses != null);
+            (match.bracket === soloShuffleLabel && match.playerWins != null && match.playerLosses != null);
 
         if (shouldShowOverlay) {
             const durationOverlay = document.createElement('div');
@@ -1089,7 +1283,7 @@ class MatchUI {
             }
 
             // Show rounds for Solo Shuffle, win/loss for other brackets
-            if (match.bracket === 'Solo Shuffle') {
+            if (match.bracket === soloShuffleLabel) {
                 // Show playerWins-playerLosses for Solo Shuffle
                 const wins = match.playerWins != null ? match.playerWins : 0;
                 const losses = match.playerLosses != null ? match.playerLosses : 0;
@@ -1234,8 +1428,8 @@ class MatchUI {
                     // Quota exhausted badge (yellow/amber)
                     const quotaBtn = document.createElement('button');
                     quotaBtn.className = 'analysis-button-inline status-quota-exhausted';
-                    quotaBtn.textContent = 'Quota Exhausted';
-                    quotaBtn.title = 'Daily free quota was exhausted - events not available';
+                    quotaBtn.textContent = 'Shuffle/3v3 Quota Reached';
+                    quotaBtn.title = 'Weekly free shuffle/3v3 quota was exhausted - events not available';
                     hoverOverlay.appendChild(quotaBtn);
                 } else if (match.hasEventEnrichment || (match.events && match.events.length > 0)) {
                     // Count total events across all categories
@@ -1300,6 +1494,13 @@ class MatchUI {
             await this.handleMatchCardClick(match);
         });
 
+        // Add right-click context menu
+        card.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation(); // Prevent bubble so close handler doesn't fire immediately
+            this.showMatchContextMenu(e, match);
+        });
+
         return card;
     }
 
@@ -1335,18 +1536,14 @@ class MatchUI {
                     // Get video info if not cached (use bufferId for lookup)
                     if (!videoPath) {
                         const recordingInfo = await window.arenaCoach.recording.getRecordingInfo(bufferId);
-                        if (!recordingInfo.videoPath) return;
+                        // Check for failure or missing video
+                        if (!recordingInfo.success || !recordingInfo.videoPath || !recordingInfo.videoExists) {
+                            return;
+                        }
 
                         // Skip preview for videos too short to play (< 2s)
                         if (recordingInfo.videoDuration !== null && recordingInfo.videoDuration < 2) {
                             previewDisabled = true;
-                            return;
-                        }
-
-                        // Check if video file actually exists before trying to load it
-                        const exists = await window.arenaCoach.recording.checkFileExists(recordingInfo.videoPath);
-                        if (!exists) {
-                            // Video file doesn't exist, don't try to load it
                             return;
                         }
 
@@ -1468,26 +1665,39 @@ class MatchUI {
         try {
             // Check recording info for this match (use bufferId for lookup)
             const recordingInfo = await window.arenaCoach.recording.getRecordingInfo(match.bufferId);
-            const { videoPath, videoDuration, recordingStatus, recordingErrorMessage } = recordingInfo;
 
-            if (videoPath) {
+            // Handle failure case
+            if (!recordingInfo.success) {
+                if (recordingInfo.code === 'METADATA_NOT_FOUND') {
+                    NotificationManager.show('Match data not found.', 'warning');
+                } else {
+                    NotificationManager.show('Unable to load recording info. Please try again.', 'error');
+                }
+                return;
+            }
+
+            const { videoPath, videoExists, videoDuration, recordingStatus, recordingErrorMessage } = recordingInfo;
+
+            if (videoPath && videoExists) {
                 // Check if video duration is too short to be playable (< 2s)
                 if (videoDuration !== null && videoDuration < 2) {
                     NotificationManager.show(`Recording too short to play (${videoDuration.toFixed(1)}s)`, 'warning');
                     return;
                 }
 
-                // Check if the video file actually exists
-                const exists = await window.arenaCoach.recording.checkFileExists(videoPath);
-                if (exists) {
-                    this.openVideoPlayer(match, videoPath);
-                } else {
-                    // Video path exists in metadata but file is missing
-                    NotificationManager.show('Video file not found. The recording for this match is missing.', 'warning');
-                }
+                this.openVideoPlayer(match, videoPath);
+            } else if (videoPath && !videoExists) {
+                // Video path exists in metadata but file is missing
+                NotificationManager.show('Video file not found. The recording for this match is missing.', 'warning');
             } else {
                 // No video path - show context-aware message based on recordingStatus
-                if (recordingStatus === 'failed_io' || recordingStatus === 'failed_unknown') {
+                if (recordingStatus === 'deleted_quota') {
+                    // Recording was deleted due to storage limit
+                    NotificationManager.show('Recording deleted due to storage limit.', 'info');
+                } else if (recordingStatus === 'failed_timeout') {
+                    // OBS stop timed out
+                    NotificationManager.show('Recording failed: OBS timed out.', 'error');
+                } else if (recordingStatus === 'failed_io' || recordingStatus === 'failed_unknown') {
                     // Recording was attempted but failed
                     const msg = recordingErrorMessage || 'Recording failed due to a system error.';
                     NotificationManager.show(msg, 'error');
@@ -1594,7 +1804,8 @@ class MatchUI {
         segments.push(document.createTextNode(mmr));
 
         // Result
-        if (bracket === 'Solo Shuffle') {
+        const soloShuffleLabel = MatchUI.getBracketLabels().SoloShuffle;
+        if (bracket === soloShuffleLabel) {
             const wins = match.playerWins != null ? match.playerWins : 0;
             const losses = match.playerLosses != null ? match.playerLosses : 0;
 
@@ -1681,7 +1892,8 @@ class MatchUI {
             videoElement: videoElement,
             containerElement: videoPlayerContainer,
             metadata: match,
-            shuffleRounds: match.shuffleRounds || []
+            shuffleRounds: match.shuffleRounds || [],
+            defaultMistakeView: this.defaultMistakeView
         });
 
         // Render initial enrichment status
@@ -1781,13 +1993,35 @@ class MatchUI {
                     : 'Enriched - events loaded';
             } else if (match.freeQuotaExhausted === true) {
                 statusBar.classList.add('quota-exhausted');
-                statusText.innerHTML = 'Free quota exhausted - <a href="#" class="quota-signup-link">Sign up to Skill Capped</a> for unlimited events';
+                statusText.innerHTML = 'Free shuffle/3v3 quota reached - <a href="#" class="quota-signup-link">Upgrade to premium</a> for unlimited events';
                 // Add click handler for the link
                 const signupLink = statusText.querySelector('.quota-signup-link');
                 if (signupLink) {
-                    signupLink.addEventListener('click', (e) => {
+                    signupLink.addEventListener('click', async (e) => {
                         e.preventDefault();
-                        window.arenaCoach.window.openExternal('https://www.skill-capped.com/wow/pricing/plans#arenacoach');
+                        try {
+                            const isAuthenticated = await window.arenaCoach.auth.isAuthenticated();
+                            if (isAuthenticated) {
+                                const loginResult = await window.arenaCoach.auth.getWebLoginUrl();
+                                if (loginResult?.success && loginResult.url) {
+                                    window.arenaCoach.window.openExternal(loginResult.url);
+                                    return;
+                                }
+                                NotificationManager.show(
+                                    loginResult?.error || 'Failed to open premium signup.',
+                                    'error'
+                                );
+                                return;
+                            }
+                            const env = await window.arenaCoach.getEnvironment();
+                            const accountUrl = env.isDevelopment
+                                ? 'http://localhost:5173/account'
+                                : 'https://arenacoach.gg/account';
+                            await window.arenaCoach.window.openExternal(accountUrl);
+                        } catch (error) {
+                            console.error('Failed to open premium signup:', error);
+                            NotificationManager.show('Failed to open premium signup.', 'error');
+                        }
                     });
                 }
             } else {
@@ -1836,7 +2070,7 @@ class MatchUI {
 
             // Get video path via recording info
             const recordingInfo = await window.arenaCoach.recording.getRecordingInfo(updatedMatch.bufferId);
-            if (!recordingInfo.videoPath) return;
+            if (!recordingInfo.success || !recordingInfo.videoPath || !recordingInfo.videoExists) return;
             const videoPath = recordingInfo.videoPath;
 
             console.debug('[MatchUI] Reloading video player with updated match data:', matchHash);
@@ -1861,21 +2095,25 @@ class MatchUI {
     }
 
     /**
-     * Show quota exhausted modal (at most once per day)
+     * Show quota exhausted modal (at most once per weekly reset)
      * @param {Object} event - The analysis completed event
      */
     maybeShowQuotaExhaustedModal(_event) {
-        // Per-day guard using localStorage
-        const today = new Date().toISOString().split('T')[0];
-        const lastShownDate = localStorage.getItem('quotaExhaustedModalDate');
+        // Per-week guard using localStorage (aligned with Wednesday 00:00 UTC reset)
+        const now = new Date();
+        const utcDay = now.getUTCDay(); // 0=Sun, 1=Mon, 2=Tue, ...
+        const daysSinceWednesday = (utcDay + 4) % 7; // Wed=0, Thu=1, ..., Tue=6
+        const wednesdayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - daysSinceWednesday));
+        const weekKey = wednesdayStart.toISOString().slice(0, 10);
+        const lastShownWeek = localStorage.getItem('quotaExhaustedModalWeek');
 
-        if (lastShownDate === today) {
-            // Already shown today, skip
+        if (lastShownWeek === weekKey) {
+            // Already shown this week, skip
             return;
         }
 
-        // Mark as shown for today
-        localStorage.setItem('quotaExhaustedModalDate', today);
+        // Mark as shown for this week
+        localStorage.setItem('quotaExhaustedModalWeek', weekKey);
 
         // Create and show modal
         this.showQuotaExhaustedModal();
@@ -1900,7 +2138,7 @@ class MatchUI {
         dialog.className = 'modal-dialog';
 
         const title = document.createElement('h3');
-        title.textContent = 'Free Quota Reached';
+        title.textContent = 'Free Shuffle/3v3 Quota Reached';
 
         const message = document.createElement('p');
         const siteLink = document.createElement('a');
@@ -1912,11 +2150,11 @@ class MatchUI {
         });
         message.appendChild(document.createTextNode("Matches will still be saved and events are available anytime at "));
         message.appendChild(siteLink);
-        message.appendChild(document.createTextNode(" - future matches can receive free events again tomorrow."));
+        message.appendChild(document.createTextNode(" - 2v2/skirmish stay free, and free shuffle/3v3 analyses reset weekly."));
 
         const upsell = document.createElement('p');
         upsell.className = 'modal-upsell';
-        upsell.textContent = 'Unlock unlimited with Skill-Capped.';
+        upsell.textContent = 'Upgrade to premium for unlimited shuffle/3v3 analyses and events.';
 
         const actions = document.createElement('div');
         actions.className = 'modal-actions';
@@ -1928,9 +2166,32 @@ class MatchUI {
 
         const signUpBtn = document.createElement('button');
         signUpBtn.className = 'btn';
-        signUpBtn.textContent = 'Get Skill-Capped';
-        signUpBtn.addEventListener('click', () => {
-            window.arenaCoach.window.openExternal('https://www.skill-capped.com/wow/pricing/plans#arenacoach');
+        signUpBtn.textContent = 'Get Premium';
+        signUpBtn.addEventListener('click', async () => {
+            try {
+                const isAuthenticated = await window.arenaCoach.auth.isAuthenticated();
+                if (isAuthenticated) {
+                    const loginResult = await window.arenaCoach.auth.getWebLoginUrl();
+                    if (loginResult?.success && loginResult.url) {
+                        window.arenaCoach.window.openExternal(loginResult.url);
+                        modal.remove();
+                        return;
+                    }
+                    NotificationManager.show(
+                        loginResult?.error || 'Failed to open premium signup.',
+                        'error'
+                    );
+                    return;
+                }
+                const env = await window.arenaCoach.getEnvironment();
+                const accountUrl = env.isDevelopment
+                    ? 'http://localhost:5173/account'
+                    : 'https://arenacoach.gg/account';
+                await window.arenaCoach.window.openExternal(accountUrl);
+            } catch (error) {
+                console.error('Failed to open premium signup:', error);
+                NotificationManager.show('Failed to open premium signup.', 'error');
+            }
             modal.remove();
         });
 
@@ -1979,10 +2240,10 @@ class MatchUI {
             }
         }
 
-        // Only log warning for unexpected cases where we have player data but still can't determine team
+        // Log warning for unexpected cases where we have player data but still can't determine team
         const hasPlayerData = analyzedPlayerId && (team0Players?.length > 0 || team1Players?.length > 0);
         if (hasPlayerData) {
-            console.warn(`Could not determine player team despite having player data. Defaulting to team 0.`, {
+            console.warn('[MatchUI] Could not determine player team', {
                 analyzedPlayerId,
                 team0Count: team0Players?.length || 0,
                 team1Count: team1Players?.length || 0,
@@ -1991,8 +2252,8 @@ class MatchUI {
             });
         }
 
-        // Default fallback: assume player is on team 0, or return null if no meaningful data
-        return hasPlayerData ? true : null;
+        // Cannot determine team - caller handles null by showing teams in natural order
+        return null;
     }
 
     createTeamCompositionDisplay(team0Players, team1Players, analyzedPlayerId, winningTeamId, analyzedPlayerWinStatus, soloShuffleRound) {
@@ -2050,14 +2311,14 @@ class MatchUI {
 
         composition.appendChild(teamContainer);
         return composition;
-            }
+    }
 
     createTeamSide(players, analyzedPlayerId) {
         const teamSide = document.createElement('div');
         teamSide.className = 'team-side';
 
 
-            if (!players || players.length === 0) {
+        if (!players || players.length === 0) {
             // Fallback for matches without team data
             const placeholder = document.createElement('div');
             placeholder.className = 'team-player';
@@ -2068,9 +2329,9 @@ class MatchUI {
             placeholder.appendChild(placeholderIcon);
             teamSide.appendChild(placeholder);
             return teamSide;
-            }
+        }
 
-            players.forEach(player => {
+        players.forEach(player => {
             // Only create spec icon, no player names as requested
             const specIconPath = AssetManager.getSpecIconPath(player.specId);
             if (specIconPath) {
@@ -2085,7 +2346,7 @@ class MatchUI {
                 }
 
                 teamSide.appendChild(specIcon);
-                }
+            }
         });
 
         return teamSide;
@@ -2120,7 +2381,7 @@ class MatchUI {
                     minute: '2-digit',
                     hour12: true
                 });
-        } else {
+            } else {
                 dateTime.textContent = 'Unknown date';
             }
         } else {
@@ -2139,7 +2400,7 @@ class MatchUI {
                 if (totalInQueue && totalInQueue > 0) {
                     if (queuePosition) {
                         return `Queue ${queuePosition}/${totalInQueue}`;
-        } else {
+                    } else {
                         return `Queue (${totalInQueue} total)`;
                     }
                 }
@@ -2165,19 +2426,31 @@ class MatchUI {
 
     /**
      * Get error badge configuration for terminal failure states
-     * @param {string|null} errorCode - Backend canonical error code
+     * @param {string|null} errorCode - Error code from backend or parser
      * @returns {{ short: string|null, long: string|null }}
      */
     static getErrorBadgeConfig(errorCode) {
         const map = {
-            // Backend permanent errors (from uploadErrorUtils.js)
-            INVALID_LOG_FORMAT: {
-                short: 'Invalid Log',
-                long: 'Combat log is corrupted or incomplete',
+            // Parser permanent errors (from @wow/combat-log-parser)
+            MISSING_HP_DATA: {
+                short: 'Missing Data',
+                long: 'Combat log is missing required HP data',
+            },
+            MISSING_IDENTITY_DATA: {
+                short: 'Missing Data',
+                long: 'Combat log is missing required identity data',
+            },
+            MISSING_ADVANCED_LOGGING: {
+                short: 'Advanced Logging',
+                long: 'Advanced Combat Logging was not enabled',
             },
             NO_MATCHES_FOUND: {
                 short: 'No Matches',
                 long: 'Log contains no arena matches',
+            },
+            MALFORMED_MATCHES: {
+                short: 'Invalid Log',
+                long: 'Arena matches found but all were malformed or incomplete',
             },
             // Desktop synthetic errors
             JOB_NOT_FOUND: {
@@ -2226,10 +2499,10 @@ class MatchUI {
                 console.error(`Local deletion for ${match.bufferId} failed.`, localError);
                 notificationMessage = 'Failed to delete match';
                 notificationType = 'error';
-                }
+            }
 
             // Refresh UI and show notification
-                await window.MatchDataService.refresh();
+            await window.MatchDataService.refresh();
             NotificationManager.show(notificationMessage, notificationType);
 
         } catch (error) {
@@ -2312,8 +2585,13 @@ class MatchUI {
 
 
     applyFilters() {
-        // Apply only bracket filtering
+        // Apply bracket and favourites filtering
         this.filteredMatches = this.recentMatches.filter(match => {
+            // Favourites filter - special filter type (not a bracket)
+            if (this.activeFilter === MatchUI.FILTER_FAVOURITES) {
+                return match.isFavourite === true;
+            }
+
             // Bracket filtering - only apply if brackets are selected
             if (this.activeBrackets.size > 0) {
                 const matchBracket = match.bracket; // Use bracket field from metadata
@@ -2331,13 +2609,22 @@ class MatchUI {
 
 
     renderFilteredMatches(append = false) {
-        // Only clear previous content on initial load
-        if (!append) {
-            this.recentMatchesList.innerHTML = '';
+        const matchesToRender = this.filteredMatches;
+
+        // Append mode: add new matches to existing list
+        if (append) {
+            const newMatches = matchesToRender.slice(this.renderedMatchCount);
+            if (newMatches.length > 0) {
+                this.appendNewMatches(newMatches);
+                this.renderedMatchCount = matchesToRender.length;
+            }
+            return;
         }
 
-        const matchesToRender = this.filteredMatches; // Always render the filtered list
+        // Full render: increment version to cancel any in-flight render (handles rapid filter clicks)
+        const renderVersion = ++this._renderVersion;
 
+        // Empty state
         if (!matchesToRender || matchesToRender.length === 0) {
             const emptyState = document.createElement('div');
             emptyState.className = 'empty-state';
@@ -2347,7 +2634,6 @@ class MatchUI {
             hintMessage.className = 'hint';
 
             if (this.filteredMatches.length === 0 && this.recentMatches.length > 0) {
-                // Filtered state - no matches for current filter
                 const filterMessages = this.getFilterSpecificMessage();
                 emptyMessage.textContent = filterMessages.main;
                 if (filterMessages.hint) {
@@ -2357,122 +2643,117 @@ class MatchUI {
                     emptyState.appendChild(emptyMessage);
                 }
             } else {
-                // No matches at all
                 emptyMessage.textContent = 'No matches detected yet';
                 hintMessage.textContent = 'Arena matches will appear here when detected';
                 emptyState.append(emptyMessage, hintMessage);
             }
-            this.recentMatchesList.appendChild(emptyState);
+            this.recentMatchesList.replaceChildren(emptyState);
+            this.renderedMatchCount = 0;
             return;
         }
 
-        // Handle append mode vs full render
-        if (append) {
-            // In append mode, only render new matches that haven't been rendered yet
-            const newMatches = matchesToRender.slice(this.renderedMatchCount);
-            if (newMatches.length > 0) {
-                this.appendNewMatches(newMatches);
-                this.renderedMatchCount = matchesToRender.length;
-            }
-        } else {
-            // Full render - reset count and render all
-            this.renderedMatchCount = 0;
-            const groupedMatches = this.groupMatchesByDate(matchesToRender);
+        // Full render: build DOM off-screen then swap (prevents rubberbanding)
+        const groupedMatches = this.groupMatchesByDate(matchesToRender);
+        const matchCount = matchesToRender.length;
 
-            for (const [dateLabel, matches] of Object.entries(groupedMatches)) {
-                const section = document.createElement('div');
-                section.className = 'date-section';
-
-                // Check if this date section should be collapsed
-                if (this.collapsedDates.has(dateLabel)) {
-                    section.classList.add('collapsed');
-                }
-
-                const { header } = this._createDateHeader(dateLabel, matches);
-
-                // Create animation wrapper for grid-template-rows animation
-                const gridWrapper = document.createElement('div');
-                gridWrapper.className = 'grid-animator';
-
-                const grid = document.createElement('div');
-                grid.className = 'match-grid';
-
-                // Ensure deterministic order: append cards sequentially in input order
-                (async () => {
-                    for (const match of matches) {
-                        const card = await this.createMatchCard(match);
-                        grid.appendChild(card);
-                    }
-                })();
-
-                gridWrapper.appendChild(grid);
-                section.append(header, gridWrapper);
-                this.recentMatchesList.appendChild(section);
-            }
-            this.renderedMatchCount = matchesToRender.length;
-        }
-    }
-
-    appendNewMatches(newMatches) {
-        // Get the last section and its corresponding date label from the DOM
-        let lastSection = this.recentMatchesList.querySelector('.date-section:last-of-type');
-        let lastGrid = lastSection ? lastSection.querySelector('.match-grid') : null;
-        let lastDateLabel = lastSection ? lastSection.querySelector('.date-header').textContent : null;
-
-        // Ensure deterministic order when appending new matches
         (async () => {
-            for (const match of newMatches) {
-                const card = await this.createMatchCard(match);
-                const matchDateLabel = this.getDateLabel(match);
+            try {
+                const fragment = document.createDocumentFragment();
 
-                if (matchDateLabel === lastDateLabel && lastGrid) {
-                    // The match belongs to the current last date group, so just append the card
-                    lastGrid.appendChild(card);
+                for (const [dateLabel, matches] of Object.entries(groupedMatches)) {
+                    // Abort if a newer render started (rapid filter clicks)
+                    if (renderVersion !== this._renderVersion) return;
 
-                    // Update data-total-matches for the existing date section
-                    const actualCount = lastGrid.children.length;
-                    const section = lastGrid.closest('.date-section');
-                    const dateCheckbox = section.querySelector('.date-select-checkbox');
-                    if (dateCheckbox) {
-                        dateCheckbox.setAttribute('data-total-matches', actualCount);
-                        this.updateDateCheckboxState(lastDateLabel);
-                    }
-                } else {
-                    // The date has changed, so we must create a new date section
                     const section = document.createElement('div');
                     section.className = 'date-section';
-
-                    // Check if this date section should be collapsed
-                    if (this.collapsedDates.has(matchDateLabel)) {
+                    if (this.collapsedDates.has(dateLabel)) {
                         section.classList.add('collapsed');
                     }
 
-                    const { header, dateCheckbox } = this._createDateHeader(matchDateLabel, [match]);
-
-                    // For append mode, override the event handler to dynamically collect matches
-                    dateCheckbox.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        const section = dateCheckbox.closest('.date-section');
-                        const matchCards = section.querySelectorAll('.match-card[data-buffer-id]');
-                        const dateMatchBufferIds = Array.from(matchCards).map(card => card.getAttribute('data-buffer-id')).filter(id => id);
-                        this.toggleSelectDate(matchDateLabel, dateMatchBufferIds, dateCheckbox.checked);
-                    });
+                    const { header } = this._createDateHeader(dateLabel, matches);
 
                     const gridWrapper = document.createElement('div');
                     gridWrapper.className = 'grid-animator';
 
                     const grid = document.createElement('div');
                     grid.className = 'match-grid';
-                    grid.appendChild(card);
+
+                    for (const match of matches) {
+                        if (renderVersion !== this._renderVersion) return;
+                        const card = await this.createMatchCard(match);
+                        grid.appendChild(card);
+                    }
 
                     gridWrapper.appendChild(grid);
                     section.append(header, gridWrapper);
-                    this.recentMatchesList.appendChild(section);
-
-                    // Update our references to the new "last" section and grid for subsequent matches in this batch
-                    lastGrid = grid;
-                    lastDateLabel = matchDateLabel;
+                    fragment.appendChild(section);
                 }
+
+                if (renderVersion !== this._renderVersion) return;
+
+                // Single DOM swap - no rubberbanding
+                this.recentMatchesList.replaceChildren(fragment);
+                this.renderedMatchCount = matchCount;
+            } catch (err) {
+                console.error('[MatchUI] renderFilteredMatches failed:', err);
+            }
+        })();
+    }
+
+    appendNewMatches(newMatches) {
+        // Find the last date section to potentially append to
+        let lastSection = this.recentMatchesList.querySelector('.date-section:last-of-type');
+        let lastGrid = lastSection ? lastSection.querySelector('.match-grid') : null;
+        const lastDateCheckbox = lastSection ? lastSection.querySelector('.date-select-checkbox[data-date]') : null;
+        let lastDateLabel = lastDateCheckbox ? lastDateCheckbox.getAttribute('data-date') : null;
+
+        (async () => {
+            try {
+                for (const match of newMatches) {
+                    const card = await this.createMatchCard(match);
+                    const matchDateLabel = this.getDateLabel(match);
+
+                    if (matchDateLabel === lastDateLabel && lastGrid) {
+                        // Same date group - just append
+                        lastGrid.appendChild(card);
+
+                        // Update date checkbox count
+                        const actualCount = Array.from(
+                            lastGrid.querySelectorAll('.match-checkbox[data-buffer-id]')
+                        ).filter(cb => cb.getAttribute('data-buffer-id')).length;
+                        const dateCheckbox = lastGrid.closest('.date-section')?.querySelector('.date-select-checkbox');
+                        if (dateCheckbox) {
+                            dateCheckbox.setAttribute('data-total-matches', actualCount);
+                            if (actualCount > 0) dateCheckbox.disabled = false;
+                            this.updateDateCheckboxState(lastDateLabel);
+                        }
+                    } else {
+                        // New date group - create section
+                        const section = document.createElement('div');
+                        section.className = 'date-section';
+                        if (this.collapsedDates.has(matchDateLabel)) {
+                            section.classList.add('collapsed');
+                        }
+
+                        const { header } = this._createDateHeader(matchDateLabel, [match]);
+
+                        const gridWrapper = document.createElement('div');
+                        gridWrapper.className = 'grid-animator';
+
+                        const grid = document.createElement('div');
+                        grid.className = 'match-grid';
+                        grid.appendChild(card);
+
+                        gridWrapper.appendChild(grid);
+                        section.append(header, gridWrapper);
+                        this.recentMatchesList.appendChild(section);
+
+                        lastGrid = grid;
+                        lastDateLabel = matchDateLabel;
+                    }
+                }
+            } catch (err) {
+                console.error('[MatchUI] appendNewMatches failed:', err);
             }
         })();
     }
@@ -2494,10 +2775,13 @@ class MatchUI {
 
 
     formatBracketName(bracket) {
+        const labels = MatchUI.getBracketLabels();
+        const displayNames = MatchUI.getBracketDisplayNames();
         const bracketMap = {
-            '2v2': '2v2 Arena',
-            '3v3': '3v3 Arena',
-            'Solo Shuffle': 'Solo Shuffle'
+            [labels.TwoVTwo]: displayNames.TwoVTwo,
+            [labels.ThreeVThree]: displayNames.ThreeVThree,
+            [labels.SoloShuffle]: displayNames.SoloShuffle,
+            [labels.Skirmish]: displayNames.Skirmish
         };
         return bracketMap[bracket] || bracket;
     }
@@ -2508,7 +2792,7 @@ class MatchUI {
         return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
     }
 
-    // Helper method to create date headers (eliminates duplication)
+    // Helper method to create date headers
     _createDateHeader(dateLabel, matches) {
         const header = document.createElement('div');
         header.className = 'date-header';
@@ -2516,36 +2800,41 @@ class MatchUI {
             header.classList.add('collapsed');
         }
 
-        // Add date checkbox for select all
+        // Date checkbox for "select all"
         const dateCheckbox = document.createElement('input');
         dateCheckbox.type = 'checkbox';
         dateCheckbox.className = 'date-select-checkbox';
         dateCheckbox.setAttribute('data-date', dateLabel);
         dateCheckbox.setAttribute('aria-label', `Select all matches for ${dateLabel}`);
 
-        // Collect all match bufferIds for this date
-        const dateMatchBufferIds = matches.map(m => m.bufferId).filter(id => id);
-        dateCheckbox.setAttribute('data-total-matches', dateMatchBufferIds.length);
+        // Count selectable matches
+        const selectableCount = matches.filter(m => m.bufferId && MatchUI.isSelectableStatus(m.currentStatus)).length;
+        dateCheckbox.setAttribute('data-total-matches', selectableCount);
 
-        // Set initial state based on current selection
-        const selectedInDate = this.selectedByDate.get(dateLabel);
-        const selectedCount = selectedInDate ? selectedInDate.size : 0;
-        if (selectedCount === 0) {
-            dateCheckbox.checked = false;
-            dateCheckbox.indeterminate = false;
-        } else if (selectedCount === dateMatchBufferIds.length && dateMatchBufferIds.length > 0) {
-            dateCheckbox.checked = true;
-            dateCheckbox.indeterminate = false;
+        if (selectableCount === 0) {
+            dateCheckbox.disabled = true;
         } else {
-            dateCheckbox.checked = false;
-            dateCheckbox.indeterminate = true;
-        }
+            // Set initial state
+            const selectedInDate = this.selectedByDate.get(dateLabel);
+            const selectedCount = selectedInDate ? selectedInDate.size : 0;
+            dateCheckbox.checked = selectedCount === selectableCount && selectableCount > 0;
+            dateCheckbox.indeterminate = selectedCount > 0 && selectedCount < selectableCount;
 
-        dateCheckbox.addEventListener('click', (e) => {
-            e.stopPropagation(); // Prevent collapse/expand
-            const isSelected = dateCheckbox.checked;
-            this.toggleSelectDate(dateLabel, dateMatchBufferIds, isSelected);
-        });
+            // Click handler queries DOM for current bufferIds (works for both full render and append)
+            dateCheckbox.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const section = dateCheckbox.closest('.date-section');
+                const checkboxes = section.querySelectorAll('.match-checkbox[data-buffer-id]');
+                const bufferIds = Array.from(checkboxes)
+                    .map(cb => cb.getAttribute('data-buffer-id'))
+                    .filter(Boolean);
+                if (bufferIds.length === 0) {
+                    dateCheckbox.checked = false;
+                    return;
+                }
+                this.toggleSelectDate(dateLabel, bufferIds, dateCheckbox.checked);
+            });
+        }
 
         // Create date/arrow button for collapse/expand
         const dateButton = document.createElement('button');
@@ -2602,6 +2891,11 @@ class MatchUI {
     }
 
     toggleSelectDate(dateLabel, matchBufferIds, isSelected) {
+        // Defensive: no-op if nothing to select (all matches are processing/non-terminal)
+        if (!matchBufferIds || matchBufferIds.length === 0) {
+            return;
+        }
+
         // NOTE: This method relies on .match-card[data-buffer-id] and .match-checkbox[data-buffer-id] selectors.
         // Any structural changes to match card DOM requires updating these selectors.
         if (isSelected) {
@@ -2864,8 +3158,8 @@ class MatchUI {
             this.isRecording = status.isRecording;
             this.updateRecordingDisabledState();
         } catch (error) {
-            // If IPC fails, assume not recording
-            this.isRecording = false;
+            // Keep last-known value on IPC error (no inference)
+            console.warn('[MatchUI] Failed to get recording status, keeping last-known value:', error);
             this.updateRecordingDisabledState();
         }
     }
@@ -2928,8 +3222,8 @@ class MatchUI {
             this.isInMatch = !!match;
             this.updateMatchDisabledState();
         } catch (error) {
-            // If IPC fails, assume no active match
-            this.isInMatch = false;
+            // Keep last-known value on IPC error (no inference)
+            console.warn('[MatchUI] Failed to get current match, keeping last-known value:', error);
             this.updateMatchDisabledState();
         }
     }
@@ -2940,12 +3234,184 @@ class MatchUI {
         this.updateRecordingDisabledState();
     }
 
-    // Cleanup method to prevent memory leaks
+    // Listen for settings changes (decoupled from SettingsUI)
+    setupSettingsListener() {
+        // Ensure idempotency - remove existing listener first
+        this.stopSettingsListener();
+
+        this._onSettingsUpdated = (event) => {
+            // Validate event shape explicitly
+            const detail = event.detail;
+            if (!detail || typeof detail !== 'object') {
+                console.error('[MatchUI] Invalid settings:updated event detail:', detail);
+                return;
+            }
+            if (detail.key === 'showMmrBadge') {
+                if (typeof detail.value !== 'boolean') {
+                    console.error('[MatchUI] Invalid showMmrBadge value from event:', typeof detail.value);
+                    return;
+                }
+                this.showMmrBadge = detail.value;
+                this.renderFilteredMatches(false);
+                return;
+            }
+
+            if (detail.key === 'defaultMistakeView') {
+                if (detail.value !== 'mine' && detail.value !== 'all') {
+                    console.error('[MatchUI] Invalid defaultMistakeView value from event:', detail.value);
+                    return;
+                }
+                this.defaultMistakeView = detail.value;
+            }
+        };
+        window.addEventListener('settings:updated', this._onSettingsUpdated);
+    }
+
+    // Stop listening for settings changes
+    stopSettingsListener() {
+        if (this._onSettingsUpdated) {
+            window.removeEventListener('settings:updated', this._onSettingsUpdated);
+            this._onSettingsUpdated = null;
+        }
+    }
+
+    /**
+     * Show context menu for match card
+     * @param {MouseEvent} e - The contextmenu event
+     * @param {Object} match - The match data
+     */
+    showMatchContextMenu(e, match) {
+        // Remove any existing context menu
+        this.hideMatchContextMenu();
+
+        const menu = document.createElement('div');
+        menu.className = 'match-context-menu';
+        menu.style.left = `${e.clientX}px`;
+        menu.style.top = `${e.clientY}px`;
+
+        // Show in Folder option
+        const openLocationOption = document.createElement('div');
+        openLocationOption.className = 'context-menu-item';
+        const folderIcon = AssetManager.createSvgIcon({
+            pathData: 'M20 6h-8l-2-2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z'
+        });
+        const folderLabel = document.createElement('span');
+        folderLabel.textContent = 'Show in Folder';
+        openLocationOption.appendChild(folderIcon);
+        openLocationOption.appendChild(folderLabel);
+        openLocationOption.addEventListener('click', async () => {
+            this.hideMatchContextMenu();
+            try {
+                if (!match.bufferId) {
+                    NotificationManager.show('No recording found for this match', 'info');
+                    return;
+                }
+                // Use ID-based reveal - main process looks up path from metadata
+                const result = await window.arenaCoach.recording.revealVideoInFolder(match.bufferId);
+                if (!result.success) {
+                    if (result.code === 'NO_MEDIA') {
+                        NotificationManager.show('No recording found for this match', 'info');
+                    } else if (result.code === 'NOT_FOUND') {
+                        NotificationManager.show('Recording file not found', 'warning');
+                    } else {
+                        NotificationManager.show(`Failed to open folder: ${result.error}`, 'error');
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to show in folder:', error);
+                NotificationManager.show('Failed to open folder', 'error');
+            }
+        });
+        menu.appendChild(openLocationOption);
+
+        // Export Match Log option
+        const exportOption = document.createElement('div');
+        exportOption.className = 'context-menu-item';
+        const exportIcon = AssetManager.createSvgIcon({
+            pathData: 'M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm4 18H6V4h7v5h5v11zm-3-7v4h-2v-4H9l4-4 4 4h-2z'
+        });
+        const exportLabel = document.createElement('span');
+        exportLabel.textContent = 'Export Match Log';
+        exportOption.appendChild(exportIcon);
+        exportOption.appendChild(exportLabel);
+        exportOption.addEventListener('click', async () => {
+            this.hideMatchContextMenu();
+            try {
+                if (!match.bufferId) {
+                    NotificationManager.show('No match data available to export', 'info');
+                    return;
+                }
+                const result = await window.arenaCoach.logs.export(match.bufferId);
+                if (result.success) {
+                    // zipPath guaranteed by discriminated union
+                    const revealResult = await window.arenaCoach.shell.showItemInFolder(result.zipPath);
+                    if (revealResult.success) {
+                        NotificationManager.show('Match log exported to Downloads', 'success');
+                    } else {
+                        NotificationManager.show('Match log exported to Downloads', 'success');
+                        console.warn('[MatchUI] Could not reveal exported file:', revealResult.error, revealResult.code);
+                    }
+                } else {
+                    // error guaranteed by discriminated union
+                    NotificationManager.show(`Export failed: ${result.error}`, 'error');
+                }
+            } catch (error) {
+                console.error('Failed to export match log:', error);
+                NotificationManager.show('Failed to export match log', 'error');
+            }
+        });
+        menu.appendChild(exportOption);
+
+        // Prevent native context menu on the custom menu itself
+        menu.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+
+        document.body.appendChild(menu);
+
+        // Track close handler for cleanup
+        const closeHandler = (event) => {
+            if (!menu.contains(event.target)) {
+                this.hideMatchContextMenu();
+            }
+        };
+
+        // Store handler reference for cleanup
+        this._contextMenuCloseHandler = closeHandler;
+
+        // Attach close listeners immediately (stopPropagation on originating event prevents immediate close)
+        document.addEventListener('click', closeHandler);
+        document.addEventListener('contextmenu', closeHandler);
+    }
+
+    /**
+     * Hide the match context menu
+     */
+    hideMatchContextMenu() {
+        // Remove listeners if they exist
+        if (this._contextMenuCloseHandler) {
+            document.removeEventListener('click', this._contextMenuCloseHandler);
+            document.removeEventListener('contextmenu', this._contextMenuCloseHandler);
+            this._contextMenuCloseHandler = null;
+        }
+
+        const existingMenu = document.querySelector('.match-context-menu');
+        if (existingMenu) {
+            existingMenu.remove();
+        }
+    }
+
     destroy() {
+        // Clean up context menu if open
+        this.hideMatchContextMenu();
+
         // Stop recording state monitoring
         this.stopRecordingStateMonitoring();
         // Stop match state monitoring
         this.stopMatchActiveMonitoring();
+        // Stop settings listener
+        this.stopSettingsListener();
 
         this.ipcListeners.forEach(cleanup => cleanup());
         this.ipcListeners = [];

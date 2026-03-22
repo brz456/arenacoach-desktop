@@ -32,6 +32,10 @@ video/audio settings, live preview, and storage quota enforcement.
 8. [Recording Flow](#recording-flow)
 9. [Error Handling](#error-handling)
 10. [Performance](#performance)
+11. [Configuration Reference](#configuration-reference)
+12. [Troubleshooting](#troubleshooting)
+13. [Known Limitations](#known-limitations)
+14. [Related Documentation](#related-documentation)
 
 ---
 
@@ -86,7 +90,8 @@ initialize(): Promise<void>
 
 // Recording lifecycle
 startRecording(outputPath?: string): Promise<string>
-stopRecording(): Promise<string | null>
+stopRecording(): Promise<StopRecordingResult>
+// StopRecordingResult = { ok: true, filePath, durationSeconds } | { ok: false, reason, error?, durationSeconds }
 
 // Settings
 updateOutputDirectory(newDirectory: string): void
@@ -114,7 +119,7 @@ getMonitors(): { id: string, name: string }[]
 setMonitorById(monitorId: string): boolean
 
 // Storage
-enforceStorageQuota(maxStorageGB: number): Promise<void>
+enforceStorageQuota(maxStorageGB: number, protectedVideoPaths?: Set<string>): Promise<StorageQuotaEnforcementResult>
 
 // Cleanup
 shutdown(): Promise<void>
@@ -128,7 +133,7 @@ constructor(config: OBSRecorderConfig)
 interface OBSRecorderConfig {
   outputDir?: string;      // Default: {videos}/ArenaCoach/Recordings/
   resolution?: Resolution;
-  fps?: number;
+  fps?: 30 | 60;
   bitrate?: number;
   encoder?: EncoderType;
   audioDevice?: string;
@@ -141,7 +146,7 @@ interface OBSRecorderConfig {
 
 - `isInitialized` flag
 - Video context (destroyed on shutdown)
-- OBS working directory: `./node_modules/obs-studio-node/`
+- OBS working directory: resolved via `getOBSWorkingDirectory()` (packaging-safe)
 - OBS data directory: `{userData}/osn-data/`
 
 **Recording (Per-Session State Machine):**
@@ -154,7 +159,7 @@ interface OBSRecorderConfig {
   - `startTime: Date`, `stopTime: Date`
 - Stop coordination: Promise + resolver (signal-driven, per-session)
 - Derives `isRecording` from
-  `currentSession.status === 'recording' | 'stopping'`
+  `currentSession.status === 'recording' || currentSession.status === 'stopping'`
 
 **Settings:**
 
@@ -164,7 +169,7 @@ interface OBSRecorderConfig {
 
 - At most one recording session at any time
 - Session IDs prevent cross-session contamination
-- Stop timeout returns `null` (never stale paths from previous sessions)
+- Stop timeout (120s hard) returns `StopRecordingResult` with `reason: 'stop_timeout'` (never stale paths from previous sessions)
 
 ### Events
 
@@ -180,19 +185,20 @@ emit('shutdown')
 
 ```typescript
 DEFAULT_OUTPUT_DIR = '{videos}/ArenaCoach/Recordings/';
-OBS_WORKING_DIR = './node_modules/obs-studio-node/';
+OBS_WORKING_DIR = getOBSWorkingDirectory(); // packaging-safe resolution
 OBS_DATA_DIR = '{userData}/osn-data/';
-STOP_TIMEOUT_MS = 10000; // 10-second failsafe
+WARN_TIMEOUT_MS = 30000; // 30-second warning (logs only)
+HARD_TIMEOUT_MS = 120000; // 120-second hard timeout (resolves stop_timeout)
 ```
 
 ### Initialization Sequence
 
 1. **ASAR Path Fixing** - Handles `.asar.unpacked` for packaged apps
-2. **IPC Connection** - Named pipe: `arenacoach-obs-{uuid}`
-3. **OBS Startup** - `obs.NodeObs.OBS_API_initAPI(locale, obsPath, dataPath)`
+2. **IPC Connection** - Named pipe: `arena-coach-obs`
+3. **OBS Startup** - `osn.NodeObs.OBS_API_initAPI(locale, dataDir, version, '')`
 4. **Video Context** - Creates global video context with resolution/FPS
-5. **Capture Manager** - Initializes scene and sources
-6. **Settings Manager** - Configures output and encoder
+5. **Settings Manager** - Configures output and encoder
+6. **Capture Manager** - Initializes scene and sources
 7. **Signal Handler** - Monitors output signals for recording events
 
 ### Recording Lifecycle (V3: Per-Session)
@@ -205,38 +211,42 @@ startRecording(outputPath?)
   ├─ Generate unique session ID (randomUUID)
   ├─ Create currentSession { id, status: 'starting', outputDir, ... }
   ├─ Set recording directory
-  ├─ Call obs.NodeObs.OBS_service_startRecording()
+  ├─ Call osn.NodeObs.OBS_service_startRecording()
   ├─ Wait for 'start' signal → transition to 'recording'
   └─ Return directory path
 ```
 
-**Stop (Signal-Driven, Per-Session):**
+**Stop (Signal-Driven, Per-Session, Two-Phase Timeout):**
 
 ```typescript
-stopRecording()
+stopRecording() → StopRecordingResult
   ├─ Precondition: currentSession exists and status !== 'idle'
+  │   └─ If no session: return { ok: false, reason: 'no_active_session', durationSeconds: 0 }
   ├─ Idempotency: return existing stopPromise if already stopping
   ├─ Capture sessionId and startTime (for duration after cleanup)
   ├─ Transition currentSession.status = 'stopping'
   ├─ Create Promise + resolver (stored per-session)
-  ├─ Set up 10s timeout failsafe
-  │   └─ On timeout: resolve(null), clear session (no stale paths)
-  ├─ Call obs.NodeObs.OBS_service_stopRecording()
+  ├─ Set up two-phase timeout:
+  │   ├─ Warn timer (30s): logs warning, does NOT resolve or clear session
+  │   └─ Hard timer (120s): resolve({ ok: false, reason: 'stop_timeout', durationSeconds }), clear session
+  ├─ Call osn.NodeObs.OBS_service_stopRecording()
   ├─ Wait for 'stop' signal from OBS (temporal correlation)
   │   ├─ Guard: ignore stale signals (check session status)
   │   ├─ Call getLastRecording() once per session
-  │   ├─ Store filePath in currentSession
-  │   ├─ Clear timeout, resolve promise
+  │   ├─ If filePath: resolve({ ok: true, filePath, durationSeconds })
+  │   ├─ If no filePath: resolve({ ok: false, reason: 'stop_error', error: '...no recording path', durationSeconds })
+  │   ├─ Clear timeouts, resolve promise
   │   └─ Set currentSession = null
-  ├─ Compute duration from captured startTime
-  └─ Return filePath (string | null)
+  ├─ On error signal (code !== 0 or writing_error):
+  │   └─ resolve({ ok: false, reason: 'write_error' | 'stop_error', durationSeconds })
+  └─ Return StopRecordingResult
 ```
 
 **Error Recovery:** (via shared `handleRecordingError` helper)
 
-- Exception in stop: clears timeout and session, throws
-- Stop signal with non-zero code: emits `recordingError` event, resolves with null
-- `writing_error` signal: emits `recordingError` event, resolves with null
+- Exception in stop: clears timeouts and session, emits `error`, returns `{ ok: false, reason: 'stop_error', error: 'Stop failed: ...', durationSeconds }` (no throw)
+- Stop signal with non-zero code: emits `recordingError` event, resolves with `StopRecordingResult` (`reason: 'stop_error'`)
+- `writing_error` signal: emits `recordingError` event, resolves with `StopRecordingResult` (`reason: 'write_error'`)
 
 ### Shutdown Sequence
 
@@ -250,7 +260,7 @@ stopRecording()
 
 - **Promise-based stop coordination** - Stop is signal-driven, not immediate
 - **Diff-based settings application** - Only applies changed settings
-- **Video context reinitialization** - FPS/resolution changes require rebuild
+- **Video context updates** - FPS/resolution changes update context.video and trigger capture rescaling (with rollback on failure)
 - **ASAR path fixing** - Handles Electron packaging
 - **Graceful shutdown** - Cleanup in reverse initialization order
 
@@ -266,8 +276,13 @@ window attachment with exponential backoff.
 ### Key APIs
 
 ```typescript
+import * as osn from 'obs-studio-node';
+
+// Type alias for video context
+type VideoContext = ReturnType<typeof osn.VideoFactory.create>;
+
 // Initialization
-initialize(context: IVideoContext): Promise<void>
+initialize(context: VideoContext): Promise<void>
 
 // WoW detection
 tryAttachToWoWWindow(): void
@@ -276,7 +291,7 @@ setWoWActive(active: boolean): void
 
 // Capture modes
 setGameCaptureEnabled(enabled: boolean): void
-applyCaptureMode(mode: CaptureMode): void
+applyCaptureMode(mode: CaptureMode): boolean  // Returns false on failure; callers must not update settings when false
 setCaptureCursor(enabled: boolean): boolean
 
 // Audio
@@ -292,17 +307,18 @@ listMonitors(): { id: string, name: string }[]
 setMonitorById(monitorId: string): boolean
 
 // Utilities
-rescaleToNewDimensions(context: IVideoContext): void
-releaseAll(): void
+rescaleToNewDimensions(context: VideoContext): void
+releaseAll(): boolean  // Returns true if all resources released successfully
 getScene(): IScene | null
 ```
 
 ### Constructor
 
 ```typescript
-constructor(options?: { hookCheckDelayMs?: number })
+constructor(options?: { hookCheckDelayMs?: number; supervisor?: ObsIpcSupervisor })
 
 // Default hookCheckDelayMs: 500ms
+// supervisor: Optional callback for fatal IPC error escalation
 ```
 
 ### Source Architecture
@@ -313,7 +329,7 @@ time)
 **Sources:**
 
 1. **Game Capture** - `game_capture` input (WoW DirectX hook)
-2. **Window Capture** - `window_capture` input (fallback when hook fails)
+2. **Window Capture** - `window_capture` input (alternative capture mode; selected via settings)
 3. **Monitor Capture** - `monitor_capture` input (full screen capture)
 4. **Desktop Audio** - `wasapi_output_capture` (system audio)
 5. **Microphone** - `wasapi_input_capture` (microphone input)
@@ -321,10 +337,14 @@ time)
    enumeration; created once via `ensureDummyWindowCapture()`, reused across
    polls, released in `releaseAll()`
 
-**Capture Modes:**
+**Capture Modes:** (enum from `RecordingTypes.ts`)
 
 ```typescript
-type CaptureMode = 'game_capture' | 'window_capture' | 'monitor_capture';
+enum CaptureMode {
+  GAME = 'game_capture',
+  WINDOW = 'window_capture',
+  MONITOR = 'monitor_capture'
+}
 ```
 
 ### WoW Window Detection
@@ -355,8 +375,10 @@ No max attempts (continues while enabled)
 **Hook Detection:**
 
 - After attaching to window, waits `hookCheckDelayMs` (500ms)
-- Checks if game capture shows actual content (hooked)
-- If not hooked: assumes WoW not running or hook failed
+- Checks for non-zero width/height on game capture source
+- If dimensions available: scales source and starts dimension monitoring
+- If dimensions stay 0 while attached and attempts exceed `LOST_SOURCE_ATTEMPTS`: disables source and schedules reattach with backoff (lost source detection)
+- Scaling checks stop after `MAX_SCALE_ATTEMPTS` (no-op terminal branch)
 - Continues polling with backoff while game capture enabled
 
 **Window Capture Mode - Continuous Polling:**
@@ -364,10 +386,10 @@ No max attempts (continues while enabled)
 - Uses persistent dummy window capture to refresh window list
 - 5-second interval between polls
 - Dummy created once, reused across polls, released only in `releaseAll()`
-- No fixed attempt limit; polls continuously while window capture mode is active
 - Pattern: `[Wow.exe]: World of Warcraft`
-- Stops when: Window found with valid dimensions (success attach) OR capture
-  mode switches away from Window OR shutdown
+- **Continues polling even after WoW found** to detect window resizes and rescale
+- Rescales automatically when source dimensions change
+- Stops only when: mode switches away from WINDOW, shutdown, or fatal IPC error
 
 ### Capture Modes
 
@@ -382,7 +404,7 @@ No max attempts (continues while enabled)
 
 - **Target:** Specific window title
 - **Method:** Window composition capture
-- **Best for:** Fallback when hook fails
+- **Best for:** Windowed/borderless scenarios or when game capture can't hook; selected via settings/UI (no automatic fallback)
 - **Limitation:** Higher overhead than game capture
 
 **Monitor Capture:**
@@ -432,12 +454,16 @@ When video context resolution changes:
 
 ```typescript
 rescaleToNewDimensions(newContext)
-  ├─ Calculate scale factors (newWidth / oldWidth, newHeight / oldHeight)
-  ├─ For each source:
-  │   ├─ Get current bounds
-  │   ├─ Apply scale factors
-  │   └─ Update source bounds
-  └─ Maintains aspect ratios and positioning
+  ├─ Store new video context reference
+  ├─ Based on currentCaptureMode:
+  │   ├─ GAME → trigger checkAndScaleSource() for game capture
+  │   ├─ WINDOW → trigger checkAndScaleWindowSource() for window capture
+  │   └─ MONITOR → trigger checkAndScaleMonitorSource() for monitor capture
+  └─ Scale logic: fit source to output while maintaining aspect ratio
+      ├─ scaleX = outputWidth / sourceWidth
+      ├─ scaleY = outputHeight / sourceHeight
+      ├─ scale = min(scaleX, scaleY)
+      └─ Center scaled source in output canvas
 ```
 
 ### Key Patterns
@@ -487,13 +513,13 @@ constructor(
 
 ### Quality Presets
 
-**Bitrate (for NVIDIA/AMD encoders):**
+**Bitrate (from QUALITY_BITRATE_KBPS_MAP in RecordingTypes.ts):**
 
 ```typescript
-LOW:    4000 kbps  (4 Mbps)
-MEDIUM: 6000 kbps  (6 Mbps)
-HIGH:   8000 kbps  (8 Mbps)
-ULTRA:  12000 kbps (12 Mbps)
+LOW:    3000 kbps  (3 Mbps)
+MEDIUM: 4500 kbps  (4.5 Mbps)
+HIGH:   6500 kbps  (6.5 Mbps)
+ULTRA:  9000 kbps  (9 Mbps)
 ```
 
 **CRF (for x264 encoder):**
@@ -507,8 +533,15 @@ ULTRA:  12000 kbps (12 Mbps)
 ```typescript
 '1280x720'; // 720p
 '1920x1080'; // 1080p
+'1920x1200'; // 16:10
+'2560x1080'; // 21:9
 '2560x1440'; // 1440p
+'2560x1600'; // 16:10
+'3440x1200'; // 21:9
 '3440x1440'; // Ultrawide 1440p
+'3840x1080'; // 32:9
+'3840x1600'; // 21:9
+'3840x2160'; // 4K
 ```
 
 ### Encoder Support
@@ -531,9 +564,9 @@ Format:** Standard (not streaming optimized)
 ### Key Patterns
 
 - **OBS settings API wrapper** - Abstracts complex settings structures
-- **Encoder-specific quality** - x264 uses CRF, NVIDIA/AMD use bitrate
+- **Encoder-specific quality** - `configureEncoderQuality()` sets CRF for x264, CQP for NVENC/AMD; `setQuality()` writes `Output.Recbitrate` using `QUALITY_BITRATE_KBPS_MAP`
 - **Subcategory iteration** - OBS settings organized hierarchically
-- **Default fallbacks** - Handles missing audio devices gracefully
+- **Audio device handling** - Returns default device entry on empty/error (errors logged); device IDs may be 'default' when OSN omits ID
 
 ---
 
@@ -602,178 +635,6 @@ interface PreviewBounds {
 
 ---
 
-## OBSSettingsManager
-
-**File:** `OBSSettingsManager.ts`
-
-**Responsibility:** Manages OBS configuration through the settings API.
-
-### Key APIs
-
-```typescript
-getVideoSettings(): IVideoInfo
-configureOutput(config?: OBSRecorderConfig): void
-applySetting(category: string, parameter: string, value: string | number): boolean
-updateConfig(config: Partial<OBSRecorderConfig>): void
-setResolution(resolution: Resolution): void
-setFPS(fps: 30 | 60): void
-setQuality(quality: RecordingQuality): void
-getInputAudioDevices(): AudioDevice[]
-getOutputAudioDevices(): AudioDevice[]
-```
-
-### Constructor
-
-```typescript
-constructor(
-  config: OBSRecorderConfig,
-  options?: { defaultQuality?: number }
-)
-```
-
-### OBS Settings Categories
-
-**Video:**
-
-- Base resolution (canvas size)
-- Output resolution (scaled)
-- FPS (30 or 60)
-- Downscale filter: Lanczos (best quality)
-
-**Output:**
-
-- Mode: Advanced
-- Recording path
-- Recording format: MP4 container
-- Encoder selection
-- Encoder settings (rate control, bitrate, or CRF)
-
-**Audio:**
-
-- Sample rate: 44.1 kHz
-- Channels: Stereo
-- Desktop audio device
-- Microphone device
-
-### Quality Configuration
-
-**Default Encoder Configuration (configureEncoderQuality):**
-
-```typescript
-// Sets rate control mode and CRF/CQP based on encoder
-configureEncoderQuality(encoder, defaultQuality) {
-  if (encoder === 'x264') {
-    applySetting('Output', 'Recrate_control', 'CRF');
-    applySetting('Output', 'Reccrf', defaultQuality); // Default: 23
-  } else {
-    applySetting('Output', 'Recrate_control', 'CQP');
-    applySetting('Output', 'Reccqp', defaultQuality); // Default: 23
-  }
-}
-```
-
-**Runtime Quality Changes (setQuality):**
-
-```typescript
-setQuality(quality: RecordingQuality) {
-  // Uses bitrate-based presets for runtime changes
-  const bitrates = {
-    LOW: 4000,    // 4 Mbps
-    MEDIUM: 6000, // 6 Mbps
-    HIGH: 8000,   // 8 Mbps
-    ULTRA: 12000  // 12 Mbps
-  };
-  applySetting('Output', 'Recbitrate', bitrates[quality]);
-}
-```
-
-### Audio Device Enumeration
-
-**Input Devices (Microphones):**
-
-```typescript
-getInputAudioDevices() → AudioDevice[]
-
-interface AudioDevice {
-  id: string;      // Hardware ID
-  name: string;    // Display name
-}
-```
-
-**Output Devices (Desktop Audio):**
-
-```typescript
-getOutputAudioDevices() → AudioDevice[]
-```
-
-### Key Patterns
-
-- **Settings API wrapper** - Abstracts OBS subcategory iteration
-- **Encoder-specific quality** - Different settings for different encoders
-- **Fallback handling** - Gracefully handles missing devices
-- **Centralized configuration** - All OBS settings go through this service
-
----
-
-## OBSPreviewManager
-
-**File:** `OBSPreviewManager.ts`
-
-**Responsibility:** Live preview display overlay for the Scene tab.
-
-### Key APIs
-
-```typescript
-setMainWindow(window: BrowserWindow): void
-setScene(scene: IScene): void
-showPreview(bounds: PreviewBounds): Promise<void>
-updatePreviewBounds(bounds: PreviewBounds): Promise<void>
-hidePreview(): void
-destroyPreview(): void
-```
-
-### State
-
-- Main window reference (for native handle)
-- Scene reference
-- Preview created/visible flags
-
-### Lifecycle
-
-**Setup:**
-
-1. Call `setMainWindow(window)` - Stores native window reference
-2. Call `setScene(scene)` - Sets scene to display
-
-**Show:**
-
-1. Creates preview display (lazy, on first show)
-2. Positions at specified bounds
-3. Starts rendering
-
-**Hide:**
-
-- Moves preview to (50000, 50000) - Far offscreen
-- Does not destroy (efficiency)
-
-**Destroy:**
-
-- Called only on shutdown
-- Releases display resources
-
-### Preview Display
-
-**Name:** `'scene-preview'` **Offscreen coordinates:** (50000, 50000)
-
-### Key Patterns
-
-- **Lazy creation** - Created on first use
-- **Offscreen for hide** - More efficient than destroy/recreate
-- **Bounds synchronization** - Matches renderer calculations
-- **No mid-lifecycle destruction** - Only destroyed on shutdown
-
----
-
 ## RecordingStorageManager
 
 **File:** `RecordingStorageManager.ts`
@@ -784,7 +645,7 @@ destroyPreview(): void
 
 ```typescript
 getRecordingsUsedSpace(): Promise<number>  // Returns GB
-enforceStorageQuota(maxStorageGB: number): Promise<void>
+enforceStorageQuota(maxStorageGB: number, protectedVideoPaths?: Set<string>): Promise<StorageQuotaEnforcementResult>
 updateOutputDirectory(newDirectory: string): void
 ```
 
@@ -806,16 +667,22 @@ constructor(defaultOutputDir: string)
 **Quota Enforcement:**
 
 ```typescript
-enforceStorageQuota(maxStorageGB: number)
+enforceStorageQuota(maxStorageGB: number, protectedVideoPaths?: Set<string>) → StorageQuotaEnforcementResult
   ├─ Get current usage
   ├─ If over quota:
   │   ├─ List all .mp4 files
   │   ├─ Sort by mtime (oldest first)
-  │   ├─ Delete files until under quota
+  │   ├─ Skip files in protectedVideoPaths (favourited recordings)
+  │   ├─ Delete unprotected files until under quota
   │   ├─ Delete associated thumbnails
-  │   └─ Log deletions
+  │   ├─ Log deletions (warn if protected paths prevented reaching quota)
+  │   └─ Return { exceeded: true, deleted: [...], ... }
   └─ Skip if under quota or quota = 0 (unlimited)
+  └─ Return { exceeded: false, deleted: [], ... }
 ```
+
+**Note:** RecordingService updates metadata for deleted recordings to
+`recordingStatus: 'deleted_quota'` using the returned deletion details.
 
 ### Key Patterns
 
@@ -845,7 +712,7 @@ enum CaptureMode {
 }
 
 // Resolutions
-type Resolution = '1280x720' | '1920x1080' | '2560x1440' | '3440x1440';
+type Resolution = keyof typeof RESOLUTION_DIMENSIONS;
 
 // Quality presets
 enum RecordingQuality {
@@ -910,7 +777,9 @@ OBS Studio Node type definitions and enums (imported from native bindings).
 
 ---
 
-## Recording Flow (V3: BufferId-First, Lifecycle-Driven)
+## Recording Flow
+
+V3 architecture: BufferId-first, lifecycle-driven.
 
 ### Architecture Overview
 
@@ -957,10 +826,10 @@ MatchLifecycleService.handleMatchEnded(event)
   │       └─ stopRecordingForMatch({ bufferId, outcome: 'complete' })
   │           ├─ OBSRecorder.stopRecording()
   │           │   ├─ Transition session 'stopping'
-  │           │   ├─ Wait for 'stop' signal (10s timeout)
-  │           │   ├─ Get filePath from OBS (or null)
+  │           │   ├─ Wait for 'stop' signal (30s warn, 120s hard timeout)
+  │           │   ├─ Get StopRecordingResult from OBS
   │           │   ├─ Clear session
-  │           │   └─ Return filePath
+  │           │   └─ Return StopRecordingResult
   │           ├─ Rename: {bufferId}.mp4
   │           ├─ Generate thumbnail: Thumbnails/{bufferId}.jpg
   │           ├─ MetadataService.updateVideoMetadataByBufferId(bufferId, videoData)
@@ -1016,17 +885,18 @@ User changes settings via UI
 IPC: scene.updateSettings(updates)
   ↓
 RecordingService.applyRecordingSettings(settings)
-  ├─ Validate: Not recording OR setting is "safe"
-  ├─ Call OBSRecorder.applyRecordingSettings(settings)
+  ├─ Guard: !this.isEnabled → return false
+  ├─ Delegate to OBSRecorder.applyRecordingSettings(settings)
+  │   ├─ Validate: Not recording/stopping OR setting is "safe" (blocks UNSAFE during recording)
   │   ├─ Diff against current settings
-  │   ├─ Apply only changed settings:
-  │   │   ├─ Resolution/FPS → Reinitialize video context
+  │   ├─ Apply only changed settings (transactional with rollback on failure):
+  │   │   ├─ Resolution/FPS → Reinitialize video context (rollback settingsManager on failure)
   │   │   ├─ Quality → OBSSettingsManager.setQuality()
   │   │   ├─ Encoder → OBSRecorder.setEncoder()
-  │   │   ├─ Capture mode → OBSCaptureManager.applyCaptureMode()
+  │   │   ├─ Capture mode → OBSCaptureManager.applyCaptureMode() (boolean; only commit on true)
   │   │   ├─ Audio → OBSCaptureManager.setDesktopAudio/Microphone()
-  │   │   └─ Cursor → OBSCaptureManager.setCaptureCursor()
-  │   └─ Update currentSettings cache
+  │   │   └─ Cursor → OBSCaptureManager.setCaptureCursor() (boolean; only commit on true)
+  │   └─ Update currentSettings cache only for successfully applied changes
   └─ Persist to SettingsService
 ```
 
@@ -1098,15 +968,16 @@ expansion point)
 
 **Stop failures:**
 
-- Signal timeout (10s failsafe)
-- File write errors
+- Signal timeout (30s warn logs only, 120s hard timeout resolves `stop_timeout`)
+- File write errors (`write_error`, `stop_error`)
 - OBS crash during recording
 
 **Handling:**
 
-- All thrown as errors
-- RecordingService logs and emits error events
-- Session state cleaned up
+- Start failures: thrown from `startRecording()`
+- Stop failures: returned as `StopRecordingResult` `{ ok: false, reason, error?, durationSeconds }` (not thrown)
+- Errors emitted via `recordingError` / `error` events
+- Session state cleaned up in all cases
 
 ### File Operation Errors
 
@@ -1133,8 +1004,8 @@ expansion point)
 
 - Game capture: Continues with unbounded exponential backoff (500ms → 30s max)
   while enabled
-- Window capture: Continuous polling (5-second interval, no attempt limit) while
-  window mode active, stops when window found or mode changed
+- Window capture: Continuous polling (5-second interval) while window mode active;
+  continues after WoW found to detect resizes; stops only on mode switch/shutdown/fatal IPC
 
 **Hook failures:**
 
@@ -1186,8 +1057,7 @@ expansion point)
 ### Polling Overhead
 
 - **WoW detection:** Negligible CPU usage when active
-- **Window enumeration:** Minimal overhead (dummy input creation is local OBS
-  API call)
+- **Window enumeration:** Uses persistent dummy input; per-poll tick refreshes settings/properties (no per-tick source creation)
 
 ---
 
@@ -1198,7 +1068,7 @@ expansion point)
 ```typescript
 // Video (from SettingsService defaults)
 DEFAULT_RESOLUTION = '1920x1080';
-DEFAULT_FPS = 60;
+DEFAULT_FPS = 30;
 DEFAULT_QUALITY = 'medium';
 DEFAULT_ENCODER = 'x264';
 
@@ -1225,7 +1095,8 @@ WOW_MAX_BACKOFF_MS = 30000;
 WINDOW_POLL_INTERVAL_MS = 5000;
 
 // Timeouts
-RECORDING_STOP_TIMEOUT_MS = 10000;
+RECORDING_STOP_WARN_TIMEOUT_MS = 30000; // logs warning only
+RECORDING_STOP_HARD_TIMEOUT_MS = 120000; // resolves stop_timeout
 VIDEO_RENAME_RETRY_DELAY_MS = 1000;
 VIDEO_RENAME_MAX_RETRIES = 3;
 ```
@@ -1300,8 +1171,9 @@ Enable verbose logging for detailed diagnostics.
 
 ### OBS Version Compatibility
 
-**Tested with:** OBS Studio Node 28.x - 30.x **Incompatibilities:** Major OBS
-versions may change API
+**Bundled:** obs-studio-node `osn-0.25.34-release-win64` (pinned in package.json)
+
+**Incompatibilities:** Major OBS versions may change API
 
 ### Hardware Acceleration
 
@@ -1315,9 +1187,12 @@ versions may change API
 - Requires AMD GPU with VCE/VCN
 - RX 400 series or newer
 
-**Fallback:**
+**Default Encoder:**
 
-- Always falls back to x264 software encoder
+- Default preference is `x264` (from settings defaults) in `auto` mode
+- Runtime does encoder probe + selection via `resolveEncoderSelection(...)`
+- In `auto` mode it picks the best available supported H.264 encoder
+- If probe data is unavailable, it falls back to `obs_x264`
 
 ### Concurrent Recording Limitation
 
@@ -1337,5 +1212,3 @@ versions may change API
   desktop documentation
 
 ---
-
-**Last Updated:** November 22, 2025 (V3 Integration)

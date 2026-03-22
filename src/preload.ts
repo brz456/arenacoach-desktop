@@ -1,14 +1,25 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import { StoredMatchMetadata, RecordingStatusType } from './match-detection/types/StoredMatchTypes';
+import { StoredMatchMetadata } from './match-detection/types/StoredMatchTypes';
 import { MatchMetadata } from './match-detection/types/MatchMetadata';
-import type { WindowBounds } from './services/SettingsService';
+import type { AppSettings } from './services/SettingsService';
 import type { RecordingSettings } from './services/RecordingTypes';
 import type { FreemiumQuotaFields } from './Freemium';
+import type { RevealResult, RecordingInfoResult } from './ipc/ipcTypes';
+import type { AuthToken, UserInfo, LoginResult } from './authTypes';
+import type { JobRetryPayload } from './match-detection/types/JobRetryPayload';
+import {
+  BRACKET_BY_SLUG,
+  BRACKET_LABEL_SKIRMISH,
+  ARENA_MAP_IMAGE_KEYS,
+  SPEC_BY_ID,
+  SPEC_ICON_KEYS,
+  CLASS_NAME_TO_ICON_SLUG,
+  getRatingIconSlug,
+} from '@wow/game-data';
 
 // Types for the API
 export interface WoWInstallation {
   path: string;
-  version: 'retail' | 'classic' | 'classic_era';
   combatLogPath: string;
   addonsPath: string;
   addonInstalled: boolean;
@@ -34,29 +45,6 @@ export interface CombatLogSession {
   isActive: boolean;
   matchType?: string;
   matchBracket?: number;
-}
-
-export interface AuthToken {
-  accessToken: string;
-  refreshToken?: string;
-  expiresAt?: Date;
-  tokenType?: string;
-}
-
-export interface UserInfo {
-  id: string;
-  bnet_id: string;
-  battletag: string;
-  is_admin?: boolean;
-  is_skill_capped_verified?: boolean;
-  created_at?: string;
-}
-
-export interface LoginResult {
-  success: boolean;
-  token?: AuthToken;
-  user?: UserInfo;
-  error?: string;
 }
 
 // Match detection types
@@ -110,7 +98,8 @@ export interface AnalysisCompletedEvent extends FreemiumQuotaFields {
   status?: string;
   matchHash: string;
   ssePayload?: SsePayload;
-  isSkillCappedViewer?: boolean;
+  isPremiumViewer?: boolean;
+  premiumSources?: Array<'skillcapped' | 'stripe'>;
 }
 
 export interface AnalysisFailedEvent {
@@ -121,24 +110,46 @@ export interface AnalysisFailedEvent {
   isPermanent?: boolean;
 }
 
-// Settings types - Single Source of Truth aligned with SettingsService
-export interface AppSettings {
-  maxMatchFiles: number;
-  recordingLocation?: string;
-  maxDiskStorage?: number; // GB limit for recordings
-  recordingEnabled?: boolean;
-  matchDetectionEnabled?: boolean;
-  windowBounds?: WindowBounds;
-  recording: RecordingSettings; // Nested recording settings (SSoT)
-  runOnStartup?: boolean;
-  wowInstallationPath?: string; // User-validated WoW installation root
+// Game data constants exposed to renderer (SSoT from @wow/game-data)
+export interface GameDataAPI {
+  /** Bracket labels for comparisons (e.g., BRACKET_LABELS.SoloShuffle === 'Solo Shuffle') */
+  BRACKET_LABELS: {
+    TwoVTwo: string;
+    ThreeVThree: string;
+    SoloShuffle: string;
+    Skirmish: string;
+  };
+  /** Bracket display names for UI (e.g., BRACKET_DISPLAY_NAMES.TwoVTwo === '2v2 Arena') */
+  BRACKET_DISPLAY_NAMES: {
+    TwoVTwo: string;
+    ThreeVThree: string;
+    SoloShuffle: string;
+    Skirmish: string;
+  };
+  /** Map ID to image filename stem (e.g., 1505 → 'nagrand'), null if unknown */
+  getMapImageFilename(mapId: number): string | null;
+  /** Spec ID to icon key (e.g., 250 → 'deathknight_blood'), null if unknown */
+  getSpecIconFilename(specId: number): string | null;
+  /** Lowercase class name to icon slug (e.g., 'deathknight' → 'dk') */
+  CLASS_ICON_SLUGS: Record<string, string>;
+  /** Spec ID to class ID (e.g., 250 → 6 for Blood DK) */
+  getClassIdFromSpec(specId: number): number;
+  /** Rating to icon slug (e.g., 2400 → 'elite', 1300 → null) */
+  getRatingIconSlug(rating: number): string | null;
 }
 
 // Define the API that will be exposed to the renderer process
 export interface ArenaCoachAPI {
+  // Game data constants (SSoT from @wow/game-data)
+  gameData: GameDataAPI;
+
   // App information
   getVersion(): Promise<string>;
   getEnvironment(): Promise<{ isDevelopment: boolean }>;
+  getBillingEnabled(): Promise<
+    | { success: true; billingEnabled: boolean }
+    | { success: false; error: string }
+  >;
 
   // Window controls
   window: {
@@ -149,6 +160,18 @@ export interface ArenaCoachAPI {
     openExternal(url: string): Promise<{ success: boolean; error?: string }>;
   };
 
+  // Shell operations
+  shell: {
+    showItemInFolder(filePath: string): Promise<
+      | { success: true }
+      | {
+          success: false;
+          error: string;
+          code: 'INVALID_PATH' | 'NOT_FOUND' | 'NOT_ALLOWED' | 'OPEN_FAILED' | 'UNKNOWN';
+        }
+    >;
+  };
+
   // Authentication
   auth: {
     isAuthenticated(): Promise<boolean>;
@@ -157,6 +180,7 @@ export interface ArenaCoachAPI {
     logout(): Promise<void>;
     verifySkillCapped(code: string): Promise<{ success: boolean; user?: UserInfo; error?: string }>;
     getSkillCappedStatus(): Promise<{ success: boolean; verified: boolean; error?: string }>;
+    getWebLoginUrl(): Promise<{ success: boolean; url?: string; error?: string }>;
 
     // Event listeners
     onAuthSuccess(callback: (data: { token: AuthToken; user: UserInfo }) => void): () => void;
@@ -164,6 +188,11 @@ export interface ArenaCoachAPI {
     onLogout(callback: () => void): () => void;
     onTokenRefreshed(callback: (token: AuthToken) => void): () => void;
   };
+
+  refreshBillingStatus(): Promise<
+    | { success: true }
+    | { success: false; error: string }
+  >;
 
   // WoW installation detection and process monitoring
   wow: {
@@ -226,14 +255,7 @@ export interface ArenaCoachAPI {
     onAnalysisProgress(callback: (event: AnalysisProgressEvent) => void): () => void;
     onAnalysisCompleted(callback: (event: AnalysisCompletedEvent) => void): () => void;
     onAnalysisFailed(callback: (event: AnalysisFailedEvent) => void): () => void;
-    onJobRetry(
-      callback: (event: {
-        matchHash: string;
-        attempt: number;
-        delayMs: number;
-        errorType: string;
-      }) => void
-    ): () => void;
+    onJobRetry(callback: (event: JobRetryPayload) => void): () => void;
     onStatusUpdated(
       callback: (event: {
         matchHash: string;
@@ -253,12 +275,25 @@ export interface ArenaCoachAPI {
     load(matchHash: string): Promise<StoredMatchMetadata | null>;
     delete(bufferId: string): Promise<boolean>;
     cleanup(): Promise<number>;
+    setFavourite(bufferId: string, isFavourite: boolean): Promise<boolean>;
+  };
+
+  // Log export for debugging
+  logs: {
+    export(
+      bufferId?: string
+    ): Promise<{ success: true; zipPath: string } | { success: false; error: string }>;
   };
 
   // Settings management
   settings: {
     get(): Promise<AppSettings>;
-    update(settings: Partial<AppSettings>): Promise<AppSettings>;
+    update(settings: Partial<AppSettings>): Promise<{
+      settings: AppSettings;
+      recordingDirUpdateError?: string;
+      recordingEnableError?: string;
+      recordingDisableError?: string;
+    }>;
     reset(): Promise<AppSettings>;
   };
 
@@ -305,7 +340,14 @@ export interface ArenaCoachAPI {
   // Scene settings for recording configuration
   scene: {
     getSettings(): Promise<RecordingSettings>;
-    updateSettings(settings: Partial<RecordingSettings>): Promise<RecordingSettings>;
+    getRuntimeEncoder(): Promise<{
+      mode: 'auto' | 'manual';
+      preferredEncoder: 'nvenc' | 'amd' | 'x264';
+      encoder: 'nvenc' | 'amd' | 'x264' | null;
+    }>;
+    updateSettings(
+      settings: Partial<RecordingSettings>
+    ): Promise<{ settings: RecordingSettings; obsApplyError?: string }>;
     setActive(active: boolean): Promise<void>;
   };
 
@@ -347,15 +389,10 @@ export interface ArenaCoachAPI {
       droppedFrames: number;
     }>;
     getThumbnailPath(bufferId: string): Promise<string | null>;
-    checkFileExists(path: string): Promise<boolean>;
     getEffectiveDirectory(): Promise<string>;
-    getRecordingInfo(bufferId: string): Promise<{
-      videoPath: string | null;
-      videoDuration: number | null;
-      recordingStatus: RecordingStatusType;
-      recordingErrorCode: string | null;
-      recordingErrorMessage: string | null;
-    }>;
+    getRecordingInfo(bufferId: string): Promise<RecordingInfoResult>;
+    revealVideoInFolder(bufferId: string): Promise<RevealResult>;
+    revealThumbnailInFolder(bufferId: string): Promise<RevealResult>;
 
     // Event listeners
     onRecordingStarted(callback: (data: { bufferId: string; path: string }) => void): () => void;
@@ -364,6 +401,9 @@ export interface ArenaCoachAPI {
     ): () => void;
     onRecordingError(callback: (error: string) => void): () => void;
     onRecordingUserError(callback: (message: string) => void): () => void;
+    onRecordingRetentionCleanup(
+      callback: (data: { deletedCount: number; freedGB: number; maxGB: number }) => void
+    ): () => void;
   };
 
   // Tray navigation
@@ -373,8 +413,31 @@ export interface ArenaCoachAPI {
 // Expose protected methods that allow the renderer process to use
 // the ipcRenderer without exposing the entire object
 const api: ArenaCoachAPI = {
+  // Game data constants (SSoT from @wow/game-data)
+  gameData: {
+    BRACKET_LABELS: {
+      TwoVTwo: BRACKET_BY_SLUG['2v2'].label,
+      ThreeVThree: BRACKET_BY_SLUG['3v3'].label,
+      SoloShuffle: BRACKET_BY_SLUG['shuffle'].label,
+      Skirmish: BRACKET_LABEL_SKIRMISH,
+    },
+    BRACKET_DISPLAY_NAMES: {
+      TwoVTwo: BRACKET_BY_SLUG['2v2'].displayName,
+      ThreeVThree: BRACKET_BY_SLUG['3v3'].displayName,
+      SoloShuffle: BRACKET_BY_SLUG['shuffle'].displayName,
+      Skirmish: BRACKET_LABEL_SKIRMISH,
+    },
+    getMapImageFilename: (mapId: number): string | null => ARENA_MAP_IMAGE_KEYS[mapId] ?? null,
+    getSpecIconFilename: (specId: number): string | null => SPEC_ICON_KEYS[specId] ?? null,
+    CLASS_ICON_SLUGS: { ...CLASS_NAME_TO_ICON_SLUG },
+    getClassIdFromSpec: (specId: number): number => SPEC_BY_ID[specId]?.classId ?? 0,
+    getRatingIconSlug: (rating: number): string | null => getRatingIconSlug(rating),
+  },
+
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
   getEnvironment: () => ipcRenderer.invoke('app:getEnvironment'),
+  getBillingEnabled: () => ipcRenderer.invoke('billing:getEnabled'),
+  refreshBillingStatus: () => ipcRenderer.invoke('auth:refreshBillingStatus'),
 
   window: {
     minimize: () => ipcRenderer.invoke('window:minimize'),
@@ -384,6 +447,10 @@ const api: ArenaCoachAPI = {
     openExternal: (url: string) => ipcRenderer.invoke('window:openExternal', url),
   },
 
+  shell: {
+    showItemInFolder: (filePath: string) => ipcRenderer.invoke('shell:showItemInFolder', filePath),
+  },
+
   auth: {
     isAuthenticated: () => ipcRenderer.invoke('auth:isAuthenticated'),
     getCurrentUser: () => ipcRenderer.invoke('auth:getCurrentUser'),
@@ -391,6 +458,7 @@ const api: ArenaCoachAPI = {
     logout: () => ipcRenderer.invoke('auth:logout'),
     verifySkillCapped: (code: string) => ipcRenderer.invoke('auth:verifySkillCapped', code),
     getSkillCappedStatus: () => ipcRenderer.invoke('auth:getSkillCappedStatus'),
+    getWebLoginUrl: () => ipcRenderer.invoke('auth:getWebLoginUrl'),
 
     onAuthSuccess: (
       callback: (data: { token: AuthToken; user: UserInfo }) => void
@@ -595,18 +663,9 @@ const api: ArenaCoachAPI = {
         ipcRenderer.removeListener('analysis:failed', handler);
       };
     },
-    onJobRetry: (
-      callback: (event: {
-        matchHash: string;
-        attempt: number;
-        delayMs: number;
-        errorType: string;
-      }) => void
-    ): (() => void) => {
-      const handler = (
-        _event: Electron.IpcRendererEvent,
-        event: { matchHash: string; attempt: number; delayMs: number; errorType: string }
-      ) => callback(event);
+    onJobRetry: (callback: (event: JobRetryPayload) => void): (() => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, event: JobRetryPayload) =>
+        callback(event);
       ipcRenderer.on('match:jobRetry', handler);
       return () => {
         ipcRenderer.removeListener('match:jobRetry', handler);
@@ -652,6 +711,12 @@ const api: ArenaCoachAPI = {
     load: (matchHash: string) => ipcRenderer.invoke('matches:load', matchHash),
     delete: (bufferId: string) => ipcRenderer.invoke('matches:delete', bufferId),
     cleanup: () => ipcRenderer.invoke('matches:cleanup'),
+    setFavourite: (bufferId: string, isFavourite: boolean) =>
+      ipcRenderer.invoke('matches:setFavourite', bufferId, isFavourite),
+  },
+
+  logs: {
+    export: (bufferId?: string) => ipcRenderer.invoke('logs:export', bufferId),
   },
 
   settings: {
@@ -714,6 +779,7 @@ const api: ArenaCoachAPI = {
 
   scene: {
     getSettings: () => ipcRenderer.invoke('scene:getSettings'),
+    getRuntimeEncoder: () => ipcRenderer.invoke('scene:getRuntimeEncoder'),
     updateSettings: (settings: Partial<RecordingSettings>) =>
       ipcRenderer.invoke('scene:updateSettings', settings),
     setActive: (active: boolean) => ipcRenderer.invoke('scene:setActive', active),
@@ -746,10 +812,13 @@ const api: ArenaCoachAPI = {
     getStatus: () => ipcRenderer.invoke('recording:getStatus'),
     getThumbnailPath: (bufferId: string) =>
       ipcRenderer.invoke('recording:getThumbnailForMatch', bufferId),
-    checkFileExists: (path: string) => ipcRenderer.invoke('recording:checkFileExists', path),
     getEffectiveDirectory: () => ipcRenderer.invoke('recording:getEffectiveDirectory'),
     getRecordingInfo: (bufferId: string) =>
       ipcRenderer.invoke('recording:getRecordingInfoForMatch', bufferId),
+    revealVideoInFolder: (bufferId: string) =>
+      ipcRenderer.invoke('recording:revealVideoInFolder', bufferId),
+    revealThumbnailInFolder: (bufferId: string) =>
+      ipcRenderer.invoke('recording:revealThumbnailInFolder', bufferId),
 
     onRecordingStarted: (
       callback: (data: { bufferId: string; path: string }) => void
@@ -787,6 +856,18 @@ const api: ArenaCoachAPI = {
       ipcRenderer.on('recording:userError', handler);
       return () => {
         ipcRenderer.removeListener('recording:userError', handler);
+      };
+    },
+    onRecordingRetentionCleanup: (
+      callback: (data: { deletedCount: number; freedGB: number; maxGB: number }) => void
+    ): (() => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        data: { deletedCount: number; freedGB: number; maxGB: number }
+      ) => callback(data);
+      ipcRenderer.on('recording:retentionCleanup', handler);
+      return () => {
+        ipcRenderer.removeListener('recording:retentionCleanup', handler);
       };
     },
   },

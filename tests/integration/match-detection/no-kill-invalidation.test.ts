@@ -22,7 +22,7 @@ import {
 /**
  * No-Kill Invalidation Integration Tests
  *
- * Tests the kill-aware validation and early-ending feature for 2v2/3v3 matches.
+ * Tests the kill-aware validation and early-ending feature for structured arena matches.
  *
  * Scenarios tested:
  * 1. Normal ARENA_MATCH_END with no kills → NO_PLAYER_DEATH → hard-delete
@@ -32,11 +32,11 @@ import {
  * Key invariants:
  * - Solo Shuffle is unaffected (uses round-level kill tracking)
  * - playerDeathCount is tracked from UNIT_DIED events for Player-* GUIDs
- * - 2v2/3v3 with kills + ARENA_MATCH_END = valid and uploadable
- * - 2v2/3v3 with kills + no ARENA_MATCH_END = kept as incomplete (not uploaded)
- * - 2v2/3v3 without kills = hard-deleted (no value, regardless of end type)
+ * - 2v2/3v3/skirmish with kills + ARENA_MATCH_END = valid and uploadable
+ * - 2v2/3v3/skirmish with kills + no ARENA_MATCH_END = kept as incomplete (not uploaded)
+ * - 2v2/3v3/skirmish without kills = hard-deleted (no value, regardless of end type)
  */
-describe('No-Kill Invalidation (2v2/3v3)', () => {
+describe('No-Kill Invalidation (2v2/3v3/Skirmish)', () => {
   let watcher: MatchLogWatcher;
   let chunker: MatchChunker;
   let metadataService: MetadataService;
@@ -156,6 +156,62 @@ describe('No-Kill Invalidation (2v2/3v3)', () => {
       expect(metadataFiles).toHaveLength(0);
 
       const bufferId = startEvents[0].bufferId;
+      const storedMetadata = await metadataStorageService.loadMatchByBufferId(bufferId);
+      expect(storedMetadata).toBeNull();
+    });
+
+    it('invalidates skirmish match with ARENA_MATCH_END but no kills (NO_PLAYER_DEATH)', async () => {
+      const lines = await loadFixtureLog('skirmish-no-kill.txt');
+
+      const startEvents: MatchStartedEvent[] = [];
+      const endEvents: MatchEndedEvent[] = [];
+
+      const lifecycleIncomplete: Array<{ bufferId: string; trigger: EarlyEndTrigger }> = [];
+      const lifecycleCompleted: string[] = [];
+      const { enqueueOp, waitForAll } = createLifecycleOpQueue();
+
+      watcher.on('matchStarted', (event: MatchStartedEvent) => {
+        startEvents.push(event);
+      });
+      watcher.on('matchEnded', (event: MatchEndedEvent) => {
+        endEvents.push(event);
+      });
+
+      lifecycleService.on('matchLifecycle:incomplete', data => {
+        lifecycleIncomplete.push({ bufferId: data.bufferId, trigger: data.trigger });
+      });
+      lifecycleService.on('matchLifecycle:completed', data => {
+        lifecycleCompleted.push(data.bufferId);
+      });
+
+      watcher.on('matchStarted', (event: MatchStartedEvent) => {
+        enqueueOp(event.bufferId, () => lifecycleService.handleMatchStarted(event));
+      });
+      watcher.on('matchEnded', (event: MatchEndedEvent) => {
+        enqueueOp(event.bufferId, () => lifecycleService.handleMatchEnded(event));
+      });
+      chunker.on('matchEndedIncomplete', (event: MatchEndedIncompleteEvent) => {
+        enqueueOp(event.bufferId, () => lifecycleService.handleMatchEndedIncomplete(event));
+      });
+
+      const watcherAny = watcher as any;
+      watcherAny.processChunkSynchronously(lines);
+
+      await waitForAll();
+
+      expect(startEvents).toHaveLength(1);
+      expect(startEvents[0].bracket).toBe('Skirmish');
+      expect(endEvents).toHaveLength(1);
+      expect(endEvents[0].metadata.bracket).toBe('Skirmish');
+      expect(endEvents[0].metadata.playerDeathCount).toBe(0);
+
+      const bufferId = startEvents[0].bufferId;
+
+      expect(lifecycleCompleted).toHaveLength(0);
+      expect(lifecycleIncomplete).toEqual([
+        { bufferId, trigger: EarlyEndTrigger.NO_PLAYER_DEATH },
+      ]);
+
       const storedMetadata = await metadataStorageService.loadMatchByBufferId(bufferId);
       expect(storedMetadata).toBeNull();
     });
