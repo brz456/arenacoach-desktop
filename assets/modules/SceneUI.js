@@ -551,10 +551,9 @@ class SceneUI {
         if (!this.previewPlaceholder) return;
 
         try {
-            const settings = await window.arenaCoach.settings.get();
-            const recordingEnabled = settings.recordingEnabled !== false;
+            const status = await window.arenaCoach.recording.getStatus();
 
-            if (recordingEnabled) {
+            if (status.isEnabled) {
                 this.previewPlaceholder.classList.add('hidden');
             } else {
                 this.previewPlaceholder.classList.remove('hidden');

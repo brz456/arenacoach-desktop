@@ -36,3 +36,24 @@ export function getEffectiveRecordingDirectory(
 
   return normalizedPath;
 }
+
+/**
+ * Resolve the directory the app should actually use for recordings.
+ * Falls back to the safe default when the configured root is unavailable.
+ */
+export function resolveRecordingDirectoryWithFallback(
+  recordingLocation: string | undefined | null,
+  defaultBasePath: string,
+  rootExists: (root: string) => boolean
+): string {
+  const safeDefaultDir = path.join(defaultBasePath, DEFAULT_RECORDING_SUBDIR);
+  const effectiveDir = getEffectiveRecordingDirectory(recordingLocation, defaultBasePath);
+  const windowsRootMatch = effectiveDir.match(/^[A-Za-z]:[\\/]/);
+  const root = windowsRootMatch?.[0] ?? path.parse(effectiveDir).root;
+
+  if (!root) {
+    return effectiveDir;
+  }
+
+  return rootExists(root) ? effectiveDir : safeDefaultDir;
+}

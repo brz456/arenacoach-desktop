@@ -154,6 +154,54 @@ describe('resolveEncoderSelection', () => {
     });
   });
 
+  it('forces x264 in auto mode when CPU fallback is active', () => {
+    const result = resolveEncoderSelection({
+      mode: 'auto',
+      availableEncoderIds: ['h264_texture_amf', 'jim_nvenc', 'obs_x264'],
+      forceCpuFallback: true,
+    });
+
+    expect(result).toEqual({
+      kind: 'resolved',
+      encoderId: 'obs_x264',
+      mode: 'auto',
+      reason: 'forced_cpu_fallback',
+      requestedEncoder: 'x264',
+    });
+  });
+
+  it('forces x264 in manual NVENC mode when CPU fallback is active', () => {
+    const result = resolveEncoderSelection({
+      mode: 'manual',
+      preferredEncoder: 'nvenc',
+      availableEncoderIds: ['h264_texture_amf', 'jim_nvenc', 'obs_x264'],
+      forceCpuFallback: true,
+    });
+
+    expect(result).toEqual({
+      kind: 'resolved',
+      encoderId: 'obs_x264',
+      mode: 'manual',
+      reason: 'forced_cpu_fallback',
+      requestedEncoder: 'nvenc',
+    });
+  });
+
+  it('returns no-op under CPU fallback when x264 is unavailable', () => {
+    const result = resolveEncoderSelection({
+      mode: 'auto',
+      availableEncoderIds: ['h264_texture_amf', 'jim_nvenc'],
+      forceCpuFallback: true,
+    });
+
+    expect(result).toEqual({
+      kind: 'no-op',
+      mode: 'auto',
+      reason: 'no_supported_h264',
+      requestedEncoder: 'x264',
+    });
+  });
+
   it('returns no-op when probe succeeded but no supported H.264 encoder exists', () => {
     const result = resolveEncoderSelection({
       mode: 'manual',

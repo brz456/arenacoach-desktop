@@ -55,9 +55,16 @@ export class RecordingStorageManager {
    * Get used space by recordings in GB (efficient calculation)
    */
   public async getRecordingsUsedSpace(): Promise<number> {
+    return RecordingStorageManager.getRecordingsUsedSpaceForDirectory(this.defaultOutputDir);
+  }
+
+  public static async getRecordingsUsedSpaceForDirectory(
+    outputDir: string,
+    options: { quietMissingDir?: boolean } = {}
+  ): Promise<number> {
     try {
       // Calculate total size of actual recording files
-      const recordingFiles = await this.getRecordingFiles();
+      const recordingFiles = await RecordingStorageManager.getRecordingFilesForDirectory(outputDir);
       let totalSize = 0;
 
       for (const file of recordingFiles) {
@@ -71,6 +78,15 @@ export class RecordingStorageManager {
 
       return totalSize / (1024 * 1024 * 1024); // Convert to GB
     } catch (error) {
+      if (
+        options.quietMissingDir &&
+        error &&
+        typeof error === 'object' &&
+        'code' in error &&
+        error.code === 'ENOENT'
+      ) {
+        return 0;
+      }
       console.error('[RecordingStorageManager] Failed to calculate recordings used space:', error);
       return 0;
     }
@@ -253,14 +269,18 @@ export class RecordingStorageManager {
    * Uses withFileTypes to avoid redundant stat calls - caller stats for size/mtime.
    */
   private async getRecordingFiles(): Promise<string[]> {
+    return RecordingStorageManager.getRecordingFilesForDirectory(this.defaultOutputDir);
+  }
+
+  private static async getRecordingFilesForDirectory(outputDir: string): Promise<string[]> {
     // Let readdir throw on failure so enforceStorageQuota can capture it
-    const items = await fs.readdir(this.defaultOutputDir, { withFileTypes: true });
+    const items = await fs.readdir(outputDir, { withFileTypes: true });
 
     const files: string[] = [];
     for (const dirent of items) {
       // Only include recording files, skip directories and non-recording files
       if (dirent.isFile() && dirent.name.endsWith(RECORDING_EXTENSION)) {
-        files.push(path.join(this.defaultOutputDir, dirent.name));
+        files.push(path.join(outputDir, dirent.name));
       }
     }
 

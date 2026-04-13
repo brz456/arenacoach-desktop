@@ -75,7 +75,7 @@ export interface StoredMatchMetadata {
   /** pg-boss job ID when upload starts */
   jobId?: string;
   /** Backend analysis ID when complete */
-  analysisId?: string;
+  analysisId?: number;
   /** Current upload/processing status */
   uploadStatus: UploadStatus;
   /** Live progress message during processing */

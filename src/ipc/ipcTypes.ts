@@ -1,5 +1,21 @@
 import type { RecordingStatusType } from '../match-detection/types/StoredMatchTypes';
 
+export type DetectionInactiveReason = 'NO_INSTALLATION' | 'USER_DISABLED';
+
+export interface WoWProcessStatusSnapshot {
+  isRunning: boolean;
+  isMonitoring: boolean;
+  firstPollCompleted: boolean;
+}
+
+export interface DetectionStatusSnapshot {
+  running: boolean;
+  initialized: boolean;
+  installationCount: number;
+  inactiveReason: DetectionInactiveReason | null;
+  wowProcessStatus: WoWProcessStatusSnapshot;
+}
+
 export type RevealResult =
   | { success: true }
   | {

@@ -1,12 +1,33 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import axios, { isAxiosError } from 'axios';
+import axios, { isAxiosError, type AxiosRequestConfig, type AxiosResponse } from 'axios';
 import FormData from 'form-data';
 import { ApiHeadersProvider } from './ApiHeadersProvider';
 import { ServiceHealthCheck } from './ServiceHealthCheck';
 import { MatchEndedEvent } from '../match-detection/types/MatchEvent';
 import { toSafeAxiosErrorLog } from '../utils/errorRedaction';
 import { activeFlavor } from '../config/wowFlavor';
+import {
+  UploadAcceptedResponse,
+  UploadTrackingContract,
+  parseUploadTrackingContract,
+} from './upload-lifecycle/types';
+import { UnauthorizedAuthError } from './upload-lifecycle/errors';
+
+interface UploadAcceptedApiResponse {
+  success: boolean;
+  accepted?: boolean;
+  jobId?: string;
+  isIdempotent?: boolean;
+  tracking?: {
+    acceptedJobId?: string;
+    statusPath?: string;
+    realtimePath?: string;
+  };
+  error?: {
+    message?: string;
+  };
+}
 
 /**
  * UploadService - Handles chunk uploads to the backend
@@ -60,8 +81,9 @@ export class UploadService {
     chunkFilePath: string,
     matchMetadata: MatchEndedEvent,
     matchHash: string,
-    jobId: string
-  ): Promise<void> {
+    jobId: string,
+    signal?: AbortSignal
+  ): Promise<UploadAcceptedResponse> {
     // Verify chunk file exists
     await fs.promises.access(chunkFilePath);
     const stats = await fs.promises.stat(chunkFilePath);
@@ -99,14 +121,29 @@ export class UploadService {
     const headers = this.headersProvider.getHeaders(formData.getHeaders());
 
     try {
-      // Make the upload request
-      const response = await axios.post(`${this.apiBaseUrl}${this.uploadEndpoint}`, formData, {
+      const requestConfig: AxiosRequestConfig = {
         headers,
         timeout: timeoutMs,
-      });
+        ...(signal ? { signal } : {}),
+      };
 
-      // Check for successful response (any 2xx with success: true)
-      if (response.status >= 200 && response.status < 300 && response.data?.success) {
+      // Make the upload request
+      const response: AxiosResponse<UploadAcceptedApiResponse> = await axios.post<
+        UploadAcceptedApiResponse
+      >(
+        `${this.apiBaseUrl}${this.uploadEndpoint}`,
+        formData,
+        requestConfig
+      );
+
+      if (
+        response.status >= 200 &&
+        response.status < 300 &&
+        response.data?.success &&
+        response.data.accepted === true &&
+        typeof response.data.jobId === 'string' &&
+        response.data.jobId.trim().length > 0
+      ) {
         console.info('[UploadService] Upload successful:', {
           jobId,
           serverJobId: response.data.jobId,
@@ -124,6 +161,10 @@ export class UploadService {
             serverJobId: response.data.jobId,
           });
         }
+
+        return {
+          tracking: this.normalizeAcceptedTrackingContract(response.data),
+        };
       } else {
         const backendMessage =
           typeof response.data?.error?.message === 'string' ? response.data.error.message : null;
@@ -132,15 +173,8 @@ export class UploadService {
         );
       }
     } catch (error) {
-      // Handle idempotent responses (regardless of status code)
-      if (isAxiosError(error) && error.response?.data?.isIdempotent) {
-        console.info('[UploadService] Upload succeeded via idempotency:', {
-          jobId,
-          status: error.response.status,
-        });
-        // Report success even for idempotent responses
-        this.healthCheck?.reportSuccess();
-        return;
+      if (isAxiosError(error) && error.response?.status === 401) {
+        throw new UnauthorizedAuthError('Upload request returned unauthorized (401)');
       }
 
       // Report failure for network or 5xx errors
@@ -166,6 +200,35 @@ export class UploadService {
       apiBaseUrl: this.apiBaseUrl,
       uploadEndpoint: this.uploadEndpoint,
       hasAuth: this.headersProvider.hasAuth(),
+    };
+  }
+
+  private normalizeAcceptedTrackingContract(
+    responseData: UploadAcceptedApiResponse
+  ): UploadTrackingContract {
+    const normalizedTracking = parseUploadTrackingContract(responseData.tracking);
+    if (!normalizedTracking) {
+      throw new Error(
+        'Backend contract violation: accepted upload tracking contract is incomplete or invalid'
+      );
+    }
+
+    const canonicalAcceptedJobId = normalizedTracking.acceptedJobId;
+
+    if (
+      typeof responseData.jobId === 'string' &&
+      responseData.jobId.trim().length > 0 &&
+      responseData.jobId !== canonicalAcceptedJobId
+    ) {
+      throw new Error(
+        'Backend contract violation: accepted upload identifiers do not match across the upload response'
+      );
+    }
+
+    return {
+      acceptedJobId: canonicalAcceptedJobId,
+      statusPath: normalizedTracking.statusPath,
+      realtimePath: normalizedTracking.realtimePath,
     };
   }
 }

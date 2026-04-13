@@ -4,7 +4,11 @@ import { MatchMetadata } from './match-detection/types/MatchMetadata';
 import type { AppSettings } from './services/SettingsService';
 import type { RecordingSettings } from './services/RecordingTypes';
 import type { FreemiumQuotaFields } from './Freemium';
-import type { RevealResult, RecordingInfoResult } from './ipc/ipcTypes';
+import type {
+  DetectionStatusSnapshot,
+  RevealResult,
+  RecordingInfoResult,
+} from './ipc/ipcTypes';
 import type { AuthToken, UserInfo, LoginResult } from './authTypes';
 import type { JobRetryPayload } from './match-detection/types/JobRetryPayload';
 import {
@@ -94,7 +98,7 @@ export interface SsePayload extends Partial<StoredMatchMetadata> {
 
 export interface AnalysisCompletedEvent extends FreemiumQuotaFields {
   jobId: string;
-  analysisId?: string;
+  analysisId?: number;
   status?: string;
   matchHash: string;
   ssePayload?: SsePayload;
@@ -106,6 +110,7 @@ export interface AnalysisFailedEvent {
   jobId: string;
   error: string;
   matchHash: string;
+  isNotFound?: boolean;
   errorCode?: string;
   isPermanent?: boolean;
 }
@@ -219,11 +224,7 @@ export interface ArenaCoachAPI {
     startDetection(): Promise<void>;
     stopDetection(): Promise<void>;
     getStatus(): Promise<boolean>;
-    getDetectionStatus(): Promise<{
-      running: boolean;
-      initialized: boolean;
-      wowProcessStatus: { isRunning: boolean; isMonitoring: boolean; firstPollCompleted: boolean };
-    }>;
+    getDetectionStatus(): Promise<DetectionStatusSnapshot>;
     getCurrentMatch(): Promise<{ bracket: string; timestamp: Date } | null>;
     getTriggerMessage(trigger: string): Promise<string>;
 
@@ -251,6 +252,7 @@ export interface ArenaCoachAPI {
     onTimeout(callback: (data: { timeoutMs: number }) => void): () => void;
     onDetectionStarted(callback: () => void): () => void;
     onDetectionStopped(callback: () => void): () => void;
+    onDetectionStatusChanged(callback: (status: DetectionStatusSnapshot) => void): () => void;
     onAnalysisJobCreated(callback: (event: AnalysisJobEvent) => void): () => void;
     onAnalysisProgress(callback: (event: AnalysisProgressEvent) => void): () => void;
     onAnalysisCompleted(callback: (event: AnalysisCompletedEvent) => void): () => void;
@@ -299,7 +301,7 @@ export interface ArenaCoachAPI {
 
   // Service status for header indicator
   service: {
-    getStatus(): Promise<{ connected: boolean; trackedJobsCount: number; hasAuth: boolean }>;
+    getStatus(): Promise<{ connected: boolean; activeUploadsCount: number; hasAuth: boolean }>;
     getQuotaStatus(): Promise<{
       success: boolean;
       data?: {
@@ -313,7 +315,7 @@ export interface ArenaCoachAPI {
       error?: string;
     }>;
     onStatusChanged(
-      callback: (status: { connected: boolean; trackedJobsCount: number; hasAuth: boolean }) => void
+      callback: (status: { connected: boolean; activeUploadsCount: number; hasAuth: boolean }) => void
     ): () => void;
   };
 
@@ -631,6 +633,18 @@ const api: ArenaCoachAPI = {
         ipcRenderer.removeListener('match:detectionStopped', handler);
       };
     },
+    onDetectionStatusChanged: (
+      callback: (status: DetectionStatusSnapshot) => void
+    ): (() => void) => {
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        status: DetectionStatusSnapshot
+      ) => callback(status);
+      ipcRenderer.on('match:detectionStatusChanged', handler);
+      return () => {
+        ipcRenderer.removeListener('match:detectionStatusChanged', handler);
+      };
+    },
     onAnalysisJobCreated: (callback: (event: AnalysisJobEvent) => void): (() => void) => {
       const handler = (_event: Electron.IpcRendererEvent, event: AnalysisJobEvent) =>
         callback(event);
@@ -729,11 +743,11 @@ const api: ArenaCoachAPI = {
     getStatus: () => ipcRenderer.invoke('service:getStatus'),
     getQuotaStatus: () => ipcRenderer.invoke('quota:getStatus'),
     onStatusChanged: (
-      callback: (status: { connected: boolean; trackedJobsCount: number; hasAuth: boolean }) => void
+      callback: (status: { connected: boolean; activeUploadsCount: number; hasAuth: boolean }) => void
     ): (() => void) => {
       const handler = (
         _event: Electron.IpcRendererEvent,
-        status: { connected: boolean; trackedJobsCount: number; hasAuth: boolean }
+        status: { connected: boolean; activeUploadsCount: number; hasAuth: boolean }
       ) => callback(status);
       ipcRenderer.on('service:statusChanged', handler);
       return () => {

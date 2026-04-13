@@ -51,7 +51,7 @@ export class AnalysisEnrichmentService {
    */
   public async finalizeCompletion(
     jobId: string,
-    analysisId: string | undefined,
+    analysisId: number | undefined,
     analysisPayload: AnalysisPayload | undefined,
     freemiumFields: FreemiumQuotaFields
   ): Promise<void> {
@@ -117,7 +117,7 @@ export class AnalysisEnrichmentService {
   private async enrichWithAnalysisResults(
     existingMatch: StoredMatchMetadata,
     analysisPayload: AnalysisPayload,
-    analysisId: string,
+    analysisId: number,
     freemiumFields: FreemiumQuotaFields
   ): Promise<void> {
     try {
@@ -150,7 +150,7 @@ export class AnalysisEnrichmentService {
       // Build single atomic update with all enrichment data
       const enrichmentUpdate: Partial<StoredMatchMetadata> = {
         // Core analysis tracking
-        analysisId, // Already a string - normalized at emission boundary
+        analysisId,
         uuid: analysisPayload.uuid,
 
         // Update matchData with rehydrated timestamp and flat events

@@ -9,7 +9,7 @@ export class ExpirationConfig {
    * Combat log expiration window in hours
    * Combat logs older than 1 hour cannot be processed
    * This value is used system-wide for:
-   * - JobQueueOrchestrator submission guard (reject expired combat logs)
+   * - UploadLifecycleService submission guard (reject expired combat logs)
    * - Periodic expiration checks
    * - Metadata status updates
    */

@@ -30,12 +30,23 @@ export interface MatchSessionState {
  */
 export class MatchLifecycleService extends EventEmitter {
   private readonly sessions = new Map<string, MatchSessionState>();
+  private recordingService: RecordingService | null;
 
   constructor(
     private readonly metadataService: MetadataService,
-    private readonly recordingService: RecordingService | null
+    recordingService: RecordingService | null
   ) {
     super();
+    this.recordingService = recordingService;
+  }
+
+  /**
+   * Update the recording service binding at runtime.
+   * This supports enabling/disabling recording after app startup without
+   * recreating lifecycle state.
+   */
+  public setRecordingService(recordingService: RecordingService | null): void {
+    this.recordingService = recordingService;
   }
 
   /**

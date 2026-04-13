@@ -28,6 +28,7 @@ import { Resolution, RECORDING_EXTENSION, THUMBNAIL_EXTENSION } from './Recordin
 import {
   DEFAULT_RECORDING_SUBDIR,
   getEffectiveRecordingDirectory,
+  resolveRecordingDirectoryWithFallback,
 } from '../utils/recordingPathUtils';
 import { isNodeError } from '../utils/errors';
 import type {
@@ -1224,10 +1225,15 @@ export class RecordingService extends EventEmitter {
       settings.recordingLocation,
       app.getPath('videos')
     );
+    const resolvedDir = resolveRecordingDirectoryWithFallback(
+      settings.recordingLocation,
+      app.getPath('videos'),
+      root => fs.existsSync(root)
+    );
 
     // If directory was sanitized (any transformation), update settings so UI shows correct location
     const normalizedInput = path.normalize(settings.recordingLocation);
-    const unavailableRoot = this.getUnavailableRecordingRoot(effectiveDir);
+    const unavailableRoot = resolvedDir === safeDefaultDir ? this.getUnavailableRecordingRoot(effectiveDir) : null;
 
     if (unavailableRoot) {
       console.warn(
@@ -1251,7 +1257,7 @@ export class RecordingService extends EventEmitter {
       }
     }
 
-    return effectiveDir;
+    return resolvedDir;
   }
 
   private getSafeDefaultRecordingDirectory(): string {

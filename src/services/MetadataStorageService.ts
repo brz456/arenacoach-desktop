@@ -585,7 +585,7 @@ export class MetadataStorageService extends EventEmitter {
     matchHash: string,
     status: UploadStatus,
     additionalData: Partial<StoredMatchMetadata> = {}
-  ): Promise<void> {
+  ): Promise<UploadStatus | null> {
     return this.safeFileOperation(async () => {
       // First load to get bufferId (outside mutex)
       const existingMatch = await this.loadMatch(matchHash);
@@ -593,7 +593,7 @@ export class MetadataStorageService extends EventEmitter {
         console.debug(
           `[MetadataStorageService] Skipping status update - no metadata file for: ${matchHash}`
         );
-        return; // Gracefully skip updates for non-existent files
+        return null; // Gracefully skip updates for non-existent files
       }
 
       const bufferId = existingMatch.bufferId;
@@ -601,7 +601,7 @@ export class MetadataStorageService extends EventEmitter {
         console.error(
           `[MetadataStorageService] Cannot update status - no bufferId for: ${matchHash}`
         );
-        return;
+        return null;
       }
 
       // BREAKING CHANGE: Lock on bufferId (not matchHash) for consistency
@@ -614,18 +614,33 @@ export class MetadataStorageService extends EventEmitter {
           console.debug(
             `[MetadataStorageService] Match disappeared during status update: ${bufferId}`
           );
-          return;
+          return null;
+        }
+
+        const preserveProcessingStatus =
+          freshMatch.uploadStatus === UploadStatus.PROCESSING && status === UploadStatus.QUEUED;
+        const effectiveStatus = preserveProcessingStatus ? UploadStatus.PROCESSING : status;
+        const effectiveAdditionalData = { ...additionalData };
+        if (preserveProcessingStatus && 'progressMessage' in effectiveAdditionalData) {
+          if (freshMatch.progressMessage === undefined) {
+            delete effectiveAdditionalData.progressMessage;
+          } else {
+            effectiveAdditionalData.progressMessage = freshMatch.progressMessage;
+          }
         }
 
         // No-op guard: Skip write if status unchanged and no additional fields
-        if (freshMatch.uploadStatus === status && Object.keys(additionalData).length === 0) {
-          return; // Skip redundant write
+        if (
+          freshMatch.uploadStatus === effectiveStatus &&
+          Object.keys(effectiveAdditionalData).length === 0
+        ) {
+          return effectiveStatus; // Skip redundant write
         }
 
         // Guard: Forbid identity field mutation via additionalData (SSoT invariant)
         const forbiddenFields = ['bufferId', 'matchHash', 'storedAt'] as const;
         for (const field of forbiddenFields) {
-          if (field in additionalData) {
+          if (field in effectiveAdditionalData) {
             throw new Error(
               `Cannot mutate identity field '${field}' via additionalData in updateMatchStatus`
             );
@@ -635,16 +650,16 @@ export class MetadataStorageService extends EventEmitter {
         // Normal status update logic
         const updatedMatch: StoredMatchMetadata = {
           ...freshMatch,
-          ...additionalData,
-          uploadStatus: status,
+          ...effectiveAdditionalData,
+          uploadStatus: effectiveStatus,
           lastUpdatedAt: new Date(),
         };
 
         // Clear progress message for final states to prevent stale data
         if (
-          status === UploadStatus.COMPLETED ||
-          status === UploadStatus.FAILED ||
-          status === UploadStatus.NOT_FOUND
+          effectiveStatus === UploadStatus.COMPLETED ||
+          effectiveStatus === UploadStatus.FAILED ||
+          effectiveStatus === UploadStatus.NOT_FOUND
         ) {
           delete updatedMatch.progressMessage;
         }
@@ -652,24 +667,37 @@ export class MetadataStorageService extends EventEmitter {
         await this._saveMatchInternal(updatedMatch);
 
         // Log status changes or enrichment updates
-        if (freshMatch.uploadStatus !== status) {
+        if (preserveProcessingStatus) {
+          console.debug('[MetadataStorageService] Ignored stale queued status update:', {
+            matchHash,
+            bufferId,
+            currentUploadStatus: freshMatch.uploadStatus,
+            requestedUploadStatus: status,
+          });
+        } else if (freshMatch.uploadStatus !== effectiveStatus) {
           console.debug('[MetadataStorageService] Updated match status:', {
             matchHash,
             bufferId,
             oldUploadStatus: freshMatch.uploadStatus,
-            newUploadStatus: status,
+            newUploadStatus: effectiveStatus,
           });
-        } else if (Object.keys(additionalData).length > 0) {
+        } else if (Object.keys(effectiveAdditionalData).length > 0) {
           // Log enrichment updates for diagnostics
           console.debug('[MetadataStorageService] Enriching match with additional data:', {
             matchHash,
             bufferId,
-            status,
-            fieldsAdded: Object.keys(additionalData),
+            status: effectiveStatus,
+            fieldsAdded: Object.keys(effectiveAdditionalData),
           });
         }
 
-        this.emit('matchUpdated', { matchHash, bufferId, status, additionalData });
+        this.emit('matchUpdated', {
+          matchHash,
+          bufferId,
+          status: effectiveStatus,
+          additionalData: effectiveAdditionalData,
+        });
+        return effectiveStatus;
       });
     }, 'updating match status');
   }

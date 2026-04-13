@@ -4,13 +4,17 @@ type EncoderResolutionReason =
   | 'auto_best_available'
   | 'manual_requested_available'
   | 'manual_requested_unavailable_fallback'
+  | 'forced_cpu_fallback'
   | 'probe_failed'
   | 'probe_empty'
   | 'no_supported_h264';
 
 type ResolvedEncoderReason = Extract<
   EncoderResolutionReason,
-  'auto_best_available' | 'manual_requested_available' | 'manual_requested_unavailable_fallback'
+  | 'auto_best_available'
+  | 'manual_requested_available'
+  | 'manual_requested_unavailable_fallback'
+  | 'forced_cpu_fallback'
 >;
 type NoOpEncoderReason = Extract<
   EncoderResolutionReason,
@@ -127,6 +131,7 @@ export function resolveEncoderSelection(input: {
   availableEncoderIds: string[] | undefined;
   mode: EncoderMode;
   preferredEncoder?: EncoderType;
+  forceCpuFallback?: boolean;
 }): EncoderResolutionResult {
   const requestedEncoder = input.preferredEncoder ?? 'x264';
 
@@ -150,6 +155,36 @@ export function resolveEncoderSelection(input: {
   }
 
   const supported = getSupportedCandidates(availableEncoderIds);
+
+  if (input.forceCpuFallback) {
+    const x264EncoderId = supported.x264;
+    if (!x264EncoderId) {
+      return {
+        kind: 'no-op',
+        mode: input.mode,
+        reason: 'no_supported_h264',
+        requestedEncoder,
+      };
+    }
+
+    if (input.mode === 'manual' && requestedEncoder === 'x264') {
+      return {
+        kind: 'resolved',
+        encoderId: x264EncoderId,
+        mode: input.mode,
+        reason: 'manual_requested_available',
+        requestedEncoder,
+      };
+    }
+
+    return {
+      kind: 'resolved',
+      encoderId: x264EncoderId,
+      mode: input.mode,
+      reason: 'forced_cpu_fallback',
+      requestedEncoder,
+    };
+  }
 
   if (input.mode === 'manual') {
     const requestedEncoderId = supported[requestedEncoder];

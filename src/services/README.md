@@ -9,7 +9,7 @@
 The services layer provides specialized business logic components organized into
 four functional areas:
 
-1. **Upload & Polling Pipeline** - Job tracking, backend communication, and
+1. **Upload Lifecycle Pipeline** - Job tracking, backend communication, and
    analysis enrichment
 2. **Match Detection & Metadata** - Match lifecycle management and persistence
 3. **Infrastructure** - Cross-cutting concerns (settings, health, headers,
@@ -23,7 +23,7 @@ concerns.
 
 ## Table of Contents
 
-1. [Upload & Polling Pipeline](#upload--polling-pipeline)
+1. [Upload Lifecycle Pipeline](#upload-lifecycle-pipeline)
 2. [Match Detection & Metadata](#match-detection--metadata)
 3. [Infrastructure Services](#infrastructure-services)
 4. [Cross-Service Data Flow](#cross-service-data-flow)
@@ -32,45 +32,131 @@ concerns.
 
 ---
 
-## Upload & Polling Pipeline
+## Upload Lifecycle Pipeline
 
 ### Overview
 
-The upload pipeline uploads match chunks to the backend and polls for analysis
-completion. It consists of five services working together to upload match
-chunks, poll for completion, and enrich local metadata with analysis results.
+The upload lifecycle uploads match chunks to the backend, persists pre- and
+post-acceptance state for restart safety, tracks accepted uploads over SSE, and
+falls back to the status endpoint when realtime transport is interrupted.
 
 **Key Architecture:**
 
-- **Backend determines analysis response:** Desktop trusts server response
-- **No client-side classification:** Analysis data presence determined by backend
-- **Contract violation guard:** Prevents infinite loops via 3-strike malformed
-  payload detection
+- **Acceptance boundary is explicit:** uploads are local-only until `/api/upload`
+  returns an accepted tracking contract
+- **Accepted tracking is server-authoritative:** desktop only tracks accepted
+  uploads via the backend contract (`acceptedJobId`, `statusPath`,
+  `realtimePath`)
+- **No client-side entitlement classification:** analysis payload presence is
+  determined entirely by the backend
+- **Status endpoint is recovery, not hot path:** SSE is primary; status is used
+  on reconnect/restart and for diagnostics
 
 **Services:**
 
-1. **JobStateStore** - Persists job correlation across restarts
-2. **UploadService** - Uploads chunks to backend API
-3. **CompletionPollingService** - Polls for job completion
-4. **AnalysisEnrichmentService** - Enriches metadata with analysis results
-5. **ApiHeadersProvider** - Centralizes authentication header management
+1. **UploadLifecycleService** - Owns upload retries, acceptance transitions,
+   persistence, and terminal cleanup
+2. **UploadLifecycleStore** - Persists local-pending and accepted uploads across
+   restarts
+3. **UploadService** - Uploads chunks to backend API and returns the accepted
+   tracking contract
+4. **AcceptedUploadTracker** - Tracks accepted uploads over SSE with status-call
+   fallback
+5. **AnalysisEnrichmentService** - Enriches metadata with analysis results
+6. **ApiHeadersProvider** - Centralizes authentication header management
 
 ---
 
-### JobStateStore
+### UploadLifecycleService
 
-**File:** `JobStateStore.ts`
+**File:** `upload-lifecycle/UploadLifecycleService.ts`
 
-**Responsibility:** Persists pending upload state to disk for recovery across
-application restarts.
+**Responsibility:** Primary upload-lifecycle coordinator. Owns the
+pre-acceptance retry loop, acceptance-state persistence, restart recovery
+branching, accepted-upload tracker wiring, and terminal cleanup for both
+local-pending and accepted uploads.
+
+**Constructor dependencies:**
+
+- `uploadService: UploadService`
+- `acceptedUploadTracker: AcceptedUploadTracker`
+- `lifecycleStore: UploadLifecycleStore`
+- `headersProvider: ApiHeadersProvider`
+- `uploadRecoveryService: UploadRecoveryService`
 
 **Key APIs:**
 
 ```typescript
-savePendingUploads(uploads: Map<string, CorrelationData>): Promise<void>
-loadPendingUploads(): Promise<Map<string, CorrelationData>>
-clearPendingUploads(): Promise<void>
-getStats(): Promise<StorageStats>
+initialize(): Promise<void>
+resumePendingUploads(): Promise<void>
+submitMatchChunk(
+  chunkFilePath: string,
+  matchMetadata: MatchEndedEvent,
+  matchHash: string
+): Promise<string>
+getStatus(): UploadLifecycleSnapshot
+cleanup(): Promise<void>
+updateAuthToken(token?: string): void
+```
+
+**State model:**
+
+- `local_pending` - desktop has a chunk and metadata, but `/api/upload` has not
+  yet returned accepted tracking
+- `accepted` - backend accepted the upload and returned
+  `{ acceptedJobId, statusPath, realtimePath }`; the desktop now tracks only the
+  accepted server-known upload
+
+**Restart behavior:**
+
+- `initialize()` loads persisted lifecycle state from `UploadLifecycleStore`
+- `resumePendingUploads()` branches deterministically:
+  - `accepted` records resume via `AcceptedUploadTracker`
+  - `local_pending` records resume via `UploadRecoveryService` and re-enter the
+    pre-acceptance upload loop
+
+**Acceptance and terminal behavior:**
+
+- `/api/upload` success is not considered complete until accepted state is
+  durably persisted
+- accepted-upload terminal events are not forwarded until accepted-record cleanup
+  is durably persisted
+- pre-acceptance uploads stop retrying once they cross the existing
+  `ExpirationConfig` combat-log expiration boundary
+
+**Events:**
+
+- `analysisJobCreated: { jobId, matchHash, status }`
+- `analysisProgress: { jobId, status, message, matchHash }`
+- `analysisCompleted: { jobId, matchHash, analysisId?, analysisPayload? }`
+- `analysisFailed: { jobId, matchHash, error, errorCode?, isPermanent?, isNotFound? }`
+- `uploadRetrying: { matchHash, attempt, nextAttempt, delayMs, ...error }`
+- `transportError: { jobId, matchHash, error }`
+- `authRequired: { jobId, matchHash, error }`
+- `serviceStatusChanged: { activeUploadsCount, localPendingUploadsCount, acceptedUploadsCount, activeUploadAttempts, lastStatusObservedAt }`
+
+**Key patterns:**
+
+- Explicit acceptance boundary
+- Durable persistence before lifecycle transitions proceed
+- Local-pending vs accepted restart split
+- Shutdown-aware cancellation for local upload attempts
+- Accepted-upload auth failures surface through `authRequired`, not transport retry noise
+
+---
+
+### UploadLifecycleStore
+
+**File:** `upload-lifecycle/UploadLifecycleStore.ts`
+
+**Responsibility:** Persists local-pending and accepted uploads to disk for
+restart-safe recovery.
+
+**Key APIs:**
+
+```typescript
+savePendingUploads(uploads: Map<string, UploadLifecycleRecord>): Promise<void>
+loadPendingUploads(): Promise<Map<string, UploadLifecycleRecord>>
 ```
 
 **Dependencies:** None
@@ -78,26 +164,16 @@ getStats(): Promise<StorageStats>
 **State:**
 
 - **Location:** `{userDataPath}/pending-uploads.json`
-- **Format:** JSON object mapping `jobId → CorrelationData`
-
-**CorrelationData Structure:**
-
-```typescript
-{
-  matchHash: string;
-  timestamp: number;
-  // Simple retry tracking
-  errorType?: 'rate_limit' | 'auth' | 'server' | 'network' | 'permanent_server';
-  retryCount?: number;
-  nextRetryAt?: number;
-}
-```
+- **Format:** JSON object mapping local upload IDs to `UploadLifecycleRecord`
+- **Migration behavior:** legacy pending records without acceptance are migrated
+  into `local_pending` state and retried instead of being tracked as accepted
 
 **Key Patterns:**
 
 - **Atomic writes** - Temp file + rename for crash safety
 - **Directory auto-creation** - Creates parent directories if missing
-- **Silent failures on load** - Returns empty Map if file doesn't exist
+- **Conservative recovery** - Restores accepted tracking only when the accepted
+  server contract is present
 
 ---
 
@@ -116,7 +192,7 @@ uploadChunk(
   matchMetadata: MatchEndedEvent,
   matchHash: string,
   jobId: string
-): Promise<void>
+): Promise<UploadAcceptedResponse>
 
 getConfig(): { apiBaseUrl, uploadEndpoint, hasAuth }
 ```
@@ -138,7 +214,7 @@ getConfig(): { apiBaseUrl, uploadEndpoint, hasAuth }
 
 **Integration:**
 
-- Called by `JobQueueOrchestrator.submitMatchChunk()`
+- Called by `UploadLifecycleService.submitMatchChunk()`
 - Reports success/failure to `ServiceHealthCheck`
 - Uses `ApiHeadersProvider` for optional authentication
 
@@ -147,120 +223,77 @@ getConfig(): { apiBaseUrl, uploadEndpoint, hasAuth }
 - Validates file exists before upload
 - Distinguishes network/5xx (service down) vs 4xx (client error)
 - Idempotent responses treated as success
-- No retries (delegated to orchestrator)
+- No retries (delegated to `UploadLifecycleService`)
 
 **Key Patterns:**
 
 - Atomic file validation
 - Health integration
-- Idempotency awareness
+- Accepted-upload contract normalization
 
 ---
 
-### CompletionPollingService
+### AcceptedUploadTracker
 
-**File:** `CompletionPollingService.ts`
+**File:** `upload-lifecycle/AcceptedUploadTracker.ts`
 
-**Responsibility:** Polls backend for job completion status with exponential
-backoff.
+**Responsibility:** Tracks accepted uploads over SSE and falls back to the
+status endpoint when the realtime transport drops.
 
 **Key APIs:**
 
 ```typescript
-trackJob(jobId: string, matchHash: string): void
-stopTrackingJob(jobId: string): void
-getTrackedJobIds(): string[]
+trackAcceptedUpload(tracking: UploadTrackingContract, matchHash: string): void
+stopTracking(jobId: string): void
 stopAll(): void
-pausePolling(): void
-resumePolling(): void
-updateAuthToken(newToken?: string): void
-handleServiceHealth(isHealthy: boolean): void
-getPollingStats(): PollingStats
+getTrackedCount(): number
 ```
 
 **Dependencies:**
 
-- `config: CompletionPollingConfig` (apiBaseUrl, authToken, intervals, limits)
+- `apiBaseUrl: string`
+- `headersProvider: ApiHeadersProvider`
+- `statusClient: UploadStatusClient`
+- `healthCheck?: ServiceHealthCheck`
 
 **External:**
 
-- `axios` - HTTP polling
+- `fetch` - SSE transport
 - `EventEmitter` - Event notifications
 - `ServiceHealthCheck` - Health integration
 
 **State:**
 
-- **In-memory only:** `trackedJobs` Map with per-job state
-- **Per-job state:** `jobId`, `matchHash`, `currentDelayMs`, `lastStatus`,
-  `lastPolled`, `startTime`, `timer`, `isPaused`, `isPolling`,
-  `contractViolationCount`
+- **In-memory only:** accepted-upload session map keyed by accepted job ID
+- **Per-session state:** tracking contract, match hash, last status,
+  reconnect attempts, abort controller
 
 **Events:**
 
-- `trackingStarted: { jobId, matchHash }`
-- `trackingStopped: { jobId }`
 - `analysisProgress: { jobId, status, message, matchHash }`
 - `analysisCompleted: { jobId, matchHash, analysisId?, analysisPayload? }`
-- `analysisFailed: { jobId, matchHash, error }`
-- `pollError: { jobId, matchHash, error }`
-- `authRequired: { jobId, matchHash, reason }`
-- `serviceStatusChanged: { pollingActive, trackedJobsCount, lastPollOkAt }`
+- `analysisFailed: { jobId, matchHash, error, errorCode?, isNotFound? }`
+- `transportError: { jobId, matchHash, error }`
+- `authRequired: { jobId, matchHash, error }`
+- `serviceStatusChanged: { trackingActive, acceptedUploadsCount, lastStatusObservedAt }`
 
-**Configuration:**
-
-```typescript
-DEFAULT_BASE_INTERVAL_MS = 5000; // 5 seconds
-DEFAULT_MAX_BACKOFF_MS = 60000; // 60 seconds
-DEFAULT_MAX_CONCURRENT_POLLS = 6; // Concurrent job limit
-DEFAULT_WARMUP_NOTFOUND_MS = 120000; // 2-minute warm-up for 404s
-HTTP_TIMEOUT_MS = 10000; // 10-second request timeout
-JITTER_PERCENT = 0.1; // ±10% jitter
-MAX_CONTRACT_VIOLATIONS_BEFORE_FAILURE = 3;
-```
-
-**Backend-Driven Completion:**
-
-The desktop trusts the backend `JobStatusResponse`:
+**Behavior:**
 
 ```typescript
-interface JobStatusResponse {
-  success: boolean;
-  jobId: string;
-  analysisStatus: string;
-  analysisId: string | null;
-  uuid: string | null;
-  hasData: boolean;
-  analysisData?: unknown;
-  // Standardized error shape (WI-02)
-  error?: { code: string; message: string; details?: unknown };
-  errorCode?: string;
-  isPermanent?: boolean;
-}
+1. Open SSE stream to tracking.realtimePath
+2. Apply canonical status events to the local session
+3. If the stream drops, call tracking.statusPath for recovery
+4. Reconnect with bounded backoff unless a terminal state is reached
 ```
-
-**Completion behavior:**
-
-- When `analysisStatus === 'completed'`:
-  - If `analysisId` non-null and `analysisData` is array: Emit
-    `analysisCompleted` with payload
-  - If `analysisId` null: Emit `analysisCompleted` without payload
-  - Both cases stop tracking the job (no infinite polling)
-
-**Contract Violation Guard:**
-
-- Detects malformed responses: `analysisId` non-null but `analysisData` not an
-  array
-- Tracks violations per job (max 3)
-- After threshold: Emits `analysisFailed`
-- Prevents infinite loops even if backend regresses
 
 **Key Patterns:**
 
-- **Exponential backoff with jitter** - Prevents thundering herd
-- **Warm-up window for 404s** - Jobs need time to appear in backend
-- **Pause/resume support** - Handles auth failures gracefully
-- **Concurrent poll limiting** - Max 6 polls at once
-- **Idempotent tracking** - Duplicate `trackJob()` calls ignored
+- **SSE-first accepted tracking** - polling is no longer the primary transport
+- **Canonical recovery path** - status endpoint is used after transport errors
+- **Contract violation guard** - completed responses with malformed payloads
+  fail explicitly
+- **Idempotent registration** - duplicate `trackAcceptedUpload()` calls are
+  ignored
 
 ---
 
@@ -276,8 +309,9 @@ data via single atomic write.
 ```typescript
 finalizeCompletion(
   jobId: string,
-  analysisId: string | undefined,
-  analysisPayload: AnalysisPayload | undefined
+  analysisId: number | undefined,
+  analysisPayload: AnalysisPayload | undefined,
+  freemiumFields: FreemiumQuotaFields
 ): Promise<void>
 ```
 
@@ -387,7 +421,7 @@ initialize(installations: WoWInstallation[]): Promise<void>
 start(): Promise<void>
 stop(): Promise<void>
 updateAuthToken(token: string): void
-setJobQueueOrchestrator(orchestrator: JobQueueOrchestrator): void
+setUploadLifecycleService(orchestrator: UploadLifecycleService): void
 getStatusWithProcessCheck(): Promise<MatchDetectionStatus>
 getStatus(): MatchDetectionStatus
 getCurrentMatch(): { bracket: string; timestamp: Date } | null
@@ -402,7 +436,7 @@ cleanup(): Promise<void>
 **External:**
 
 - `MatchDetectionOrchestrator` - Core detection pipeline
-- `JobQueueOrchestrator` - Upload pipeline
+- `UploadLifecycleService` - Upload pipeline
 - `WoWProcessMonitor` - Process monitoring
 
 **State:**
@@ -424,8 +458,8 @@ cleanup(): Promise<void>
 
 - **Adapter pattern** - Wraps orchestrator, forwards events
 - **Initialization guard** - Prevents duplicate initialization
-- **Retail-only filter** - Filters installations to `_retail_` paths only
-- **Lazy orchestrator setup** - Can set `JobQueueOrchestrator` before/after init
+- **Active-flavor filter** - Rejects installations that do not match `activeFlavor.dirName`
+- **Lazy orchestrator setup** - Can set `UploadLifecycleService` before/after init
 - **Optional process check** - One-time WoW process status for UI
 
 ---
@@ -638,7 +672,7 @@ saveMatch(metadata: StoredMatchMetadata): Promise<void>
 loadMatchByBufferId(bufferId: string): Promise<StoredMatchMetadata | null>
 loadMatch(matchHash: string): Promise<StoredMatchMetadata | null>
 findMatchByJobId(jobId: string): Promise<StoredMatchMetadata | null>
-updateMatchStatus(matchHash: string, status: UploadStatus, additionalData?: {}): Promise<void>
+updateMatchStatus(matchHash: string, status: UploadStatus, additionalData?: {}): Promise<UploadStatus | null>
 updateVideoMetadataByBufferId(bufferId: string, videoData: VideoMetadataUpdate): Promise<void>
 updateFavouriteByBufferId(bufferId: string, isFavourite: boolean): Promise<void>
 listFavouriteVideoPathsWithDiagnostics(): Promise<{ paths: Set<string>; scanErrors: Array<{ file: string; error: string }> }>
@@ -1057,30 +1091,30 @@ cleanup(): void
 
 ## Cross-Service Data Flow
 
-### Upload → Poll → Enrich Flow
+### Upload → Track → Enrich Flow
 
 ```
 1. Match Detected (Complete)
    ├─ MatchLifecycleService validates and finalizes
    └─ MetadataService.finalizeCompleteMatch() creates metadata with hash
 
-2. Job Queue Orchestration
-   ├─ JobQueueOrchestrator.submitMatchChunk()
-   ├─ Generates jobId (UUID)
-   ├─ Persists CorrelationData via JobStateStore (entitlement-agnostic)
-   └─ Logs hasAuth for diagnostics only (no entitlement classification)
+2. Upload Lifecycle Coordination
+   ├─ UploadLifecycleService.submitMatchChunk()
+   ├─ Generates local upload ID (UUID)
+   ├─ Persists local-pending state via UploadLifecycleStore
+   └─ Treats the upload as local-only until backend acceptance is confirmed
 
 3. Upload
    ├─ UploadService.uploadChunk()
    ├─ Multipart POST to /api/upload with optional auth header
-   ├─ Returns jobId
+   ├─ Returns accepted tracking contract
    └─ Reports health to ServiceHealthCheck
 
-4. Polling
-   ├─ CompletionPollingService.trackJob(jobId, matchHash)
-   ├─ Polls /api/upload/job-status/:jobId with backoff
-   ├─ Backend queries DB for entitlements, returns isPremiumViewer + conditional payload
-   ├─ Desktop trusts backend response (no local entitlement inference)
+4. Accepted Upload Tracking
+   ├─ AcceptedUploadTracker.trackAcceptedUpload(tracking, matchHash)
+   ├─ Opens SSE stream to tracking.realtimePath
+   ├─ Falls back to tracking.statusPath after reconnect/restart or transport failure
+   ├─ Backend recomputes canonical status and entitlement-gated payload
    └─ Emits analysisCompleted (with/without payload) or analysisFailed
 
 5. Enrichment
@@ -1147,15 +1181,15 @@ cleanup(): void
 
 **Upload retries:**
 
-- Delegated to `JobQueueOrchestrator`
+- Delegated to `UploadLifecycleService`
 - Exponential backoff: 1s → 5m max
 - Permanent vs transient error classification
 
-**Polling retries:**
+**Accepted-upload transport recovery:**
 
-- Exponential backoff: 5s → 60s (with jitter)
-- Automatic on poll failure
-- No attempt-based cap for required jobs
+- SSE is the primary accepted-upload transport
+- Status endpoint is the canonical recovery path after disconnects/restarts
+- Reconnect backoff: 1s → 30s max
 
 **File operation retries:**
 
@@ -1204,7 +1238,7 @@ cleanup(): void
 
 **Duplicate tracking:**
 
-- `trackJob()` ignores if job already tracked
+- `trackAcceptedUpload()` ignores if job already tracked
 
 **Duplicate metadata writes:**
 
@@ -1218,7 +1252,7 @@ cleanup(): void
 
 | Service                | Location                          | Format         | Purpose                              |
 | ---------------------- | --------------------------------- | -------------- | ------------------------------------ |
-| JobStateStore          | `{userData}/pending-uploads.json` | JSON           | Job correlation for restart recovery |
+| UploadLifecycleStore          | `{userData}/pending-uploads.json` | JSON           | Job correlation for restart recovery |
 | MetadataStorageService | `{userData}/logs/matches/`        | JSON per match | Match metadata                       |
 | SettingsService        | `{userData}/config.json`          | JSON           | App settings                         |
 | RecordingService       | `{recordingLocation}/`            | MP4 videos     | Match recordings                     |
@@ -1240,10 +1274,12 @@ All services use **temp file + rename** for crash safety:
 
 ```
 App Start
-  ├─ JobStateStore.loadPendingUploads()
-  ├─ For each pending job:
-  │   └─ CompletionPollingService.trackJob(jobId, matchHash, { expectedEvents })
-  └─ Polling resumes exactly where it left off
+  ├─ UploadLifecycleStore.loadPendingUploads()
+  ├─ For each accepted upload:
+  │   └─ AcceptedUploadTracker.trackAcceptedUpload(tracking, matchHash)
+  ├─ For each local-pending upload:
+  │   └─ UploadRecoveryService rehydrates chunk + metadata and retries upload
+  └─ Non-accepted uploads are never resumed via server status
 ```
 
 ---
@@ -1256,22 +1292,35 @@ App Start
 │  (Orchestrator wrapper, event forwarding)                   │
 └─────────────────────────────────────────────────────────────┘
          │
-         ├──▶ JobQueueOrchestrator (injected via setter)
+         ├──▶ UploadLifecycleService (injected via setter)
          │      │
          │      ├──▶ UploadService
          │      │      ├──▶ ApiHeadersProvider
          │      │      └──▶ ServiceHealthCheck
          │      │
-         │      ├──▶ CompletionPollingService
+         │      ├──▶ AcceptedUploadTracker
          │      │      └──▶ ServiceHealthCheck
          │      │
-         │      ├──▶ JobStateStore
+         │      ├──▶ UploadLifecycleStore
          │      └──▶ ApiHeadersProvider
+
+┌─────────────────────────────────────────────────────────────┐
+│                      MatchLifecycleService                   │
+│  (Session SSoT, metadata + recording coordination)          │
+└─────────────────────────────────────────────────────────────┘
          │
-         └──▶ MetadataService
-                ├──▶ MetadataStorageService
-                └──▶ AnalysisEnrichmentService
-                       └──▶ MetadataStorageService
+         ├──▶ MetadataService
+         │      └──▶ MetadataStorageService
+         └──▶ RecordingService
+                ├──▶ MetadataService
+                └──▶ SettingsService
+
+┌─────────────────────────────────────────────────────────────┐
+│                  AnalysisEnrichmentService                   │
+│  (Accepted-upload completion enrichment)                    │
+└─────────────────────────────────────────────────────────────┘
+         │
+         └──▶ MetadataStorageService
 
 ┌─────────────────────────────────────────────────────────────┐
 │                      RecordingService                        │
@@ -1284,7 +1333,7 @@ App Start
          │      ├──▶ OBSPreviewManager
          │      └──▶ RecordingStorageManager
          │
-         ├──▶ MetadataStorageService
+         ├──▶ MetadataService
          └──▶ SettingsService
 ```
 
@@ -1296,22 +1345,23 @@ App Start
 
 | Service                  | Baseline | Per-Job/Match                 |
 | ------------------------ | -------- | ----------------------------- |
-| CompletionPollingService | ~1 MB    | ~500 bytes per tracked job    |
+| AcceptedUploadTracker | ~1 MB    | ~500 bytes per tracked job    |
 | MetadataStorageService   | ~2 MB    | ~10 KB per match file         |
-| JobStateStore            | ~100 KB  | ~200 bytes per pending upload |
+| UploadLifecycleStore            | ~100 KB  | ~200 bytes per pending upload |
 | RecordingService         | ~5 MB    | 0 (files on disk)             |
 | OBSRecorder              | ~50 MB   | 0 (OBS overhead)              |
 
 ### Concurrency Limits
 
-- **Polling:** Max 6 concurrent job status requests
+- **Accepted uploads:** One SSE stream per accepted upload
+- **Local upload attempts:** Determined by active local uploads; tracked explicitly by `UploadLifecycleService`
 - **Metadata writes:** Per-key mutex (unlimited concurrent for different keys)
 - **Chunk cleanup:** Parallel deletion (Promise.all, no limit)
 
 ### Timing Characteristics
 
-- **Polling base interval:** 5 seconds
-- **Polling max backoff:** 60 seconds
+- **Upload retry backoff:** 1 second → 5 minutes max
+- **SSE reconnect backoff:** 1 second → 30 seconds max
 - **File rename retry:** 1 second between attempts
 - **WoW detection backoff:** 500ms → 30s max
 - **Health check timeout:** 5 seconds
@@ -1375,7 +1425,7 @@ this.healthCheck?.reportSuccess(); // Only if provided
 ## Future Enhancement Areas
 
 1. **Cross-Platform Support** - Abstract Windows-specific patterns
-2. **WebSocket Polling** - Replace HTTP polling for lower latency
+2. **Upload Lifecycle Metrics** - Export accepted/local upload counts for diagnostics
 3. **Distributed Tracing** - Correlation IDs across all services
 4. **Metrics Collection** - Prometheus-style metrics export
 5. **Configuration Hot-Reload** - Update settings without restart

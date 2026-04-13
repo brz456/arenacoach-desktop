@@ -129,6 +129,17 @@ class MatchUI {
         }
     }
 
+    static mapAnalysisStatusToUploadStatus(status) {
+        const statusMap = {
+            completed: MatchUI.STATUS_COMPLETED,
+            queued: MatchUI.STATUS_QUEUED,
+            processing: MatchUI.STATUS_PROCESSING,
+            pending: MatchUI.STATUS_PENDING,
+            uploading: MatchUI.STATUS_UPLOADING
+        };
+        return statusMap[status] || null;
+    }
+
     // Team ID constants for team identification
     static TEAM_ID_0 = '0';
     static TEAM_ID_1 = '1';
@@ -196,6 +207,51 @@ class MatchUI {
         this.startRecordingStateMonitoring(); // Start event-driven recording state monitoring
         this.startMatchActiveMonitoring(); // Start event-driven match state monitoring
         this.setupSettingsListener(); // Listen for settings changes
+    }
+
+    applyStatusUpdate(event) {
+        if (!event?.matchHash || !event.status) {
+            return;
+        }
+
+        // Update in-memory match object so re-opening video shows correct status
+        const matchInMemory = this.recentMatches.find(m => m.matchHash === event.matchHash);
+        if (matchInMemory) {
+            matchInMemory.uploadStatus = event.status;
+            matchInMemory.queuePosition = event.queuePosition;
+            matchInMemory.totalInQueue = event.totalInQueue;
+        }
+
+        // Find and update the specific status button (match cards)
+        const statusBtn = document.getElementById(`status-persistent-${event.matchHash}`);
+        if (statusBtn) {
+            // Update button class
+            statusBtn.className = `analysis-button-inline status-${event.status}`;
+
+            // Use helper method to populate button content
+            const text = MatchUI.formatStatusForDisplay(
+                event.status,
+                event.queuePosition,
+                event.totalInQueue
+            );
+            const showSpinner = [MatchUI.STATUS_UPLOADING, MatchUI.STATUS_PROCESSING].includes(event.status);
+            MatchUI._populateStatusButton(statusBtn, text, showSpinner);
+        }
+
+        // Also update video status bar if this match is currently open
+        if (this._currentVideoMatchHash && event.matchHash === this._currentVideoMatchHash) {
+            // Build a lightweight match object with live status data
+            const liveMatch = {
+                uploadStatus: event.status,
+                queuePosition: event.queuePosition,
+                totalInQueue: event.totalInQueue,
+                // Empty/default values for fields that only exist after completion
+                events: [],
+                hasEventEnrichment: false,
+                freeQuotaExhausted: false,
+            };
+            this.updateVideoEnrichmentStatus(liveMatch);
+        }
     }
 
     setupElements() {
@@ -302,12 +358,11 @@ class MatchUI {
         this.ipcListeners.push(
             window.arenaCoach.match.onAnalysisJobCreated(async (event) => {
                 if (event.matchHash && event.jobId) {
-                    // Persist 'queued' status to JSON files via IPC (Single Source of Truth)
-                    try {
-                        await window.arenaCoach.match.updateLiveStatus(event.matchHash, MatchUI.STATUS_QUEUED);
-                    } catch (error) {
-                        console.error(`Failed to persist queued status for match ${event.matchHash}:`, error);
-                    }
+                    this.jobToMatchHashMap.set(event.jobId, event.matchHash);
+                    this.applyStatusUpdate({
+                        matchHash: event.matchHash,
+                        status: MatchUI.STATUS_QUEUED
+                    });
 
                     // Check if completion event already arrived (race condition handling)
                     if (this.unprocessedCompletions.has(event.jobId)) {
@@ -318,9 +373,6 @@ class MatchUI {
                         }
                         // Clean up - completion has been processed
                         this.unprocessedCompletions.delete(event.jobId);
-                    } else {
-                        // Normal case: creation before completion
-                        this.jobToMatchHashMap.set(event.jobId, event.matchHash);
                     }
 
                     // Refresh UI to show the newly created match
@@ -331,47 +383,31 @@ class MatchUI {
         );
 
 
-        // Handle analysis progress - persist to JSON via Single Source of Truth pattern
+        // Handle analysis progress for live renderer updates. Main/storage own persistence.
         this.ipcListeners.push(
             window.arenaCoach.match.onAnalysisProgress(async (event) => {
-                // Persist status changes to JSON files via IPC (Single Source of Truth)
-                if (event.jobId) {
-                    const matchHash = this.jobToMatchHashMap.get(event.jobId);
+                if (event.jobId || event.matchHash) {
+                    const matchHash = event.matchHash || this.jobToMatchHashMap.get(event.jobId);
                     if (matchHash) {
-                        try {
-                            // Call IPC to persist status and progress message to JSON files
-                            // Skip failure/ambiguous statuses in progress events:
-                            // - 'failed': handled by analysisFailed event with error details
-                            // - 'not_found': transient during warmup, terminal after warmup triggers analysisFailed
-                            if (event.status === 'failed' || event.status === 'not_found') {
-                                return;
-                            }
-
-                            // Map to UI status constants (no silent fallback)
-                            const statusMap = {
-                                'completed': MatchUI.STATUS_COMPLETED,
-                                'queued': MatchUI.STATUS_QUEUED,
-                                'processing': MatchUI.STATUS_PROCESSING,
-                                'pending': MatchUI.STATUS_PENDING,
-                                'uploading': MatchUI.STATUS_UPLOADING
-                            };
-                            const statusToUse = statusMap[event.status];
-                            if (!statusToUse) {
-                                console.warn('[MatchUI] Unknown analysisProgress status:', event.status);
-                                return; // Don't persist unknown status as processing
-                            }
-
-                            await window.arenaCoach.match.updateLiveStatus(
-                                matchHash,
-                                statusToUse,
-                                event.message || null,
-                                event.queuePosition || null,
-                                event.totalInQueue || null
-                            );
-                        } catch (error) {
-                            console.error(`Failed to persist progress for match ${matchHash}:`, error);
-                            NotificationManager.show('Failed to update match status', 'error');
+                        // Skip terminal/ambiguous statuses in progress events:
+                        // - 'failed': handled by analysisFailed event with error details
+                        // - 'not_found': transient during warmup, terminal after warmup triggers analysisFailed
+                        if (event.status === 'failed' || event.status === 'not_found') {
+                            return;
                         }
+
+                        const statusToUse = MatchUI.mapAnalysisStatusToUploadStatus(event.status);
+                        if (!statusToUse) {
+                            console.warn('[MatchUI] Unknown analysisProgress status:', event.status);
+                            return;
+                        }
+
+                        this.applyStatusUpdate({
+                            matchHash,
+                            status: statusToUse,
+                            queuePosition: event.queuePosition,
+                            totalInQueue: event.totalInQueue
+                        });
                     }
                 }
             })
@@ -478,44 +514,7 @@ class MatchUI {
                         return;
                     }
 
-                    // Update in-memory match object so re-opening video shows correct status
-                    const matchInMemory = this.recentMatches.find(m => m.matchHash === event.matchHash);
-                    if (matchInMemory) {
-                        matchInMemory.uploadStatus = event.status;
-                        matchInMemory.queuePosition = event.queuePosition;
-                        matchInMemory.totalInQueue = event.totalInQueue;
-                    }
-
-                    // Find and update the specific status button (match cards)
-                    const statusBtn = document.getElementById(`status-persistent-${event.matchHash}`);
-                    if (statusBtn) {
-                        // Update button class
-                        statusBtn.className = `analysis-button-inline status-${event.status}`;
-
-                        // Use helper method to populate button content
-                        const text = MatchUI.formatStatusForDisplay(
-                            event.status,
-                            event.queuePosition,
-                            event.totalInQueue
-                        );
-                        const showSpinner = [MatchUI.STATUS_UPLOADING, MatchUI.STATUS_PROCESSING].includes(event.status);
-                        MatchUI._populateStatusButton(statusBtn, text, showSpinner);
-                    }
-
-                    // Also update video status bar if this match is currently open
-                    if (this._currentVideoMatchHash && event.matchHash === this._currentVideoMatchHash) {
-                        // Build a lightweight match object with live status data
-                        const liveMatch = {
-                            uploadStatus: event.status,
-                            queuePosition: event.queuePosition,
-                            totalInQueue: event.totalInQueue,
-                            // Empty/default values for fields that only exist after completion
-                            events: [],
-                            hasEventEnrichment: false,
-                            freeQuotaExhausted: false,
-                        };
-                        this.updateVideoEnrichmentStatus(liveMatch);
-                    }
+                    this.applyStatusUpdate(event);
 
                     // If the button is not found, we do nothing. It will be rendered correctly
                     // during the next full list render. A fallback to re-render all matches here
@@ -2454,8 +2453,8 @@ class MatchUI {
             },
             // Desktop synthetic errors
             JOB_NOT_FOUND: {
-                short: 'Analysis Missing',
-                long: 'Analysis not found on server (may have been cleaned up)',
+                short: 'Upload Missing',
+                long: 'Accepted upload record is missing on the server after acceptance',
             },
             BACKEND_CONTRACT_VIOLATION: {
                 short: 'Analysis Error',
@@ -2464,6 +2463,14 @@ class MatchUI {
             ANALYSIS_TIMEOUT: {
                 short: 'Timed Out',
                 long: 'Analysis timed out after maximum attempts',
+            },
+            UPLOAD_RECOVERY_FAILED: {
+                short: 'Upload Lost',
+                long: 'Upload could not be resumed because the local chunk or match data is missing',
+            },
+            UPLOAD_REJECTED: {
+                short: 'Upload Rejected',
+                long: 'Upload did not reach server acceptance',
             },
         };
 

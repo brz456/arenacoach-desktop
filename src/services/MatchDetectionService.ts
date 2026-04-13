@@ -5,7 +5,7 @@ import MatchDetectionOrchestrator, {
   OrchestratorConfig,
   MatchProcessedPayload,
 } from '../match-detection/MatchDetectionOrchestrator';
-import { JobQueueOrchestrator } from '../match-detection/pipeline/JobQueueOrchestrator';
+import { UploadLifecycleService } from './upload-lifecycle/UploadLifecycleService';
 import { WoWInstallation } from '../wowInstallation';
 import {
   WoWProcessMonitorError,
@@ -61,7 +61,7 @@ export interface MatchDetectionStatus {
  */
 export class MatchDetectionService extends EventEmitter {
   private orchestrator?: MatchDetectionOrchestrator | undefined;
-  private jobQueueOrchestrator?: JobQueueOrchestrator;
+  private uploadLifecycleService?: UploadLifecycleService;
   private config: MatchDetectionServiceConfig;
   private installations: WoWInstallation[] = [];
   private outputDirectory: string;
@@ -135,9 +135,9 @@ export class MatchDetectionService extends EventEmitter {
     // Create orchestrator
     this.orchestrator = new MatchDetectionOrchestrator(orchestratorConfig);
 
-    // Pass JobQueueOrchestrator to the MatchDetectionOrchestrator if already set
-    if (this.jobQueueOrchestrator) {
-      this.orchestrator.setJobQueueOrchestrator(this.jobQueueOrchestrator);
+    // Pass UploadLifecycleService to the MatchDetectionOrchestrator if already set
+    if (this.uploadLifecycleService) {
+      this.orchestrator.setUploadLifecycleService(this.uploadLifecycleService);
     }
 
     this.setupEventHandlers();
@@ -183,6 +183,7 @@ export class MatchDetectionService extends EventEmitter {
     } catch (error) {
       console.error('[MatchDetectionService] Error stopping:', error);
       this.emit('error', error);
+      throw error;
     }
   }
 
@@ -198,16 +199,15 @@ export class MatchDetectionService extends EventEmitter {
   }
 
   /**
-   * Set the JobQueueOrchestrator to use for uploads
-   * This allows using the new decomposed services for upload processing
+   * Set the upload lifecycle service used for upload processing.
    */
-  public setJobQueueOrchestrator(orchestrator: JobQueueOrchestrator): void {
-    console.info('[MatchDetectionService] Setting JobQueueOrchestrator');
-    this.jobQueueOrchestrator = orchestrator;
+  public setUploadLifecycleService(service: UploadLifecycleService): void {
+    console.info('[MatchDetectionService] Setting UploadLifecycleService');
+    this.uploadLifecycleService = service;
 
     // Pass to MatchDetectionOrchestrator if already initialized
     if (this.orchestrator) {
-      this.orchestrator.setJobQueueOrchestrator(orchestrator);
+      this.orchestrator.setUploadLifecycleService(service);
     }
   }
 

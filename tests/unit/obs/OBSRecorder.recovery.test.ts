@@ -15,6 +15,7 @@ const mockState = vi.hoisted(() => {
   const state = {
     signalHandlers: [] as Array<(signal: any) => void>,
     lastRecording: null as string | null,
+    recordingEncoderId: 'obs_x264',
     recoveryInitGate: null as Promise<void> | null,
     initializeCount: 0,
     videoSettings: {
@@ -55,11 +56,18 @@ const mockState = vi.hoisted(() => {
     captureListMonitors: vi.fn(() => []),
     captureSetMonitorById: vi.fn(() => true),
     settingsGetVideoSettings: vi.fn(() => ({ ...state.videoSettings })),
-    settingsConfigureOutput: vi.fn(),
+    settingsConfigureOutput: vi.fn((options?: { encoderId?: string; preserveCurrentEncoder?: boolean }) => {
+      if (options?.encoderId) {
+        state.recordingEncoderId = options.encoderId;
+      }
+    }),
     settingsApplySetting: vi.fn(),
     settingsUpdateConfig: vi.fn(),
-    settingsApplyEncoderById: vi.fn(() => true),
-    settingsGetRecordingEncoderId: vi.fn(() => 'obs_x264'),
+    settingsApplyEncoderById: vi.fn((encoderId: string) => {
+      state.recordingEncoderId = encoderId;
+      return true;
+    }),
+    settingsGetRecordingEncoderId: vi.fn(() => state.recordingEncoderId),
     settingsSetFPS: vi.fn((fps: number) => {
       state.videoSettings = { ...state.videoSettings, fpsNum: fps };
     }),
@@ -181,15 +189,16 @@ vi.mock('../../../src/services/obs/OBSPreviewManager', () => ({
   },
 }));
 
-vi.mock('../../../src/services/obs/encoderResolver', () => ({
-  resolveEncoderSelection: vi.fn(() => ({
-    kind: 'resolved',
-    encoderId: 'obs_x264',
-    mode: 'auto',
-    reason: 'auto_best_available',
-    requestedEncoder: 'x264',
-  })),
-}));
+vi.mock('../../../src/services/obs/encoderResolver', async () => {
+  const actual = await vi.importActual<typeof import('../../../src/services/obs/encoderResolver')>(
+    '../../../src/services/obs/encoderResolver'
+  );
+
+  return {
+    ...actual,
+    resolveEncoderSelection: vi.fn(actual.resolveEncoderSelection),
+  };
+});
 
 import {
   OBSRecorder,
@@ -216,6 +225,7 @@ describe('OBSRecorder recovery', () => {
   beforeEach(() => {
     mockState.signalHandlers.length = 0;
     mockState.lastRecording = null;
+    mockState.recordingEncoderId = 'obs_x264';
     mockState.recoveryInitGate = null;
     mockState.initializeCount = 0;
     mockState.context.video = {
@@ -461,6 +471,119 @@ describe('OBSRecorder recovery', () => {
       expect(recordingErrors[0]).toMatchObject({ code: -1 });
       expect(mockState.initShutdownSequence).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('forces x264 on recovery after a confirmed NVENC start failure', async () => {
+    mockState.encoderTypes.mockReturnValue(['jim_nvenc', 'obs_x264']);
+
+    const recorder = new OBSRecorder();
+    await recorder.initialize();
+
+    expect(mockState.settingsConfigureOutput).toHaveBeenCalledWith({ encoderId: 'jim_nvenc' });
+    expect(mockState.recordingEncoderId).toBe('jim_nvenc');
+
+    await recorder.startRecording('/tmp/session-a');
+
+    const firstGenerationHandler = mockState.signalHandlers[0];
+    firstGenerationHandler({
+      type: 'recording',
+      signal: 'stop',
+      code: -4,
+      error: 'Your driver does not support this NVENC version',
+    });
+
+    await vi.waitFor(() => {
+      expect(mockState.captureInitialize).toHaveBeenCalledTimes(2);
+    });
+
+    expect(mockState.settingsConfigureOutput).toHaveBeenLastCalledWith({ encoderId: 'obs_x264' });
+    expect(mockState.recordingEncoderId).toBe('obs_x264');
+    expect(recorder.getCurrentEncoderId()).toBe('obs_x264');
+  });
+
+  it('forces x264 on recovery after a starting stop error with code -4 and empty error', async () => {
+    mockState.encoderTypes.mockReturnValue(['jim_nvenc', 'obs_x264']);
+
+    const recorder = new OBSRecorder();
+    await recorder.initialize();
+
+    expect(mockState.settingsConfigureOutput).toHaveBeenCalledWith({ encoderId: 'jim_nvenc' });
+    expect(mockState.recordingEncoderId).toBe('jim_nvenc');
+
+    await recorder.startRecording('/tmp/session-a');
+
+    const firstGenerationHandler = mockState.signalHandlers[0];
+    firstGenerationHandler({
+      type: 'recording',
+      signal: 'stop',
+      code: -4,
+      error: '',
+    });
+
+    await vi.waitFor(() => {
+      expect(mockState.captureInitialize).toHaveBeenCalledTimes(2);
+    });
+
+    expect(mockState.settingsConfigureOutput).toHaveBeenLastCalledWith({ encoderId: 'obs_x264' });
+    expect(mockState.recordingEncoderId).toBe('obs_x264');
+    expect(recorder.getCurrentEncoderId()).toBe('obs_x264');
+  });
+
+  it('does not arm CPU fallback for NVENC stop errors after recording has started', async () => {
+    mockState.encoderTypes.mockReturnValue(['jim_nvenc', 'obs_x264']);
+
+    const recorder = new OBSRecorder();
+    await recorder.initialize();
+
+    expect(mockState.settingsConfigureOutput).toHaveBeenCalledWith({ encoderId: 'jim_nvenc' });
+    expect(mockState.recordingEncoderId).toBe('jim_nvenc');
+
+    await recorder.startRecording('/tmp/session-a');
+
+    const firstGenerationHandler = mockState.signalHandlers[0];
+    firstGenerationHandler({ type: 'recording', signal: 'start' });
+    firstGenerationHandler({
+      type: 'recording',
+      signal: 'stop',
+      code: -4,
+      error: '',
+    });
+
+    await vi.waitFor(() => {
+      expect(mockState.captureInitialize).toHaveBeenCalledTimes(2);
+    });
+
+    expect(mockState.settingsConfigureOutput).toHaveBeenLastCalledWith({ encoderId: 'jim_nvenc' });
+    expect(mockState.recordingEncoderId).toBe('jim_nvenc');
+    expect(recorder.getCurrentEncoderId()).toBe('jim_nvenc');
+  });
+
+  it('forces x264 for ready-time manual encoder changes while CPU fallback is armed', async () => {
+    mockState.encoderTypes.mockReturnValue(['jim_nvenc', 'obs_x264']);
+
+    const recorder = new OBSRecorder();
+    await recorder.initialize();
+    await recorder.startRecording('/tmp/session-a');
+
+    const firstGenerationHandler = mockState.signalHandlers[0];
+    firstGenerationHandler({
+      type: 'recording',
+      signal: 'stop',
+      code: -4,
+      error: 'Your driver does not support this NVENC version',
+    });
+
+    await vi.waitFor(() => {
+      expect(mockState.captureInitialize).toHaveBeenCalledTimes(2);
+    });
+
+    mockState.settingsApplyEncoderById.mockClear();
+
+    recorder.setEncoder('nvenc');
+
+    expect(mockState.settingsApplyEncoderById).toHaveBeenCalledWith('obs_x264');
+    expect(mockState.recordingEncoderId).toBe('obs_x264');
+    expect(recorder.getCurrentEncoderId()).toBe('obs_x264');
   });
 
   it('re-seeds currentSettings video values from recovered OBS settings after deferred recovery', async () => {

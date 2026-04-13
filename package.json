@@ -1,6 +1,6 @@
 {
   "name": "arenacoach-desktop",
-  "version": "0.1.47",
+  "version": "0.1.52",
   "description": "ArenaCoach Desktop App - Official desktop companion app for ArenaCoach",
   "main": "dist/main.js",
   "engines": {

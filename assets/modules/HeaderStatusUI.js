@@ -1,13 +1,23 @@
 class HeaderStatusUI {
     constructor() {
         this.ipcListeners = []; // Store cleanup functions for IPC listeners
+        this.hasReceivedDetectionStatusEvent = false;
 
         // Pure event-driven state - never query backend after initialization
         this.rendererState = {
             isInMatch: false,
             matchInfo: null, // { bracket, timestamp }
-            isDetectionActive: false,
-            isWoWRunning: false,
+            detectionStatus: {
+                running: false,
+                initialized: false,
+                installationCount: 0,
+                inactiveReason: null,
+                wowProcessStatus: {
+                    isRunning: false,
+                    isMonitoring: false,
+                    firstPollCompleted: false,
+                },
+            },
             // Freemium quota state
             quota: {
                 limit: null,
@@ -41,8 +51,9 @@ class HeaderStatusUI {
             const detectionStatus = await window.arenaCoach.match.getDetectionStatus();
             const currentMatch = await window.arenaCoach.match.getCurrentMatch();
 
-            this.rendererState.isDetectionActive = detectionStatus?.running || false;
-            this.rendererState.isWoWRunning = detectionStatus?.wowProcessStatus?.isRunning || false;
+            if (!this.hasReceivedDetectionStatusEvent) {
+                this.applyDetectionStatus(detectionStatus);
+            }
             this.rendererState.isInMatch = !!currentMatch;
             this.rendererState.matchInfo = currentMatch;
 
@@ -99,43 +110,12 @@ class HeaderStatusUI {
             );
         }
 
-        // WoW process events
-        if (window.arenaCoach?.wow?.onProcessStart) {
+        // Detection status snapshots own header detection/process state after initial load
+        if (window.arenaCoach?.match?.onDetectionStatusChanged) {
             this.ipcListeners.push(
-                window.arenaCoach.wow.onProcessStart(() => {
-                    // Process started - updating state
-                    this.rendererState.isWoWRunning = true;
-                    this.renderMatchStatus();
-                })
-            );
-        }
-
-        if (window.arenaCoach?.wow?.onProcessStop) {
-            this.ipcListeners.push(
-                window.arenaCoach.wow.onProcessStop(() => {
-                    // Process stopped - updating state
-                    this.rendererState.isWoWRunning = false;
-                    this.renderMatchStatus();
-                })
-            );
-        }
-
-        // Detection state events
-        if (window.arenaCoach?.match?.onDetectionStarted) {
-            this.ipcListeners.push(
-                window.arenaCoach.match.onDetectionStarted(() => {
-                    // Detection started - updating state
-                    this.rendererState.isDetectionActive = true;
-                    this.renderMatchStatus();
-                })
-            );
-        }
-
-        if (window.arenaCoach?.match?.onDetectionStopped) {
-            this.ipcListeners.push(
-                window.arenaCoach.match.onDetectionStopped(() => {
-                    // Detection stopped - updating state
-                    this.rendererState.isDetectionActive = false;
+                window.arenaCoach.match.onDetectionStatusChanged((status) => {
+                    this.hasReceivedDetectionStatusEvent = true;
+                    this.applyDetectionStatus(status);
                     this.renderMatchStatus();
                 })
             );
@@ -173,9 +153,14 @@ class HeaderStatusUI {
         }
     }
 
+    applyDetectionStatus(status) {
+        this.rendererState.detectionStatus = status;
+    }
+
     renderMatchStatus() {
         // Pure function - uses only local state, no async calls or backend queries
-        const { isInMatch, matchInfo, isDetectionActive, isWoWRunning } = this.rendererState;
+        const { isInMatch, matchInfo, detectionStatus } = this.rendererState;
+        const { running, inactiveReason, wowProcessStatus } = detectionStatus;
 
         // Rendering status based on current state
 
@@ -188,7 +173,7 @@ class HeaderStatusUI {
             if (this.matchDot) {
                 this.matchDot.className = 'status-dot in-progress';
             }
-        } else if (isDetectionActive && isWoWRunning) {
+        } else if (running && wowProcessStatus.isRunning) {
             // Show "Ready" with ready dot
             this.matchStatus?.classList.add('ready');
             this.matchStatus?.classList.remove('active', 'in-progress');
@@ -197,13 +182,20 @@ class HeaderStatusUI {
             if (this.matchDot) {
                 this.matchDot.className = 'status-dot ready';
             }
-        } else if (isDetectionActive) {
+        } else if (running) {
             // Detection active but WoW not running - show "Idle"
             this.matchStatus?.classList.remove('active', 'in-progress', 'ready');
             this.matchText.textContent = 'Idle';
 
             if (this.matchDot) {
                 this.matchDot.className = 'status-dot checking';
+            }
+        } else if (inactiveReason === 'NO_INSTALLATION') {
+            this.matchStatus?.classList.remove('active', 'in-progress', 'ready');
+            this.matchText.textContent = 'WoW installation not found';
+
+            if (this.matchDot) {
+                this.matchDot.className = 'status-dot not-authenticated';
             }
         } else {
             // Detection inactive

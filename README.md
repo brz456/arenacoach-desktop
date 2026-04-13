@@ -21,8 +21,8 @@ error handling.
 **Core Capabilities:**
 
 - **Automated Match Detection**: Real-time parsing of WoW combat logs
-- **Job Tracking**: Resilient polling with exponential backoff and intelligent
-  retry
+- **Upload Lifecycle**: Restart-safe acceptance tracking with SSE-first progress
+  delivery and status fallback
 - **Video Recording**: OBS integration with game/window/monitor capture
 - **Match Analysis**: Backend enrichment with detailed event data
 - **State Persistence**: Survives application restarts without losing tracking
@@ -68,19 +68,19 @@ error handling.
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│               Job Queue Pipeline                             │
+│             Upload Lifecycle Pipeline                        │
 │  • Chunk upload to backend API                               │
-│  • Job ID generation and correlation                         │
-│  • State persistence (JobStateStore)                         │
-│  • Polling initiation (CompletionPollingService)             │
+│  • Explicit acceptance boundary                              │
+│  • Restart-safe state persistence (UploadLifecycleStore)     │
+│  • Accepted-upload tracking (AcceptedUploadTracker)          │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────┐
-│          Completion Polling & Enrichment                      │
-│  • Resilient job status polling (5s base, 60s cap)          │
-│  • Smart correlation with O(1) job lookup                    │
-│  • Jitter to prevent thundering herd                         │
+│         Accepted Upload Tracking & Enrichment                │
+│  • SSE-first progress delivery                               │
+│  • Canonical status fallback on reconnect                    │
+│  • Terminal completion/failure finalization                  │
 │  • Analysis enrichment with event data                       │
 └──────────────────────────────────────────────────────────────┘
                               │
@@ -101,8 +101,11 @@ The application uses **EventEmitter** throughout for loose coupling:
 - **WoWProcessMonitor** → `wowProcessStart/Stop` →
   **MatchDetectionOrchestrator**
 - **CombatLogParser** → `MATCH_STARTED/ENDED` → **MatchChunker**
-- **MatchChunker** → `matchProcessed` → **JobQueueOrchestrator**
-- **CompletionPollingService** → `analysisCompleted/Failed` → **Main Process**
+- **MatchChunker** → `matchProcessed` → **MatchDetectionOrchestrator** →
+  **MatchDetectionService** → **Main Process** →
+  **UploadLifecycleService.submitMatchChunk(...)**
+- **UploadLifecycleService** → `analysisProgress/Completed/Failed` →
+  **Main Process**
 - **Main Process** → IPC → **Renderer Process** (UI updates)
 
 ---
@@ -127,8 +130,6 @@ desktop/
 │   │   ├── chunking/                   # Match segmentation
 │   │   │   ├── MatchChunker.ts
 │   │   │   └── MatchResolver.ts
-│   │   ├── pipeline/
-│   │   │   └── JobQueueOrchestrator.ts
 │   │   ├── constants/                  # Arena zones, class/spec maps
 │   │   ├── types/                      # Type definitions
 │   │   └── utils/                      # Hashing, bracket utils
@@ -142,8 +143,6 @@ desktop/
 │   │   ├── MatchLifecycleService.ts    # Session lifecycle coordinator
 │   │   ├── MetadataService.ts          # Match metadata operations
 │   │   ├── MetadataStorageService.ts
-│   │   ├── CompletionPollingService.ts
-│   │   ├── JobStateStore.ts
 │   │   ├── UploadService.ts
 │   │   ├── AnalysisEnrichmentService.ts
 │   │   ├── RecordingService.ts         # Match-driven recording orchestrator
@@ -152,6 +151,12 @@ desktop/
 │   │   ├── ServiceHealthCheck.ts
 │   │   ├── OBSRecorder.ts              # Per-session OBS state machine
 │   │   ├── RecordingTypes.ts
+│   │   ├── upload-lifecycle/
+│   │   │   ├── UploadLifecycleService.ts
+│   │   │   ├── AcceptedUploadTracker.ts
+│   │   │   ├── UploadLifecycleStore.ts
+│   │   │   ├── UploadRecoveryService.ts
+│   │   │   └── UploadStatusClient.ts
 │   │   └── obs/                        # OBS sub-services
 │   │       ├── OBSCaptureManager.ts
 │   │       ├── OBSSettingsManager.ts
@@ -268,86 +273,90 @@ Extracts individual matches from continuous combat logs.
 
 ---
 
-### 3. Job Queue Pipeline
+### 3. Upload Lifecycle Pipeline
 
-**File**: `src/match-detection/pipeline/JobQueueOrchestrator.ts`
+**File**: `src/services/upload-lifecycle/UploadLifecycleService.ts`
 
-Thin orchestration layer coordinating uploads and tracking.
+Lifecycle owner coordinating retries, persistence, acceptance transitions, and
+accepted-upload tracking.
 
 **Workflow:**
 
-1. Receives `MatchProcessedPayload` from orchestrator
-2. Generates unique `jobId` (UUID)
+1. Main process receives `matchProcessed` from `MatchDetectionService`
+2. Creates a local pending upload record
 3. Uploads chunk via `UploadService` (with auth header if authenticated)
-4. Initiates polling via `CompletionPollingService`
-5. Persists correlation state via `JobStateStore` (entitlement-agnostic)
+4. Persists the accepted tracking contract on `/api/upload` success
+5. Starts `AcceptedUploadTracker` only after acceptance
 
 **Backend-Driven Analysis:**
 
 - Backend determines what analysis data to return on each request
 - Desktop trusts server response (no local classification)
-- Changes take effect on next poll (no token refresh needed)
+- Changes take effect on the next canonical status event
 
 **State Management:**
 
-- `pendingUploads` Map tracks in-flight jobs
+- `pendingUploads` Map tracks local-pending and accepted uploads
 - Persisted to `{userData}/pending-uploads.json`
 - Survives application restarts
-- Resumes polling on app launch
+- Resumes accepted tracking or local retry on app launch
 
 **Retry Strategy:**
 
 - Exponential backoff: 1s → 5m max
 - Permanent vs. transient error classification
-- Server-side expiration provides natural termination
+- Desktop-side expiration terminates pre-acceptance retries once `ExpirationConfig` is crossed
 
 ---
 
-### 4. Completion Polling Service
+### 4. Accepted Upload Tracker
 
-**File**: `src/services/CompletionPollingService.ts`
+**File**: `src/services/upload-lifecycle/AcceptedUploadTracker.ts`
 
-Polls backend for job status updates with intelligent backoff.
+Tracks accepted uploads over SSE and falls back to the status endpoint when the
+realtime transport drops.
 
-**Polling Strategy:**
+**Tracking Strategy:**
 
-- **Base interval**: 5 seconds
-- **Max backoff**: 60 seconds
-- **Jitter**: ±10% randomization
-- **Concurrent limit**: 6 jobs
-- **HTTP timeout**: 10 seconds per request
+- **Primary transport**: `GET /api/realtime/uploads/:jobId` SSE stream
+- **Fallback**: one-shot `GET /api/upload/job-status/:jobId`
+- **Reconnect**: bounded exponential backoff after transport failure
+- **Terminal states**: `completed`, `failed`, `not_found`
 
 **Backend-Driven Completion:**
 
-Desktop trusts the backend `JobStatusResponse` completely:
+Desktop trusts the backend accepted-upload status contract completely:
 
 - When `analysisStatus === 'completed'`:
   - If `analysisId` non-null + `analysisData` is array: Emit `analysisCompleted`
     **with** payload
   - If `analysisId` null: Emit `analysisCompleted` **without** payload
-  - Both cases stop tracking (no infinite polling)
+  - Both cases stop tracking immediately
 
 **Contract Violation Guard (Defensive):**
 
-- Detects malformed responses: `analysisId` non-null but `analysisData` not
-  array
-- Tracks violations per job (max 3)
-- After threshold: Emits `analysisFailed` and stops tracking
-- Prevents infinite loops even if backend regresses
+- Realtime stream contract anomalies fall back to canonical status recovery
+- Canonical contract violations emit `analysisFailed` immediately with
+  `BACKEND_CONTRACT_VIOLATION`
+- Prevents silent tracker drift if backend contracts regress
 
-**Job Status Response:**
+**Accepted Upload Status Response:**
 
 ```typescript
-interface JobStatusResponse {
+interface UploadStatusResponse {
   success: boolean;
   jobId: string;
-  analysisStatus: string; // 'queued' | 'processing' | 'completed'
-  analysisId: string | null;
+  analysisStatus:
+    | 'queued'
+    | 'processing'
+    | 'completed'
+    | 'failed'
+    | 'not_found';
+  analysisId: number | null;
   uuid: string | null;
   hasData: boolean;
   analysisData?: unknown;
   jobDetails?: { ... };
-  // Standardized error shape (WI-02)
   error?: { code: string; message: string; details?: unknown };
   errorCode?: string;
   isPermanent?: boolean;
@@ -467,32 +476,47 @@ Handles Battle.net OAuth authentication flow.
 
 ### 8. Data Persistence
 
-#### Job State Store
+#### Upload Lifecycle Store
 
-**File**: `src/services/JobStateStore.ts`
+**File**: `src/services/upload-lifecycle/UploadLifecycleStore.ts`
 
 **Responsibilities:**
 
-- Persists pending upload tracking to disk
+- Persists `local_pending` and `accepted` upload lifecycle records to disk
 - Atomic write operations (temp file + rename)
 - Survives application crashes
 
 **Storage:**
 
 - Location: `{userData}/pending-uploads.json`
-- Format: `Map<jobId, CorrelationData>`
+- Format: `Map<localUploadId, UploadLifecycleRecord>`
 
-**CorrelationData:**
+**UploadLifecycleRecord:**
 
 ```typescript
-interface CorrelationData {
+interface LocalPendingUploadRecord {
+  acceptanceState: 'local_pending';
   matchHash: string;
-  timestamp: number;
-  errorType?: 'rate_limit' | 'auth' | 'server' | 'network' | 'permanent_server';
-  retryCount?: number;
-  nextRetryAt?: number;
+  createdAt: number;
+  bufferId: string;
+}
+
+interface AcceptedUploadRecord {
+  acceptanceState: 'accepted';
+  matchHash: string;
+  createdAt: number;
+  acceptedAt: number;
+  tracking: {
+    acceptedJobId: string;
+    statusPath: `/api/${string}`;
+    realtimePath: `/api/${string}`;
+  };
 }
 ```
+
+Accepted records are resumed via the server-authoritative tracking contract.
+`local_pending` records are recovered locally and retried only until they become
+accepted, terminally fail, or cross the combat-log expiration boundary.
 
 #### Metadata Storage Service
 
@@ -703,21 +727,16 @@ manual check
 **File**: `src/config/ExpirationConfig.ts`
 
 ```typescript
-COMBAT_LOG_EXPIRATION_HOURS = 48; // Reject logs older than 48 hours
+COMBAT_LOG_EXPIRATION_HOURS = 1; // Reject logs older than 1 hour
 ```
 
-### Polling Configuration
+### Upload Tracking Configuration
 
-**File**: `src/services/CompletionPollingService.ts`
+**File**: `src/services/upload-lifecycle/AcceptedUploadTracker.ts`
 
 ```typescript
-DEFAULT_BASE_INTERVAL_MS = 5000; // 5 seconds
-DEFAULT_MAX_BACKOFF_MS = 60000; // 60 seconds
-DEFAULT_MAX_CONCURRENT_POLLS = 6; // Concurrent job limit
-DEFAULT_WARMUP_NOTFOUND_MS = 120000; // 2-minute warm-up for 404s
-HTTP_TIMEOUT_MS = 10000; // 10-second request timeout
-JITTER_PERCENT = 0.1; // ±10% jitter
-MAX_CONTRACT_VIOLATIONS_BEFORE_FAILURE = 3;
+BASE_RECONNECT_DELAY_MS = 1000; // 1 second
+MAX_RECONNECT_DELAY_MS = 30000; // 30 seconds
 ```
 
 ---
@@ -812,7 +831,7 @@ interface StoredMatchMetadata {
 
   // Upload tracking
   jobId?: string;
-  analysisId?: string;
+  analysisId?: number;
   uploadStatus: UploadStatus;
   progressMessage?: string;
   queuePosition?: number | null;
@@ -859,13 +878,13 @@ interface StoredMatchMetadata {
 - **Memory**: Bounded by active match count (~10MB per match buffer)
 - **WoW Process Monitor**: 2-second polling (Windows `tasklist`)
 
-### Job Polling
+### Upload Lifecycle Tracking
 
-- **Base interval**: 5 seconds
-- **Max backoff**: 60 seconds
-- **Concurrent limit**: 6 jobs
-- **Timeout**: 10 seconds per request
-- **Algorithm**: O(1) job correlation via Map lookup
+- **Primary transport**: One SSE stream per accepted upload
+- **Recovery transport**: Canonical status endpoint after disconnect/restart
+- **SSE reconnect backoff**: 1 second → 30 seconds max
+- **Upload retry backoff**: 1 second → 5 minutes max
+- **Local state lookup**: O(1) local upload record lookup via `Map`
 
 ### Recording
 
@@ -895,26 +914,27 @@ interface StoredMatchMetadata {
 
 ### Combat Log Parsing
 
-**Retail-only**: Covers `_retail_` WoW version only.
+**Active-flavor only**: Covers the WoW flavor selected by the current desktop
+build/runtime configuration (for example `_retail_` or `_beta_`).
 
-**Reason**: Combat log format changes across WoW versions (Classic, TBC, Wrath,
-etc.)
+**Reason**: Combat log paths, process names, and related runtime integration are
+validated against the active flavor configuration.
 
 **Line limits**: 20-200,000 lines per match (safety bounds to prevent runaway
 parsing)
 
-### Job Polling Architecture
+### Upload Realtime Architecture
 
-**Polling vs. WebSocket**: Current implementation uses HTTP polling for
-simplicity.
+**SSE vs. WebSocket**: Current implementation uses server-sent events because
+the desktop only needs server-to-client progress delivery.
 
 **Trade-offs:**
 
-- ✅ Simpler deployment (no WebSocket infrastructure)
-- ✅ Better handling of network interruptions
-- ✅ Idempotent status checks
-- ❌ Slightly higher latency (~5s vs instant)
-- ❌ More HTTP requests (mitigated by exponential backoff)
+- ✅ Simpler deployment than a bidirectional socket protocol
+- ✅ Canonical status recovery via idempotent HTTP checks
+- ✅ Lower request volume than accepted-upload polling
+- ❌ One stream per accepted upload
+- ❌ Still requires status endpoint fallback when transport drops
 
 ### Recording Integration
 
@@ -944,7 +964,7 @@ Follow conventional commits format:
 
 ```
 feat: add Solo Shuffle support
-fix: resolve race condition in job polling
+fix: resolve accepted-upload lifecycle reconnect race
 refactor: extract match chunking logic
 docs: update API documentation
 ```

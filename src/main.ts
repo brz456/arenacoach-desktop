@@ -12,7 +12,7 @@ import {
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
 import * as path from 'path';
-import { promises as fs } from 'fs';
+import { existsSync, promises as fs } from 'fs';
 import * as dotenv from 'dotenv';
 
 // Load environment variables from .env file
@@ -60,6 +60,7 @@ import {
 import { MetadataService } from './services/MetadataService';
 import { MatchLifecycleService } from './services/MatchLifecycleService';
 import { RecordingService, RecordingServiceConfig } from './services/RecordingService';
+import { RecordingStorageManager } from './services/obs/RecordingStorageManager';
 import { AnalysisEnrichmentService, AnalysisPayload } from './services/AnalysisEnrichmentService';
 import { LogExportService, LogExportResult } from './services/LogExportService';
 import {
@@ -69,7 +70,10 @@ import {
   MIN_WINDOW_WIDTH,
   MIN_WINDOW_HEIGHT,
 } from './services/SettingsService';
-import { getEffectiveRecordingDirectory } from './utils/recordingPathUtils';
+import {
+  getEffectiveRecordingDirectory,
+  resolveRecordingDirectoryWithFallback,
+} from './utils/recordingPathUtils';
 import { AppError, isAppError, isNodeError } from './utils/errors';
 import { isValidBufferId } from './utils/bufferId';
 import { toSafeAxiosErrorLog } from './utils/errorRedaction';
@@ -87,13 +91,7 @@ import {
 import { ChunkCleanupService } from './services/ChunkCleanupService';
 import { ApiHeadersProvider } from './services/ApiHeadersProvider';
 import { UploadService } from './services/UploadService';
-import { JobStateStore } from './services/JobStateStore';
 import { ServiceHealthCheck } from './services/ServiceHealthCheck';
-import { JobQueueOrchestrator } from './match-detection/pipeline/JobQueueOrchestrator';
-import {
-  CompletionPollingService,
-  CompletionPollingConfig,
-} from './services/CompletionPollingService';
 import { UploadStatus, StoredMatchMetadata } from './match-detection/types/StoredMatchTypes';
 import {
   MatchStartedEvent,
@@ -103,6 +101,7 @@ import {
 import type { MatchEndedIncompleteEvent } from './match-detection/types/MatchEvent';
 import { EarlyEndTrigger, getTriggerMessage } from './match-detection/types/EarlyEndTriggers';
 import { isCombatLogExpiredError } from './match-detection/types/PipelineErrors';
+import { PipelineErrorCode } from './match-detection/types/PipelineErrors';
 import type { JobRetryPayload } from './match-detection/types/JobRetryPayload';
 import { MatchProcessedPayload } from './match-detection/MatchDetectionOrchestrator';
 import {
@@ -113,6 +112,24 @@ import { ExpirationConfig } from './config/ExpirationConfig';
 import { ChunkRetentionConfig } from './config/ChunkRetentionConfig';
 import { FreemiumQuotaFields } from './Freemium';
 import { inferEncoderTypeFromId } from './services/obs/encoderResolver';
+import type { DetectionStatusSnapshot } from './ipc/ipcTypes';
+import {
+  buildDetectionStatusSnapshot,
+  isNonRunningUninitializedDetectionStatus,
+  isServiceOwnedDetectionStatus,
+} from './ipc/detectionStatus';
+import { UploadLifecycleStore } from './services/upload-lifecycle/UploadLifecycleStore';
+import { UploadRecoveryService } from './services/upload-lifecycle/UploadRecoveryService';
+import { UploadStatusClient } from './services/upload-lifecycle/UploadStatusClient';
+import { AcceptedUploadTracker } from './services/upload-lifecycle/AcceptedUploadTracker';
+import { UploadLifecycleService } from './services/upload-lifecycle/UploadLifecycleService';
+import type {
+  UploadAuthRequiredData,
+  UploadLifecycleStatus,
+  UploadProgressStatus,
+  UploadRetryingData,
+} from './services/upload-lifecycle/types';
+import { isUnauthorizedAuthError } from './services/upload-lifecycle/errors';
 
 // Event payload interfaces for improved type safety
 interface AnalysisJobCreatedPayload {
@@ -123,7 +140,7 @@ interface AnalysisJobCreatedPayload {
 
 interface AnalysisProgressPayload {
   jobId: string;
-  status: string;
+  status: UploadProgressStatus;
   matchHash: string;
   message?: string;
   queuePosition?: number | null;
@@ -132,7 +149,7 @@ interface AnalysisProgressPayload {
 
 interface AnalysisCompletedPayload extends FreemiumQuotaFields {
   jobId: string;
-  analysisId?: string; // Optional string - normalized at boundary, undefined for non-auth users
+  analysisId?: number;
   matchHash: string;
   analysisPayload?: AnalysisPayload; // Optional - only present for entitled users (premium or freemium)
   isPremiumViewer?: boolean;
@@ -146,12 +163,6 @@ interface AnalysisFailedPayload {
   originalName?: string;
   errorCode?: string;
   isPermanent?: boolean;
-}
-
-interface AnalysisTimeoutPayload {
-  jobId: string;
-  matchHash: string;
-  attempts?: number;
 }
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
@@ -196,7 +207,6 @@ class ArenaCoachDesktop {
   private static readonly EXPIRATION_CHECK_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
   private static readonly WINDOW_READY_TIMEOUT_MS = 30000; // 30 second timeout
   private static readonly WINDOW_READY_POLL_INTERVAL_MS = 100; // 100ms polling interval
-  private static readonly POLLING_INTERVAL_MS = 5000; // 5 seconds for job polling
   private static readonly SERVICE_STATUS_INTERVAL_MS = 5000; // 5 seconds for service status updates
   private static readonly UPLOAD_ENDPOINT = '/api/upload';
   private static readonly IDLE_CHECK_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes for idle health checks
@@ -219,6 +229,9 @@ class ArenaCoachDesktop {
   private authManager: AuthManager;
   private matchDetectionService: MatchDetectionService;
   private recordingService: RecordingService | null = null;
+  // Tracks whether automatic match-start/stop recording should be bound into lifecycle.
+  // This is distinct from the persisted settings flag and from RecordingService.isEnabled.
+  private recordingCaptureEnabled = false;
   private metadataStorageService!: MetadataStorageService;
   private metadataService!: MetadataService;
   private matchLifecycleService?: MatchLifecycleService;
@@ -230,9 +243,9 @@ class ArenaCoachDesktop {
   // New decomposed services
   private apiHeadersProvider!: ApiHeadersProvider;
   private uploadService!: UploadService;
-  private jobStateStore!: JobStateStore;
-  private completionPollingService!: CompletionPollingService;
-  private jobQueueOrchestrator!: JobQueueOrchestrator;
+  private uploadLifecycleStore!: UploadLifecycleStore;
+  private acceptedUploadTracker!: AcceptedUploadTracker;
+  private uploadLifecycleService!: UploadLifecycleService;
   private serviceHealthCheck!: ServiceHealthCheck;
   private apiBaseUrl: string;
   private idleCheckTimer: NodeJS.Timeout | null = null;
@@ -244,6 +257,7 @@ class ArenaCoachDesktop {
   // Per-buffer lifecycle serialization: ensures match lifecycle operations
   // (start, end, endIncomplete) run sequentially per bufferId
   private bufferQueues = new Map<string, Promise<void>>();
+  private uploadStatusQueues = new Map<string, Promise<void>>();
   private updateIntervalId: NodeJS.Timeout | null = null;
   private expirationTimerId: NodeJS.Timeout | null = null;
   private serviceStatusTimerId: NodeJS.Timeout | null = null;
@@ -300,6 +314,186 @@ class ArenaCoachDesktop {
       }
     } catch (error) {
       console.error('[ArenaCoachDesktop] Failed to notify addon status to renderer:', error);
+    }
+  }
+
+  private async createDetectionStatusSnapshot(options?: {
+    useProcessCheck?: boolean;
+    installations?: WoWInstallation[];
+  }): Promise<DetectionStatusSnapshot> {
+    const status = options?.useProcessCheck
+      ? await this.matchDetectionService.getStatusWithProcessCheck()
+      : this.matchDetectionService.getStatus();
+
+    const matchDetectionEnabled = this.settingsService.getSettings().matchDetectionEnabled;
+    if (isNonRunningUninitializedDetectionStatus(status)) {
+      const installations = options?.installations ?? (await this.resolveWoWInstallations());
+      return buildDetectionStatusSnapshot({
+        status,
+        matchDetectionEnabled,
+        resolvedInstallationCount: installations.length,
+      });
+    }
+
+    if (isServiceOwnedDetectionStatus(status)) {
+      return buildDetectionStatusSnapshot({
+        status,
+        matchDetectionEnabled,
+      });
+    }
+
+    throw new Error('[ArenaCoachDesktop] Unreachable detection status state');
+  }
+
+  private async notifyDetectionStatusToRenderer(options?: {
+    useProcessCheck?: boolean;
+    installations?: WoWInstallation[];
+  }): Promise<void> {
+    try {
+      if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+        return;
+      }
+
+      const snapshot = await this.createDetectionStatusSnapshot(options);
+      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('match:detectionStatusChanged', snapshot);
+      }
+    } catch (error) {
+      console.error('[ArenaCoachDesktop] Failed to notify detection status to renderer:', error);
+    }
+  }
+
+  private async notifyDetectionStoppedToRenderer(options?: {
+    installations?: WoWInstallation[];
+  }): Promise<void> {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send('match:detectionStopped');
+    }
+    await this.notifyDetectionStatusToRenderer(options);
+  }
+
+  private haveResolvedInstallationsChanged(
+    currentPaths: string[] | undefined,
+    installations: WoWInstallation[]
+  ): boolean {
+    const nextPaths = installations.map(installation => installation.combatLogPath);
+    if (!currentPaths || currentPaths.length !== nextPaths.length) {
+      return true;
+    }
+
+    return currentPaths.some((path, index) => path !== nextPaths[index]);
+  }
+
+  private async maybeStartDetectionForInstallations(
+    installations: WoWInstallation[],
+    options?: { respectDisabledSetting?: boolean }
+  ): Promise<void> {
+    const respectDisabledSetting = options?.respectDisabledSetting ?? true;
+    const settings = this.settingsService.getSettings();
+    if ((respectDisabledSetting && settings.matchDetectionEnabled === false) || this.isUIDevMode) {
+      return;
+    }
+
+    const currentStatus = this.matchDetectionService.getStatus();
+    const installationsChanged = this.haveResolvedInstallationsChanged(
+      currentStatus.installations?.paths,
+      installations
+    );
+
+    if (currentStatus.running && !installationsChanged) {
+      return;
+    }
+
+    const needsReinitialize = !currentStatus.initialized || installationsChanged;
+    let stoppedExistingDetection = false;
+
+    try {
+      if (currentStatus.initialized && needsReinitialize) {
+        await this.matchDetectionService.stop();
+        stoppedExistingDetection = true;
+      }
+
+      if (needsReinitialize) {
+        await this.matchDetectionService.initialize(installations);
+      }
+      await this.matchDetectionService.start();
+    } catch (error) {
+      if (stoppedExistingDetection) {
+        await this.notifyDetectionStoppedToRenderer({ installations });
+      }
+      throw error;
+    }
+
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send('match:detectionStarted');
+    }
+    await this.notifyDetectionStatusToRenderer({ useProcessCheck: true });
+  }
+
+  private async checkAndInstallAddonsForInstallations(
+    installations: WoWInstallation[]
+  ): Promise<WoWInstallation[]> {
+    if (installations.length === 0) {
+      console.info('[ArenaCoachDesktop] No WoW installations found, skipping addon check');
+      return installations;
+    }
+
+    const installationsNeedingAddon: WoWInstallation[] = [];
+    const installationsWithAddon: WoWInstallation[] = [];
+
+    for (const installation of installations) {
+      if (installation.addonInstalled) {
+        const filesValid = await AddonManager.validateAddonFiles(installation);
+        if (filesValid) {
+          installationsWithAddon.push(installation);
+        } else {
+          console.info(
+            `[ArenaCoachDesktop] Addon files invalid for ${installation.path}, needs reinstall`
+          );
+          installationsNeedingAddon.push(installation);
+        }
+      } else {
+        installationsNeedingAddon.push(installation);
+      }
+    }
+
+    console.info(
+      `[ArenaCoachDesktop] Found ${installationsWithAddon.length} installations with addon, ${installationsNeedingAddon.length} needing addon`
+    );
+
+    for (const installation of installationsNeedingAddon) {
+      try {
+        console.info(`[ArenaCoachDesktop] Installing ArenaCoach addon to: ${installation.path}`);
+        const result = await AddonManager.installAddon(installation);
+
+        if (result.success) {
+          console.info(`[ArenaCoachDesktop] Successfully installed addon to: ${installation.path}`);
+        } else {
+          console.warn(
+            `[ArenaCoachDesktop] Failed to install addon to ${installation.path}: ${result.message}`
+          );
+          if (result.error) {
+            console.warn(`[ArenaCoachDesktop] Error details: ${result.error}`);
+          }
+        }
+      } catch (error) {
+        console.error(
+          `[ArenaCoachDesktop] Unexpected error installing addon to ${installation.path}:`,
+          error
+        );
+      }
+    }
+
+    try {
+      const updatedInstallations = await this.resolveWoWInstallations();
+      this.notifyAddonStatusToRenderer(updatedInstallations);
+      return updatedInstallations;
+    } catch (error) {
+      console.error(
+        '[ArenaCoachDesktop] Failed to re-resolve installations after addon install:',
+        error
+      );
+      return installations;
     }
   }
 
@@ -429,6 +623,7 @@ class ArenaCoachDesktop {
       if (status.isRecording) {
         const applyResult = await this.applyPersistedRecordingSettings();
         if (applyResult.success) {
+          this.restoreRecordingCaptureAfterRecovery();
           console.info('[Main] Soft-refreshed recording settings during active recording');
         } else {
           console.warn('[Main] Soft-refresh settings failed during recording:', applyResult.error);
@@ -440,6 +635,7 @@ class ArenaCoachDesktop {
         }
         const applyResult = await this.applyPersistedRecordingSettings();
         if (applyResult.success) {
+          this.restoreRecordingCaptureAfterRecovery();
           console.info('[Main] Recording service reinitialized');
         } else {
           console.warn(
@@ -450,7 +646,9 @@ class ArenaCoachDesktop {
       } else {
         // Soft-refresh settings to ensure sources are valid after resume
         const applyResult = await this.applyPersistedRecordingSettings();
-        if (!applyResult.success) {
+        if (applyResult.success) {
+          this.restoreRecordingCaptureAfterRecovery();
+        } else {
           console.warn('[Main] Soft-refresh settings failed:', applyResult.error);
         }
       }
@@ -467,6 +665,7 @@ class ArenaCoachDesktop {
           }
           const applyResult = await this.applyPersistedRecordingSettings();
           if (applyResult.success) {
+            this.restoreRecordingCaptureAfterRecovery();
             console.info('[Main] Recording service fully restarted');
           } else {
             console.warn(
@@ -599,7 +798,7 @@ class ArenaCoachDesktop {
 
         try {
           const status = await this.recordingService.getStatus();
-          if (status.isInitialized && status.isEnabled) {
+          if (status.isInitialized && status.isEnabled && this.recordingCaptureEnabled) {
             this.pendingRecordingRecovery = null;
             return;
           }
@@ -1074,6 +1273,30 @@ class ArenaCoachDesktop {
     return getEffectiveRecordingDirectory(settings.recordingLocation, app.getPath('videos'));
   }
 
+  private async getRecordingDiskUsage(): Promise<number> {
+    const recordingsDir = resolveRecordingDirectoryWithFallback(
+      this.settingsService.getSettings().recordingLocation,
+      app.getPath('videos'),
+      root => existsSync(root)
+    );
+
+    return RecordingStorageManager.getRecordingsUsedSpaceForDirectory(recordingsDir, {
+      quietMissingDir: true,
+    });
+  }
+
+  private setRecordingCaptureState(enabled: boolean): void {
+    this.recordingCaptureEnabled = enabled;
+    this.syncRecordingServiceToMatchLifecycle();
+  }
+
+  private restoreRecordingCaptureAfterRecovery(): void {
+    if (this.settingsService.getSettings().recordingEnabled === false) {
+      return;
+    }
+    this.setRecordingCaptureState(true);
+  }
+
   /**
    * Reveal a file in the OS file manager (Explorer/Finder) with security validation.
    * Only allows paths under userData/logs or downloads.
@@ -1162,8 +1385,10 @@ class ArenaCoachDesktop {
    * Centralizes the logic for applying saved settings, avoiding code duplication
    * @returns Explicit result so callers can handle failures deterministically
    */
-  private async applyPersistedRecordingSettings(): Promise<{ success: boolean; error?: string }> {
-    if (!this.recordingService) {
+  private async applyPersistedRecordingSettings(
+    recordingService: RecordingService | null = this.recordingService
+  ): Promise<{ success: boolean; error?: string }> {
+    if (!recordingService) {
       const error = 'RecordingService not initialized';
       console.warn('[ArenaCoachDesktop] Cannot apply recording settings:', error);
       return { success: false, error };
@@ -1187,7 +1412,7 @@ class ArenaCoachDesktop {
     }
 
     try {
-      const success = await this.recordingService.applyRecordingSettings(settings);
+      const success = await recordingService.applyRecordingSettings(settings);
       if (success) {
         console.info('[ArenaCoachDesktop] Applied persisted recording settings');
         return { success: true };
@@ -1490,9 +1715,12 @@ class ArenaCoachDesktop {
           },
         ];
         this.latestWoWInstallations = mockData;
+        await this.notifyDetectionStatusToRenderer({ installations: mockData });
         return mockData;
       }
-      return await this.resolveWoWInstallations();
+      const installations = await this.resolveWoWInstallations();
+      await this.notifyDetectionStatusToRenderer({ installations });
+      return installations;
     });
 
     ipcMain.handle(
@@ -1528,6 +1756,10 @@ class ArenaCoachDesktop {
           // Re-resolve installations and notify renderer to keep UI in sync
           const updated = await this.resolveWoWInstallations();
           this.notifyAddonStatusToRenderer(updated);
+          await this.notifyDetectionStatusToRenderer({ installations: updated });
+
+          const updatedWithAddonStatus = await this.checkAndInstallAddonsForInstallations(updated);
+          await this.maybeStartDetectionForInstallations(updatedWithAddonStatus);
         } catch (error) {
           console.error('[ArenaCoachDesktop] Failed to refresh installations after validation:', error);
         }
@@ -1660,16 +1892,12 @@ class ArenaCoachDesktop {
     ipcMain.handle('match:startDetection', async (): Promise<void> => {
       try {
         const installations = await this.resolveWoWInstallations();
-        await this.matchDetectionService.initialize(installations);
-        await this.matchDetectionService.start();
+        await this.maybeStartDetectionForInstallations(installations, {
+          respectDisabledSetting: false,
+        });
 
         // Persist user preference only after successful start
         this.settingsService.updateSettings({ matchDetectionEnabled: true });
-
-        // Emit event for renderer state management
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-          this.mainWindow.webContents.send('match:detectionStarted');
-        }
       } catch (error) {
         console.error('Error starting match detection:', error);
         throw error;
@@ -1687,6 +1915,7 @@ class ArenaCoachDesktop {
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           this.mainWindow.webContents.send('match:detectionStopped');
         }
+        await this.notifyDetectionStatusToRenderer();
       } catch (error) {
         console.error('Error stopping match detection:', error);
         throw error;
@@ -1947,12 +2176,7 @@ class ArenaCoachDesktop {
     });
 
     ipcMain.handle('match:getDetectionStatus', async () => {
-      const fullStatus = await this.matchDetectionService.getStatusWithProcessCheck();
-      return {
-        running: fullStatus.running,
-        initialized: fullStatus.initialized,
-        wowProcessStatus: fullStatus.wowProcessStatus,
-      };
+      return await this.createDetectionStatusSnapshot({ useProcessCheck: true });
     });
 
     ipcMain.handle('match:getSystemMetrics', () => {
@@ -1991,7 +2215,12 @@ class ArenaCoachDesktop {
     });
 
     ipcMain.handle('recording:isEnabled', async (): Promise<boolean> => {
-      return this.recordingService ? (await this.recordingService.getStatus()).isEnabled : false;
+      if (!this.recordingService) {
+        return false;
+      }
+
+      const status = await this.recordingService.getStatus();
+      return this.recordingCaptureEnabled && status.isEnabled;
     });
 
     ipcMain.handle('recording:isRecording', async (): Promise<boolean> => {
@@ -2005,22 +2234,26 @@ class ArenaCoachDesktop {
     });
 
     ipcMain.handle('recording:enable', async (): Promise<void> => {
-      if (!this.recordingService) {
-        throw new Error('Recording service not available');
-      }
-
       try {
-        // Re-enable OBS and re-apply saved settings so capture sources are correctly configured
-        await this.recordingService.enable();
-        if (this.mainWindow) {
-          this.recordingService.setMainWindow(this.mainWindow);
+        if (this.recordingService) {
+          const status = await this.recordingService.getStatus();
+          if (this.recordingCaptureEnabled && status.isEnabled) {
+            this.settingsService.updateSettings({ recordingEnabled: true });
+            return;
+          }
+          const activateResult = await this.enableExistingRecordingService(this.recordingService, {
+            persistEnabled: true,
+          });
+          if (!activateResult.success) {
+            throw new Error(activateResult.error ?? 'Failed to apply recording settings');
+          }
+        } else {
+          const settings = this.settingsService.getSettings();
+          const attachResult = await this.attachRecordingService(settings, { persistEnabled: true });
+          if (!attachResult.success) {
+            throw new Error(attachResult.error ?? 'Failed to apply recording settings');
+          }
         }
-        const applyResult = await this.applyPersistedRecordingSettings();
-        if (!applyResult.success) {
-          throw new Error(applyResult.error ?? 'Failed to apply recording settings');
-        }
-        // Persist user preference
-        this.settingsService.updateSettings({ recordingEnabled: true });
       } catch (error) {
         console.error('[recording:enable] Failed to enable recording:', error);
         throw error;
@@ -2031,9 +2264,9 @@ class ArenaCoachDesktop {
       if (!this.recordingService) {
         throw new Error('Recording service not available');
       }
-      await this.recordingService.disable();
-      // Persist user preference
+      // Persist user intent before async teardown so recovery cannot re-enable capture mid-disable.
       this.settingsService.updateSettings({ recordingEnabled: false });
+      await this.disableRecordingCapture();
     });
 
     ipcMain.handle('recording:getStatus', async () => {
@@ -2044,7 +2277,7 @@ class ArenaCoachDesktop {
           isRecording: false,
           currentFile: null,
           currentMatchHash: null,
-          diskUsedGB: 0,
+          diskUsedGB: await this.getRecordingDiskUsage(),
           cpuUsage: 0,
           droppedFrames: 0,
         };
@@ -2053,7 +2286,7 @@ class ArenaCoachDesktop {
       const status = await this.recordingService.getStatus();
       return {
         isInitialized: status.isInitialized,
-        isEnabled: status.isEnabled,
+        isEnabled: this.recordingCaptureEnabled && status.isEnabled,
         isRecording: status.isRecording,
         currentFile: status.currentFile, // Proper file/directory path from OBS
         currentMatchHash: status.currentMatchKey, // Match identification for UI
@@ -2340,7 +2573,7 @@ class ArenaCoachDesktop {
           process.platform === 'win32' &&
           wasRecordingEnabled !== willBeRecordingEnabled
         ) {
-          if (willBeRecordingEnabled && !this.recordingService) {
+          if (willBeRecordingEnabled && !this.recordingCaptureEnabled) {
             // Guard: Ensure metadata service is initialized before creating recording service
             if (!this.metadataStorageService) {
               console.warn(
@@ -2348,37 +2581,26 @@ class ArenaCoachDesktop {
               );
               recordingEnableError = 'Recording service not ready - please try again';
             } else {
-              // Enable recording - initialize service
               try {
                 console.info(
                   '[ArenaCoachDesktop] Enabling recording service due to settings change'
                 );
-                const recordingConfig = this.createRecordingServiceConfig(updatedSettings);
-                this.recordingService = new RecordingService(
-                  recordingConfig,
-                  this.metadataService,
-                  this.settingsService
-                );
-                await this.recordingService.initialize();
-                this.setupRecordingEvents(); // Wire up event handlers
+                let activateResult: { success: boolean; error?: string };
 
-                // Pass main window for preview
-                if (this.mainWindow) {
-                  this.recordingService.setMainWindow(this.mainWindow);
+                if (this.recordingService) {
+                  activateResult = await this.enableExistingRecordingService(this.recordingService);
+                } else {
+                  activateResult = await this.attachRecordingService(updatedSettings);
                 }
 
-                // Apply saved recording settings using helper method
-                const applyResult = await this.applyPersistedRecordingSettings();
-                if (!applyResult.success) {
-                  // Service initialized but settings failed to apply - report as partial failure
-                  recordingEnableError = applyResult.error ?? 'Failed to apply recording settings';
+                if (!activateResult.success) {
+                  recordingEnableError =
+                    activateResult.error ?? 'Failed to apply recording settings';
                 } else {
                   console.info('[ArenaCoachDesktop] Recording service enabled via settings');
                 }
               } catch (error) {
                 console.error('[ArenaCoachDesktop] Failed to enable recording service:', error);
-                this.recordingService = null;
-                this.clearRecordingRecoveryState();
                 recordingEnableError =
                   error instanceof Error ? error.message : 'Failed to enable recording';
               }
@@ -2389,9 +2611,7 @@ class ArenaCoachDesktop {
               console.info(
                 '[ArenaCoachDesktop] Disabling recording service due to settings change'
               );
-              await this.recordingService.shutdown();
-              this.recordingService = null;
-              this.clearRecordingRecoveryState();
+              await this.disableRecordingCapture();
               console.info('[ArenaCoachDesktop] Recording service disabled via settings');
             } catch (error) {
               console.error('[ArenaCoachDesktop] Error disabling recording service:', error);
@@ -2946,19 +3166,20 @@ class ArenaCoachDesktop {
           if (totalInQueue !== undefined && totalInQueue !== null)
             updateData.totalInQueue = totalInQueue;
 
-          await this.metadataStorageService.updateMatchStatus(
+          const effectiveStatus = await this.metadataStorageService.updateMatchStatus(
             matchHash,
             status as UploadStatus,
             updateData
           );
 
-          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          if (effectiveStatus && this.mainWindow && !this.mainWindow.isDestroyed()) {
+            const statusChanged = effectiveStatus !== status;
             this.mainWindow.webContents.send('match:statusUpdated', {
               matchHash,
-              status,
-              progressMessage,
-              queuePosition,
-              totalInQueue,
+              status: effectiveStatus,
+              progressMessage: statusChanged ? undefined : progressMessage,
+              queuePosition: statusChanged ? undefined : queuePosition,
+              totalInQueue: statusChanged ? undefined : totalInQueue,
             });
           }
         } catch (error) {
@@ -2971,13 +3192,13 @@ class ArenaCoachDesktop {
     // Service status handler - returns current connection status
     ipcMain.handle('service:getStatus', async () => {
       // Read directly from services for current status
-      const pollingStats = this.completionPollingService?.getPollingStats();
+      const uploadLifecycleStatus = this.uploadLifecycleService?.getStatus();
       const isConnected = this.serviceHealthCheck?.isServiceAvailable() ?? false;
       const hasAuth = this.apiHeadersProvider?.hasAuth() ?? false;
 
       return {
         connected: isConnected,
-        trackedJobsCount: pollingStats?.trackedJobsCount ?? 0,
+        activeUploadsCount: uploadLifecycleStatus?.activeUploads ?? 0,
         hasAuth,
       };
     });
@@ -3040,6 +3261,7 @@ class ArenaCoachDesktop {
       if (errorCode !== 'OBS_IPC_FATAL') {
         return;
       }
+      this.setRecordingCaptureState(false);
       this.requestRecordingRecoveryDueToFatalObsIpc(error);
     });
 
@@ -3065,6 +3287,12 @@ class ArenaCoachDesktop {
     console.info('[ArenaCoachDesktop] Recording event handlers registered');
   }
 
+  private syncRecordingServiceToMatchLifecycle(): void {
+    this.matchLifecycleService?.setRecordingService(
+      this.recordingCaptureEnabled ? this.recordingService ?? null : null
+    );
+  }
+
   /**
    * Enqueues a lifecycle operation for a specific bufferId, ensuring sequential execution.
    * Operations for the same bufferId run one after another in the order they are enqueued.
@@ -3083,6 +3311,24 @@ class ArenaCoachDesktop {
     );
 
     return current;
+  }
+
+  /**
+   * Serializes upload-status metadata writes for a specific matchHash so lifecycle
+   * transitions like queued -> processing cannot race and overwrite each other.
+   */
+  private enqueueUploadStatusOp(matchHash: string, operation: () => Promise<void>): void {
+    const previous = this.uploadStatusQueues.get(matchHash) ?? Promise.resolve();
+    const current = previous.then(operation, operation);
+    const tail = current.catch(() => {});
+
+    this.uploadStatusQueues.set(matchHash, tail);
+
+    void current.finally(() => {
+      if (this.uploadStatusQueues.get(matchHash) === tail) {
+        this.uploadStatusQueues.delete(matchHash);
+      }
+    });
   }
 
   /**
@@ -3250,6 +3496,13 @@ class ArenaCoachDesktop {
           `[ArenaCoachDesktop] Successfully submitted chunk for complete match: ${matchHash}`
         );
       } catch (uploadError) {
+        if (isUnauthorizedAuthError(uploadError)) {
+          console.warn(
+            `[ArenaCoachDesktop] Upload auth expired for match ${matchHash}; authRequired flow will logout and preserve lifecycle state`
+          );
+          return;
+        }
+
         console.error(
           `[ArenaCoachDesktop] Upload failed for match ${matchHash}:`,
           toSafeAxiosErrorLog(uploadError)
@@ -3362,199 +3615,6 @@ class ArenaCoachDesktop {
       }
     });
 
-    // Analysis pipeline events - using any type following proven combat log patterns
-    //
-    // ARCHITECTURAL JUSTIFICATION for `any` typing in event handlers:
-    // the use of `any` for dynamic event payloads is a proven and necessary pattern for
-    // combat log and match detection systems. This follows established patterns because:
-    //
-    // 1. DYNAMIC EVENT STRUCTURES: Match detection events have variable payload structures
-    //    similar to WoW combat log events (60+ different event types with varying parameters)
-    //
-    // 2. PERFORMANCE OPTIMIZATION: Just-in-time payload processing avoids overhead of
-    //    parsing unused data, critical for real-time match detection processing
-    //
-    // 3. VERSION RESILIENCE: `any` typing allows graceful handling of analysis pipeline
-    //    evolution without breaking existing event handlers
-    //
-    // 4. SAFE BOUNDARY PATTERN: `any` is confined to the event boundary and immediately
-    //    converted to typed structures within handlers (see immediate destructuring below)
-    //
-    // This is "strategic flexibility" not "weak typing" - a deliberate architectural
-    // choice for dynamic event systems processing thousands of events per second.
-    this.matchDetectionService.on('analysisJobCreated', (event: AnalysisJobCreatedPayload) => {
-      try {
-        const { jobId, matchHash } = event;
-        console.info('Analysis job created:', jobId);
-
-        // Update match metadata with jobId and uploading status
-        this.updateMatchMetadataForUpload(matchHash, jobId);
-
-        // Notify renderer process
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-          this.mainWindow.webContents.send('analysis:jobCreated', event);
-        }
-      } catch (error) {
-        console.error('Error handling analysisJobCreated event:', error);
-      }
-    });
-
-    this.matchDetectionService.on('analysisProgress', (event: AnalysisProgressPayload) => {
-      try {
-        const { jobId, status } = event;
-        if (this.isDevelopment) {
-          console.info('Analysis progress:', { jobId, status });
-        }
-
-        // Notify renderer process
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-          this.mainWindow.webContents.send('analysis:progress', event);
-        }
-      } catch (error) {
-        console.error('Error handling analysisProgress event:', error);
-      }
-    });
-
-    this.matchDetectionService.on('jobRetry', (event: JobRetryPayload) => {
-      try {
-        if (this.isDevelopment) {
-          console.info('Job retry:', event);
-        }
-
-        // Notify renderer process
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-          this.mainWindow.webContents.send('match:jobRetry', event);
-        }
-      } catch (error) {
-        console.error('Error handling jobRetry event:', error);
-      }
-    });
-
-    this.matchDetectionService.on('analysisCompleted', async (event: AnalysisCompletedPayload) => {
-      try {
-        const { jobId, analysisId, analysisPayload, matchHash } = event;
-
-        console.info('Analysis completed:', {
-          jobId,
-          analysisId,
-          matchHash,
-          entitlementMode: event.entitlementMode,
-        });
-
-        // Single atomic completion finalizer handles both entitled and non-entitled paths
-        // - Non-entitled: marks as COMPLETED with freemium state
-        // - Entitled (skill-capped or freemium): marks as COMPLETED + enriches with analysis data
-        await this.analysisEnrichmentService.finalizeCompletion(
-          jobId,
-          analysisId, // Already normalized to string at emission boundary
-          analysisPayload,
-          {
-            entitlementMode: event.entitlementMode,
-            freeQuotaLimit: event.freeQuotaLimit,
-            freeQuotaUsed: event.freeQuotaUsed,
-            freeQuotaRemaining: event.freeQuotaRemaining,
-            freeQuotaExhausted: event.freeQuotaExhausted,
-          }
-        );
-
-        // Keep auth state in sync with backend-authoritative job-status entitlement.
-        // This updates UI immediately when premium is gained/lost while app is running.
-        const authToken = this.authManager.getAuthToken();
-        const currentUser = this.authManager.getCurrentUser();
-        if (authToken && currentUser && typeof event.isPremiumViewer === 'boolean') {
-          const premiumChanged = currentUser.is_premium !== event.isPremiumViewer;
-
-          if (premiumChanged) {
-            const updatedUser: UserInfo = {
-              ...currentUser,
-              is_premium: event.isPremiumViewer,
-            };
-            this.authManager.updateCurrentUser(updatedUser);
-            if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-              this.mainWindow.webContents.send('auth:success', {
-                token: authToken,
-                user: updatedUser,
-                source: 'billing-status',
-              });
-            }
-          }
-        }
-
-        // Notify renderer process (existing behavior preserved)
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-          this.mainWindow.webContents.send('analysis:completed', event);
-        }
-      } catch (error) {
-        console.error('Error handling analysisCompleted event:', error);
-      }
-    });
-
-    // Handle new fallback polling events for enhanced reliability
-    this.matchDetectionService.on('analysisFailed', (event: AnalysisFailedPayload) => {
-      try {
-        console.debug('[ArenaCoachDesktop] Received analysisFailed event:', event);
-
-        const { jobId, matchHash, error, isNotFound, errorCode, isPermanent } = event;
-
-        console.error('Analysis failed:', {
-          jobId,
-          matchHash,
-          error,
-          isNotFound,
-          errorCode,
-          isPermanent,
-        });
-
-        // Update local metadata to reflect failure with structured error data
-        this.updateMatchMetadataForFailure(
-          matchHash,
-          error || 'Unknown error',
-          isNotFound,
-          errorCode,
-          isPermanent
-        );
-
-        // Clean up chunk files selectively based on failure type
-        this.cleanupChunksForTerminalFailure(jobId, matchHash, isNotFound).catch(cleanupError => {
-          console.error(
-            `[ArenaCoachDesktop] Failed to cleanup chunks for terminal failure ${jobId}:`,
-            cleanupError
-          );
-        });
-
-        // Notify renderer process
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-          this.mainWindow.webContents.send('analysis:failed', event);
-        }
-      } catch (handlingError) {
-        console.error('Error handling analysisFailed event:', handlingError);
-      }
-    });
-
-    this.matchDetectionService.on('analysisTimeout', (event: AnalysisTimeoutPayload) => {
-      try {
-        const { jobId, matchHash, attempts } = event;
-
-        console.warn('Analysis timeout:', { jobId, matchHash, totalAttempts: attempts });
-
-        // Update local metadata to reflect timeout with synthetic error code
-        this.updateMatchMetadataForFailure(
-          matchHash,
-          'Analysis timed out after maximum polling attempts',
-          /* isNotFound */ false,
-          'ANALYSIS_TIMEOUT',
-          false
-        );
-
-        // Notify renderer process
-        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-          this.mainWindow.webContents.send('analysis:timeout', event);
-        }
-      } catch (handlingError) {
-        console.error('Error handling analysisTimeout event:', handlingError);
-      }
-    });
-
     // Handle service lifecycle events
     this.matchDetectionService.on('started', () => {
       try {
@@ -3588,6 +3648,7 @@ class ArenaCoachDesktop {
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           this.mainWindow.webContents.send('wow:processStart');
         }
+        void this.notifyDetectionStatusToRenderer();
       } catch (error) {
         console.error('[MAIN] Error handling wowProcessStart event:', error);
       }
@@ -3605,6 +3666,7 @@ class ArenaCoachDesktop {
         if (this.mainWindow && !this.mainWindow.isDestroyed()) {
           this.mainWindow.webContents.send('wow:processStop');
         }
+        void this.notifyDetectionStatusToRenderer();
       } catch (error) {
         console.error('[MAIN] Error handling wowProcessStop event:', error);
       }
@@ -3699,7 +3761,7 @@ class ArenaCoachDesktop {
         if (this.recordingService) {
           try {
             console.info('Shutting down recording service...');
-            await this.recordingService.shutdown();
+            await this.detachRecordingService();
             console.info('Recording service shutdown complete');
           } catch (error) {
             console.error('Error shutting down recording service:', error);
@@ -3708,12 +3770,10 @@ class ArenaCoachDesktop {
         }
 
         // Clean up new services
-        if (this.completionPollingService) {
-          console.info('Stopping completion polling service...');
-          this.completionPollingService.stopAll();
+        if (this.uploadLifecycleService) {
+          console.info('Stopping upload lifecycle coordinator...');
+          await this.uploadLifecycleService.cleanup();
         }
-
-        // The JobQueueOrchestrator handles job state persistence internally
 
         // Clean up match detection service
         await this.matchDetectionService.cleanup();
@@ -3730,6 +3790,204 @@ class ArenaCoachDesktop {
         // Now exit the app
         app.quit();
       }
+    });
+  }
+
+  private setupUploadLifecycleHandlers(): void {
+    if (!this.uploadLifecycleService) {
+      return;
+    }
+
+    this.uploadLifecycleService.on('analysisJobCreated', (event: AnalysisJobCreatedPayload) => {
+      const { jobId, matchHash } = event;
+      console.info('Analysis job created:', jobId);
+
+      this.enqueueUploadStatusOp(matchHash, async () => {
+        try {
+          await this.updateMatchMetadataForUpload(matchHash, jobId);
+
+          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+            this.mainWindow.webContents.send('analysis:jobCreated', event);
+          }
+        } catch (error) {
+          console.error('Error handling analysisJobCreated event:', error);
+        }
+      });
+    });
+
+    this.uploadLifecycleService.on('analysisProgress', (event: AnalysisProgressPayload) => {
+      const { jobId, status, matchHash } = event;
+      if (this.isDevelopment) {
+        console.info('Analysis progress:', { jobId, status });
+      }
+
+      this.enqueueUploadStatusOp(matchHash, async () => {
+        try {
+          await this.updateMatchMetadataForProgress(matchHash, status, event.message);
+
+          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+            this.mainWindow.webContents.send('analysis:progress', event);
+          }
+        } catch (error) {
+          console.error('Error handling analysisProgress event:', error);
+        }
+      });
+    });
+
+    this.uploadLifecycleService.on('uploadRetrying', (event: UploadRetryingData) => {
+      try {
+        const retryPayload: JobRetryPayload = {
+          matchHash: event.matchHash,
+          attempt: event.attempt,
+          delayMs: event.delayMs,
+          errorType: event.code === 'ECONNABORTED' ? 'timeout' : 'network',
+        };
+
+        if (this.isDevelopment) {
+          console.info('Job retry:', retryPayload);
+        }
+
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send('match:jobRetry', retryPayload);
+        }
+      } catch (error) {
+        console.error('Error handling uploadRetrying event:', error);
+      }
+    });
+
+    this.uploadLifecycleService.on(
+      'analysisCompleted',
+      async (event: AnalysisCompletedPayload) => {
+        try {
+          const { jobId, analysisId, analysisPayload, matchHash } = event;
+
+          console.info('Analysis completed:', {
+            jobId,
+            analysisId,
+            matchHash,
+            entitlementMode: event.entitlementMode,
+          });
+
+          await this.analysisEnrichmentService.finalizeCompletion(
+            jobId,
+            analysisId,
+            analysisPayload,
+            {
+              entitlementMode: event.entitlementMode,
+              freeQuotaLimit: event.freeQuotaLimit,
+              freeQuotaUsed: event.freeQuotaUsed,
+              freeQuotaRemaining: event.freeQuotaRemaining,
+              freeQuotaExhausted: event.freeQuotaExhausted,
+            }
+          );
+
+          const authToken = this.authManager.getAuthToken();
+          const currentUser = this.authManager.getCurrentUser();
+          if (authToken && currentUser && typeof event.isPremiumViewer === 'boolean') {
+            const premiumChanged = currentUser.is_premium !== event.isPremiumViewer;
+
+            if (premiumChanged) {
+              const updatedUser: UserInfo = {
+                ...currentUser,
+                is_premium: event.isPremiumViewer,
+              };
+              this.authManager.updateCurrentUser(updatedUser);
+              if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+                this.mainWindow.webContents.send('auth:success', {
+                  token: authToken,
+                  user: updatedUser,
+                  source: 'billing-status',
+                });
+              }
+            }
+          }
+
+          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+            this.mainWindow.webContents.send('analysis:completed', event);
+          }
+        } catch (error) {
+          console.error('Error handling analysisCompleted event:', error);
+        }
+      }
+    );
+
+    this.uploadLifecycleService.on('analysisFailed', (event: AnalysisFailedPayload) => {
+      try {
+        console.debug('[ArenaCoachDesktop] Received analysisFailed event:', event);
+
+        const { jobId, matchHash, error, isNotFound, errorCode, isPermanent } = event;
+
+        if (errorCode === PipelineErrorCode.COMBAT_LOG_EXPIRED) {
+          void (async () => {
+            const storedMatch = await this.metadataStorageService.loadMatch(matchHash);
+            if (!storedMatch?.bufferId) {
+              console.warn(
+                `[ArenaCoachDesktop] Expired upload retry had no stored match/bufferId for ${matchHash}`
+              );
+              return;
+            }
+
+            const result = await this.updateMatchMetadataToExpired(
+              {
+                ...storedMatch,
+                matchHash,
+                bufferId: storedMatch.bufferId,
+              },
+              Date.now()
+            );
+            if (result.errors.length > 0) {
+              console.warn(
+                `[ArenaCoachDesktop] Errors while marking resumed expired upload ${matchHash}:`,
+                result.errors
+              );
+            }
+          })().catch(handlingError => {
+            console.error('Error handling expired analysisFailed event:', handlingError);
+          });
+          return;
+        }
+
+        console.error('Analysis failed:', {
+          jobId,
+          matchHash,
+          error,
+          isNotFound,
+          errorCode,
+          isPermanent,
+        });
+
+        this.updateMatchMetadataForFailure(
+          matchHash,
+          error || 'Unknown error',
+          isNotFound,
+          errorCode,
+          isPermanent
+        );
+
+        this.cleanupChunksForTerminalFailure(jobId, matchHash, isNotFound).catch(cleanupError => {
+          console.error(
+            `[ArenaCoachDesktop] Failed to cleanup chunks for terminal failure ${jobId}:`,
+            cleanupError
+          );
+        });
+
+        if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+          this.mainWindow.webContents.send('analysis:failed', event);
+        }
+      } catch (handlingError) {
+        console.error('Error handling analysisFailed event:', handlingError);
+      }
+    });
+
+    this.uploadLifecycleService.on('authRequired', (event: UploadAuthRequiredData) => {
+      void (async () => {
+        try {
+          console.warn('[ArenaCoachDesktop] Upload lifecycle auth expired, logging out', event);
+          await this.authManager.logout();
+        } catch (error) {
+          console.error('Error handling upload lifecycle authRequired event:', error);
+        }
+      })();
     });
   }
 
@@ -4003,15 +4261,10 @@ class ArenaCoachDesktop {
       if (settings.matchDetectionEnabled !== false && !this.isUIDevMode) {
         console.info('[ArenaCoachDesktop] Auto-starting match detection based on settings...');
         try {
-          await this.matchDetectionService.start();
-
-          // Only emit if start succeeds
-          if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-            this.mainWindow.webContents.send('match:detectionStarted');
-          }
+          await this.maybeStartDetectionForInstallations(installations);
         } catch (startError) {
           console.error('[ArenaCoachDesktop] Failed to auto-start match detection:', startError);
-          // Continue - service is initialized but not running
+          // Continue - detection start failed
         }
       } else {
         console.info(
@@ -4034,73 +4287,7 @@ class ArenaCoachDesktop {
       console.info('[ArenaCoachDesktop] Checking ArenaCoach addon installations...');
 
       const installations = await this.resolveWoWInstallations();
-
-      if (installations.length === 0) {
-        console.info('[ArenaCoachDesktop] No WoW installations found, skipping addon check');
-        return;
-      }
-
-      const installationsNeedingAddon: WoWInstallation[] = [];
-      const installationsWithAddon: WoWInstallation[] = [];
-
-      // Check addon status for all installations
-      for (const installation of installations) {
-        if (installation.addonInstalled) {
-          // Double-check that files are valid
-          const filesValid = await AddonManager.validateAddonFiles(installation);
-          if (filesValid) {
-            installationsWithAddon.push(installation);
-          } else {
-            console.info(
-              `[ArenaCoachDesktop] Addon files invalid for ${installation.path}, needs reinstall`
-            );
-            installationsNeedingAddon.push(installation);
-          }
-        } else {
-          installationsNeedingAddon.push(installation);
-        }
-      }
-
-      console.info(
-        `[ArenaCoachDesktop] Found ${installationsWithAddon.length} installations with addon, ${installationsNeedingAddon.length} needing addon`
-      );
-
-      // Install addon to installations that need it
-      for (const installation of installationsNeedingAddon) {
-        try {
-          console.info(`[ArenaCoachDesktop] Installing ArenaCoach addon to: ${installation.path}`);
-          const result = await AddonManager.installAddon(installation);
-
-          if (result.success) {
-            console.info(
-              `[ArenaCoachDesktop] Successfully installed addon to: ${installation.path}`
-            );
-          } else {
-            console.warn(
-              `[ArenaCoachDesktop] Failed to install addon to ${installation.path}: ${result.message}`
-            );
-            if (result.error) {
-              console.warn(`[ArenaCoachDesktop] Error details: ${result.error}`);
-            }
-          }
-        } catch (error) {
-          console.error(
-            `[ArenaCoachDesktop] Unexpected error installing addon to ${installation.path}:`,
-            error
-          );
-        }
-      }
-
-      // Re-resolve installations to reflect addon changes and notify renderer
-      try {
-        const updatedInstallations = await this.resolveWoWInstallations();
-        this.notifyAddonStatusToRenderer(updatedInstallations);
-      } catch (error) {
-        console.error(
-          '[ArenaCoachDesktop] Failed to re-resolve installations after addon install:',
-          error
-        );
-      }
+      await this.checkAndInstallAddonsForInstallations(installations);
 
       console.info('[ArenaCoachDesktop] Addon installation check completed');
     } catch (error) {
@@ -4117,6 +4304,9 @@ class ArenaCoachDesktop {
 
     try {
       console.info('[ArenaCoachDesktop] Starting async service initialization...');
+
+      // Register listeners before any service can emit resumed lifecycle events.
+      this.setupMatchDetection();
 
       // Step 1: Initialize metadata services FIRST (required by IPC and event handlers)
       await this.initializeMatchMetadataServices();
@@ -4135,14 +4325,6 @@ class ArenaCoachDesktop {
       if (!this.isUIDevMode) {
         await this.initializeMatchDetection();
         await this.checkAndInstallAddons();
-      }
-
-      // Step 5: ONLY NOW register match detection event handlers
-      this.setupMatchDetection();
-
-      // Setup recording service event handlers if available
-      if (this.recordingService) {
-        this.setupRecordingEvents();
       }
 
       console.info('[ArenaCoachDesktop] All async services initialized successfully');
@@ -4168,6 +4350,116 @@ class ArenaCoachDesktop {
       encoderMode: settings.recording.encoderMode || 'auto',
       ...(settings.recordingLocation && { outputDir: settings.recordingLocation }),
     };
+  }
+
+  private async activateRecordingCapture(
+    recordingService: RecordingService,
+    options: { persistEnabled?: boolean } = {}
+  ): Promise<{ success: boolean; error?: string }> {
+    const applyResult = await this.applyPersistedRecordingSettings(recordingService);
+    if (!applyResult.success) {
+      this.setRecordingCaptureState(false);
+      return applyResult;
+    }
+
+    this.setRecordingCaptureState(true);
+
+    if (options.persistEnabled) {
+      this.settingsService.updateSettings({ recordingEnabled: true });
+    }
+
+    return { success: true };
+  }
+
+  private async enableExistingRecordingService(
+    recordingService: RecordingService,
+    options: { persistEnabled?: boolean } = {}
+  ): Promise<{ success: boolean; error?: string }> {
+    const status = await recordingService.getStatus();
+    if (!status.isInitialized || !status.isEnabled) {
+      await recordingService.enable();
+      const enabledStatus = await recordingService.getStatus();
+      if (!enabledStatus.isInitialized || !enabledStatus.isEnabled) {
+        throw new Error('Recording service failed to enable');
+      }
+    }
+
+    if (this.mainWindow) {
+      recordingService.setMainWindow(this.mainWindow);
+    }
+
+    return this.activateRecordingCapture(recordingService, options);
+  }
+
+  private async attachRecordingService(
+    settings: AppSettings,
+    options: { persistEnabled?: boolean } = {}
+  ): Promise<{ success: boolean; error?: string }> {
+    if (this.isUIDevMode || process.platform !== 'win32') {
+      throw new Error('Recording is not supported in this environment');
+    }
+
+    if (!this.metadataStorageService || !this.metadataService) {
+      throw new Error('Recording service not ready - metadata services not yet initialized');
+    }
+
+    const recordingConfig = this.createRecordingServiceConfig(settings);
+    const candidate = new RecordingService(recordingConfig, this.metadataService, this.settingsService);
+
+    try {
+      await candidate.initialize();
+
+      const status = await candidate.getStatus();
+      if (!status.isInitialized || !status.isEnabled) {
+        throw new Error('Recording service failed to initialize');
+      }
+
+      if (this.mainWindow) {
+        candidate.setMainWindow(this.mainWindow);
+      }
+
+      this.recordingService = candidate;
+      this.setupRecordingEvents();
+      return await this.activateRecordingCapture(candidate, options);
+    } catch (error) {
+      if (this.recordingService === candidate) {
+        this.recordingService = null;
+      }
+      this.setRecordingCaptureState(false);
+      this.clearRecordingRecoveryState();
+      try {
+        await candidate.shutdown();
+      } catch (shutdownError) {
+        console.warn(
+          '[ArenaCoachDesktop] Failed to discard recording service after attach failure:',
+          shutdownError
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async disableRecordingCapture(): Promise<void> {
+    if (!this.recordingService) {
+      return;
+    }
+
+    const service = this.recordingService;
+    this.setRecordingCaptureState(false);
+    this.clearRecordingRecoveryState();
+    await service.disable();
+  }
+
+  private async detachRecordingService(): Promise<void> {
+    if (!this.recordingService) {
+      return;
+    }
+
+    const service = this.recordingService;
+    this.recordingService = null;
+    this.setRecordingCaptureState(false);
+    this.clearRecordingRecoveryState();
+    await service.shutdown();
   }
 
   /**
@@ -4201,33 +4493,20 @@ class ArenaCoachDesktop {
         settings.recordingEnabled !== false
       ) {
         try {
-          const recordingConfig = this.createRecordingServiceConfig(settings);
-          this.recordingService = new RecordingService(
-            recordingConfig,
-            this.metadataService,
-            this.settingsService
-          );
-          await this.recordingService.initialize();
-
-          // Pass main window for preview
-          if (this.mainWindow) {
-            this.recordingService.setMainWindow(this.mainWindow);
-          }
-
-          // Apply saved recording settings using helper method
-          const applyResult = await this.applyPersistedRecordingSettings();
-          if (applyResult.success) {
+          const attachResult = await this.attachRecordingService(settings);
+          if (attachResult.success) {
             console.info('[ArenaCoachDesktop] Recording service initialized');
           } else {
             console.warn(
               '[ArenaCoachDesktop] Recording service initialized but settings apply failed:',
-              applyResult.error
+              attachResult.error
             );
           }
         } catch (error) {
           console.error('[ArenaCoachDesktop] Failed to initialize recording service:', error);
           // Non-critical - continue without recording
           this.recordingService = null;
+          this.setRecordingCaptureState(false);
           this.clearRecordingRecoveryState();
         }
       } else {
@@ -4235,13 +4514,14 @@ class ArenaCoachDesktop {
           '[ArenaCoachDesktop] Recording disabled in settings or not supported on this platform'
         );
         this.recordingService = null;
+        this.setRecordingCaptureState(false);
         this.clearRecordingRecoveryState();
       }
 
       // 5. Lifecycle orchestrator (depends on metadata + recording)
       this.matchLifecycleService = new MatchLifecycleService(
         this.metadataService,
-        this.recordingService ?? null
+        this.recordingCaptureEnabled ? this.recordingService ?? null : null
       );
 
       // Initialize new decomposed services
@@ -4261,30 +4541,35 @@ class ArenaCoachDesktop {
         this.apiHeadersProvider,
         this.serviceHealthCheck
       );
-      this.jobStateStore = new JobStateStore(app.getPath('userData'));
-
-      // Initialize completion polling service
-      const pollingConfig: CompletionPollingConfig = {
-        apiBaseUrl: this.apiBaseUrl,
-        baseIntervalMs: ArenaCoachDesktop.POLLING_INTERVAL_MS,
-        ...(authTokenString && { authToken: authTokenString }),
-        healthCheck: this.serviceHealthCheck,
-      };
-      this.completionPollingService = new CompletionPollingService(pollingConfig);
-
-      // Set up event handlers for job queue orchestrator
-      // Events flow: JobQueueOrchestrator -> main.ts handlers -> UI/storage updates
-
-      // Initialize job queue orchestrator
-      this.jobQueueOrchestrator = new JobQueueOrchestrator(
-        this.uploadService,
-        this.completionPollingService,
-        this.jobStateStore,
-        this.apiHeadersProvider
+      this.uploadLifecycleStore = new UploadLifecycleStore(app.getPath('userData'));
+      const uploadStatusClient = new UploadStatusClient(
+        this.apiBaseUrl,
+        this.apiHeadersProvider,
+        this.serviceHealthCheck
+      );
+      this.acceptedUploadTracker = new AcceptedUploadTracker(
+        this.apiBaseUrl,
+        this.apiHeadersProvider,
+        uploadStatusClient,
+        this.serviceHealthCheck
+      );
+      const uploadRecoveryService = new UploadRecoveryService(
+        this.metadataStorageService,
+        path.join(app.getPath('userData'), 'logs', 'chunks')
       );
 
-      // Initialize the orchestrator to restore state and set up event forwarding
-      await this.jobQueueOrchestrator.initialize();
+      // Events flow: UploadLifecycleService -> main.ts handlers -> UI/storage updates
+
+      this.uploadLifecycleService = new UploadLifecycleService(
+        this.uploadService,
+        this.acceptedUploadTracker,
+        this.uploadLifecycleStore,
+        this.apiHeadersProvider,
+        uploadRecoveryService
+      );
+
+      await this.uploadLifecycleService.initialize();
+      this.setupUploadLifecycleHandlers();
 
       // Perform an initial health check to warm internal status (UI update occurs after renderer is ready)
       if (this.serviceHealthCheck) {
@@ -4301,9 +4586,9 @@ class ArenaCoachDesktop {
       // Start idle health checks
       this.startIdleHealthChecks();
 
-      // Listen for job tracking changes to manage idle checks
-      this.completionPollingService.on('serviceStatusChanged', (status: any) => {
-        const hasJobs = status.trackedJobsCount > 0;
+      // Listen for active upload lifecycle changes to manage idle checks
+      this.uploadLifecycleService.on('serviceStatusChanged', (status: UploadLifecycleStatus) => {
+        const hasJobs = status.activeUploadsCount > 0;
         if (hasJobs && this.idleCheckTimer) {
           // Stop idle checks when jobs are being tracked
           this.stopIdleHealthChecks();
@@ -4313,18 +4598,9 @@ class ArenaCoachDesktop {
         }
       });
 
-      // Handle auth failures from polling service (401 responses)
-      this.completionPollingService.on(
-        'authRequired',
-        async (event: { jobId: string; matchHash: string; reason: string }) => {
-          console.warn('[Main] CompletionPollingService reported auth failure:', event.reason);
-          await this.authManager.logout();
-        }
-      );
+      this.matchDetectionService.setUploadLifecycleService(this.uploadLifecycleService);
 
-      // Pass the JobQueueOrchestrator to the MatchDetectionService
-      // This allows it to use our new decomposed services for uploads
-      this.matchDetectionService.setJobQueueOrchestrator(this.jobQueueOrchestrator);
+      await this.uploadLifecycleService.resumePendingUploads();
 
       console.info('[ArenaCoachDesktop] Match metadata services initialized successfully');
     } catch (error) {
@@ -4354,20 +4630,62 @@ class ArenaCoachDesktop {
    */
   private async updateMatchMetadataForUpload(matchHash: string, jobId: string): Promise<void> {
     try {
-      await this.metadataStorageService.updateMatchStatus(matchHash, UploadStatus.UPLOADING, {
-        jobId,
-      });
+      const effectiveStatus = await this.metadataStorageService.updateMatchStatus(
+        matchHash,
+        UploadStatus.QUEUED,
+        { jobId }
+      );
 
       console.info('[ArenaCoachDesktop] Updated match metadata for upload:', { matchHash, jobId });
 
-      if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      if (effectiveStatus && this.mainWindow && !this.mainWindow.isDestroyed()) {
         this.mainWindow.webContents.send('match:statusUpdated', {
           matchHash,
-          status: UploadStatus.UPLOADING,
+          status: effectiveStatus,
         });
       }
     } catch (error) {
       console.error('[ArenaCoachDesktop] Failed to update match metadata for upload:', error);
+    }
+  }
+
+  private async updateMatchMetadataForProgress(
+    matchHash: string,
+    lifecycleStatus: string,
+    progressMessage?: string
+  ): Promise<void> {
+    const uploadStatus =
+      lifecycleStatus === 'queued'
+        ? UploadStatus.QUEUED
+        : lifecycleStatus === 'processing'
+          ? UploadStatus.PROCESSING
+          : null;
+
+    if (!uploadStatus) {
+      return;
+    }
+
+    try {
+      const effectiveStatus = await this.metadataStorageService.updateMatchStatus(
+        matchHash,
+        uploadStatus,
+        {
+          ...(progressMessage && { progressMessage }),
+        }
+      );
+
+      if (effectiveStatus && this.mainWindow && !this.mainWindow.isDestroyed()) {
+        this.mainWindow.webContents.send('match:statusUpdated', {
+          matchHash,
+          status: effectiveStatus,
+        });
+      }
+    } catch (error) {
+      console.error('[ArenaCoachDesktop] Failed to update match metadata for progress:', {
+        matchHash,
+        lifecycleStatus,
+        error,
+      });
     }
   }
 
@@ -4442,17 +4760,13 @@ class ArenaCoachDesktop {
    * Update authentication token across all services
    */
   private updateAllServicesAuthToken(token?: string): void {
-    // Update match detection service
-    const tokenString = token ?? '';
-    this.matchDetectionService.updateAuthToken(tokenString);
-
-    // Update decomposed services
     if (this.apiHeadersProvider) {
       this.apiHeadersProvider.updateToken(token);
     }
-    if (this.completionPollingService) {
-      this.completionPollingService.updateAuthToken(token);
-    }
+
+    // Update match detection service
+    const tokenString = token ?? '';
+    this.matchDetectionService.updateAuthToken(tokenString);
   }
 
   /**
@@ -4589,12 +4903,12 @@ class ArenaCoachDesktop {
 
     try {
       const isAvailable = this.serviceHealthCheck?.isServiceAvailable() ?? false;
-      const pollingStats = this.completionPollingService?.getPollingStats();
+      const uploadLifecycleStatus = this.uploadLifecycleService?.getStatus();
       const hasAuth = this.apiHeadersProvider?.hasAuth() ?? false;
 
       this.mainWindow.webContents.send('service:statusChanged', {
         connected: isAvailable,
-        trackedJobsCount: pollingStats?.trackedJobsCount ?? 0,
+        activeUploadsCount: uploadLifecycleStatus?.activeUploads ?? 0,
         hasAuth,
       });
     } catch (error) {
@@ -5007,7 +5321,7 @@ class ArenaCoachDesktop {
    */
   private async performIdleHealthCheck(): Promise<void> {
     // Only check if no jobs are being tracked
-    const trackedJobs = this.completionPollingService?.getPollingStats().trackedJobsCount || 0;
+    const trackedJobs = this.uploadLifecycleService?.getStatus().activeUploads || 0;
     if (trackedJobs > 0) {
       console.debug(
         '[ArenaCoachDesktop] Skipping idle check - jobs are being tracked:',

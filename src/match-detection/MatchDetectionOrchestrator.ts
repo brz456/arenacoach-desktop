@@ -1,7 +1,15 @@
 import { EventEmitter } from 'events';
 import MatchLogWatcher from './parsing/MatchLogWatcher';
 import MatchChunker, { MatchChunkerOptions } from './chunking/MatchChunker';
-import { JobQueueOrchestrator } from './pipeline/JobQueueOrchestrator';
+import { UploadLifecycleService } from '../services/upload-lifecycle/UploadLifecycleService';
+import type {
+  AnalysisCompletedData,
+  AnalysisFailedData,
+  AnalysisProgressData,
+  UploadLifecycleStatus,
+  UploadRetryingData,
+  UploadTransportErrorData,
+} from '../services/upload-lifecycle/types';
 import {
   MatchStartedEvent,
   MatchEndedEvent,
@@ -40,23 +48,22 @@ export interface OrchestratorConfig {
 
 /**
  * Orchestrates the complete automated pipeline:
- * WoW Process Monitoring → Combat Log Watching → Match Detection → Chunking → Job Queue Processing → Polling-based Tracking
+ * WoW Process Monitoring → Combat Log Watching → Match Detection → Chunking → Upload Lifecycle
  *
  * Replaces both manual upload and old file watching systems
  */
 export default class MatchDetectionOrchestrator extends EventEmitter {
   private watcher: MatchLogWatcher;
   private chunker: MatchChunker;
-  private jobQueueOrchestrator?: JobQueueOrchestrator;
-  private jobQueueHandlers: {
-    analysisJobCreated?: (data: any) => void;
-    analysisProgress?: (data: any) => void;
-    analysisCompleted?: (data: any) => void;
-    analysisFailed?: (data: any) => void;
-    serviceStatusChanged?: (status: any) => void;
-    pollError?: (data: any) => void;
-    pollTimeout?: (data: any) => void;
-    uploadRetrying?: (data: any) => void;
+  private uploadLifecycleService?: UploadLifecycleService;
+  private uploadLifecycleHandlers: {
+    analysisJobCreated?: (data: { matchHash: string; jobId: string; status: string }) => void;
+    analysisProgress?: (data: AnalysisProgressData) => void;
+    analysisCompleted?: (data: AnalysisCompletedData) => void;
+    analysisFailed?: (data: AnalysisFailedData) => void;
+    serviceStatusChanged?: (status: UploadLifecycleStatus) => void;
+    transportError?: (data: UploadTransportErrorData) => void;
+    uploadRetrying?: (data: UploadRetryingData) => void;
   } = {};
   private processMonitor: WoWProcessMonitor | null = null;
   private isRunning = false;
@@ -239,7 +246,7 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
       console.info('[MatchOrchestrator] Phase 5: Final resource cleanup...');
       this.watcher.cleanup();
       this.chunker.cleanup();
-      this.cleanupJobQueueHandlers();
+      this.cleanupUploadLifecycleHandlers();
 
       this.isRunning = false;
       this.isWatchingActive = false; // Reset watching state
@@ -448,103 +455,107 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
    */
   public updateAuthToken(token: string): void {
     console.info('[MatchOrchestrator] Updating authentication token');
-    if (this.jobQueueOrchestrator) {
-      this.jobQueueOrchestrator.updateAuthToken(token);
+    if (this.uploadLifecycleService) {
+      this.uploadLifecycleService.updateAuthToken(token);
     }
   }
 
 
   /**
-   * Clean up JobQueueOrchestrator event handlers to prevent listener leaks
+   * Clean up upload lifecycle event handlers to prevent listener leaks
    */
-  private cleanupJobQueueHandlers(): void {
-    if (!this.jobQueueOrchestrator) {
+  private cleanupUploadLifecycleHandlers(): void {
+    if (!this.uploadLifecycleService) {
       return;
     }
 
-    // Remove all stored handler references
-    if (this.jobQueueHandlers.analysisJobCreated) {
-      this.jobQueueOrchestrator.off('analysisJobCreated', this.jobQueueHandlers.analysisJobCreated);
+    if (this.uploadLifecycleHandlers.analysisJobCreated) {
+      this.uploadLifecycleService.off(
+        'analysisJobCreated',
+        this.uploadLifecycleHandlers.analysisJobCreated
+      );
     }
-    if (this.jobQueueHandlers.analysisProgress) {
-      this.jobQueueOrchestrator.off('analysisProgress', this.jobQueueHandlers.analysisProgress);
+    if (this.uploadLifecycleHandlers.analysisProgress) {
+      this.uploadLifecycleService.off(
+        'analysisProgress',
+        this.uploadLifecycleHandlers.analysisProgress
+      );
     }
-    if (this.jobQueueHandlers.analysisCompleted) {
-      this.jobQueueOrchestrator.off('analysisCompleted', this.jobQueueHandlers.analysisCompleted);
+    if (this.uploadLifecycleHandlers.analysisCompleted) {
+      this.uploadLifecycleService.off(
+        'analysisCompleted',
+        this.uploadLifecycleHandlers.analysisCompleted
+      );
     }
-    if (this.jobQueueHandlers.analysisFailed) {
-      this.jobQueueOrchestrator.off('analysisFailed', this.jobQueueHandlers.analysisFailed);
+    if (this.uploadLifecycleHandlers.analysisFailed) {
+      this.uploadLifecycleService.off(
+        'analysisFailed',
+        this.uploadLifecycleHandlers.analysisFailed
+      );
     }
-    if (this.jobQueueHandlers.serviceStatusChanged) {
-      this.jobQueueOrchestrator.off('serviceStatusChanged', this.jobQueueHandlers.serviceStatusChanged);
+    if (this.uploadLifecycleHandlers.serviceStatusChanged) {
+      this.uploadLifecycleService.off(
+        'serviceStatusChanged',
+        this.uploadLifecycleHandlers.serviceStatusChanged
+      );
     }
-    if (this.jobQueueHandlers.pollError) {
-      this.jobQueueOrchestrator.off('pollError', this.jobQueueHandlers.pollError);
+    if (this.uploadLifecycleHandlers.transportError) {
+      this.uploadLifecycleService.off(
+        'transportError',
+        this.uploadLifecycleHandlers.transportError
+      );
     }
-    if (this.jobQueueHandlers.pollTimeout) {
-      this.jobQueueOrchestrator.off('pollTimeout', this.jobQueueHandlers.pollTimeout);
-    }
-    if (this.jobQueueHandlers.uploadRetrying) {
-      this.jobQueueOrchestrator.off('uploadRetrying', this.jobQueueHandlers.uploadRetrying);
+    if (this.uploadLifecycleHandlers.uploadRetrying) {
+      this.uploadLifecycleService.off(
+        'uploadRetrying',
+        this.uploadLifecycleHandlers.uploadRetrying
+      );
     }
 
-    // Clear handler storage
-    this.jobQueueHandlers = {};
+    this.uploadLifecycleHandlers = {};
   }
 
   /**
-   * Set the JobQueueOrchestrator to use
-   * This allows using the new decomposed services for uploads
+   * Set the upload lifecycle service used for retries, recovery, and accepted-upload tracking.
    */
-  public setJobQueueOrchestrator(orchestrator: JobQueueOrchestrator): void {
-    console.info('[MatchOrchestrator] Setting JobQueueOrchestrator');
-    
-    // Remove old listeners before attaching new ones
-    this.cleanupJobQueueHandlers();
-    
-    this.jobQueueOrchestrator = orchestrator;
+  public setUploadLifecycleService(service: UploadLifecycleService): void {
+    console.info('[MatchOrchestrator] Setting UploadLifecycleService');
 
-    // Wire up event forwarding from JobQueueOrchestrator and store handler references
-    this.jobQueueHandlers.analysisJobCreated = data => {
+    this.cleanupUploadLifecycleHandlers();
+
+    this.uploadLifecycleService = service;
+
+    this.uploadLifecycleHandlers.analysisJobCreated = data => {
       this.emit('analysisJobCreated', data);
     };
-    orchestrator.on('analysisJobCreated', this.jobQueueHandlers.analysisJobCreated);
+    service.on('analysisJobCreated', this.uploadLifecycleHandlers.analysisJobCreated);
 
-    this.jobQueueHandlers.analysisProgress = data => {
+    this.uploadLifecycleHandlers.analysisProgress = data => {
       this.emit('analysisProgress', data);
     };
-    orchestrator.on('analysisProgress', this.jobQueueHandlers.analysisProgress);
+    service.on('analysisProgress', this.uploadLifecycleHandlers.analysisProgress);
 
-    this.jobQueueHandlers.analysisCompleted = data => {
+    this.uploadLifecycleHandlers.analysisCompleted = data => {
       this.emit('analysisCompleted', data);
     };
-    orchestrator.on('analysisCompleted', this.jobQueueHandlers.analysisCompleted);
+    service.on('analysisCompleted', this.uploadLifecycleHandlers.analysisCompleted);
 
-    this.jobQueueHandlers.analysisFailed = data => {
+    this.uploadLifecycleHandlers.analysisFailed = data => {
       this.emit('analysisFailed', data);
     };
-    orchestrator.on('analysisFailed', this.jobQueueHandlers.analysisFailed);
+    service.on('analysisFailed', this.uploadLifecycleHandlers.analysisFailed);
 
-    this.jobQueueHandlers.serviceStatusChanged = status => {
+    this.uploadLifecycleHandlers.serviceStatusChanged = status => {
       this.emit('serviceStatusChanged', status);
     };
-    orchestrator.on('serviceStatusChanged', this.jobQueueHandlers.serviceStatusChanged);
+    service.on('serviceStatusChanged', this.uploadLifecycleHandlers.serviceStatusChanged);
 
-    this.jobQueueHandlers.pollError = data => {
+    this.uploadLifecycleHandlers.transportError = data => {
       this.emit('pipelineError', data);
     };
-    orchestrator.on('pollError', this.jobQueueHandlers.pollError);
+    service.on('transportError', this.uploadLifecycleHandlers.transportError);
 
-    this.jobQueueHandlers.pollTimeout = data => {
-      this.emit('analysisTimeout', {
-        jobId: data.jobId,
-        matchHash: data.matchHash,
-        attempts: data.attempts,
-      });
-    };
-    orchestrator.on('pollTimeout', this.jobQueueHandlers.pollTimeout);
-
-    this.jobQueueHandlers.uploadRetrying = data => {
+    this.uploadLifecycleHandlers.uploadRetrying = data => {
       // Map error information to JobRetryPayload with deterministic errorType
       const errorType = data.code === 'ECONNABORTED' ? 'timeout' : 'network';
       
@@ -557,7 +568,7 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
       
       this.emit('jobRetry', retryPayload);
     };
-    orchestrator.on('uploadRetrying', this.jobQueueHandlers.uploadRetrying);
+    service.on('uploadRetrying', this.uploadLifecycleHandlers.uploadRetrying);
   }
 
 
@@ -569,10 +580,10 @@ export default class MatchDetectionOrchestrator extends EventEmitter {
     matchMetadata: MatchEndedEvent,
     matchHash: string
   ): Promise<string> {
-    if (!this.jobQueueOrchestrator) {
-      throw new Error('JobQueueOrchestrator not initialized');
+    if (!this.uploadLifecycleService) {
+      throw new Error('UploadLifecycleService not initialized');
     }
-    return this.jobQueueOrchestrator.submitMatchChunk(chunkFilePath, matchMetadata, matchHash);
+    return this.uploadLifecycleService.submitMatchChunk(chunkFilePath, matchMetadata, matchHash);
   }
 
   /**

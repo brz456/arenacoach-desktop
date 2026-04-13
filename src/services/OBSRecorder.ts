@@ -32,7 +32,7 @@ import {
   RESOLUTION_DIMENSIONS,
   UNSAFE_RECORDING_SETTINGS,
 } from './RecordingTypes';
-import { resolveEncoderSelection } from './obs/encoderResolver';
+import { inferEncoderTypeFromId, resolveEncoderSelection } from './obs/encoderResolver';
 import { AppError, isNodeError } from '../utils/errors';
 
 /**
@@ -189,6 +189,7 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
   private lifecycleToken = 0;
   private engineGeneration = 0;
   private nativeEngineStarted = false;
+  private forceCpuFallback = false;
 
   // Managers
   private captureManager: OBSCaptureManager;
@@ -449,20 +450,25 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
         return;
       }
 
-      this.config.encoder = encoder;
-      this.config.encoderMode = 'manual';
-      this.settingsManager.updateConfig({ encoder, encoderMode: 'manual' });
+      this.updateEncoderIntent('manual', encoder);
 
       const availableEncoderIds = this.enumerateVideoEncoderIds();
       const decision = resolveEncoderSelection({
         availableEncoderIds,
         mode: 'manual',
         preferredEncoder: encoder,
+        forceCpuFallback: this.forceCpuFallback,
       });
 
       if (decision.kind === 'resolved') {
         if (decision.reason === 'manual_requested_unavailable_fallback') {
           console.warn('[OBSRecorder] Requested manual encoder unavailable; using fallback', {
+            requestedEncoder: decision.requestedEncoder,
+            fallbackEncoderId: decision.encoderId,
+            availableEncoderIds: availableEncoderIds ?? null,
+          });
+        } else if (decision.reason === 'forced_cpu_fallback') {
+          console.warn('[OBSRecorder] CPU fallback active; overriding manual encoder request', {
             requestedEncoder: decision.requestedEncoder,
             fallbackEncoderId: decision.encoderId,
             availableEncoderIds: availableEncoderIds ?? null,
@@ -476,6 +482,17 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
       }
 
       if (decision.reason === 'no_supported_h264') {
+        if (this.forceCpuFallback) {
+          console.warn(
+            '[OBSRecorder] CPU fallback active but no confirmed x264 encoder is available; keeping current encoder',
+            {
+              requestedEncoder: encoder,
+              availableEncoderIds: availableEncoderIds ?? null,
+            }
+          );
+          return;
+        }
+
         console.warn('[OBSRecorder] No supported H.264 encoders available; keeping current encoder', {
           requestedEncoder: encoder,
           availableEncoderIds: availableEncoderIds ?? null,
@@ -484,10 +501,11 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
       }
 
       const appliedFallback = this.settingsManager.applyEncoderById('obs_x264');
-      console.warn('[OBSRecorder] Encoder probe unavailable; forced x264 fallback', {
+      console.warn('[OBSRecorder] Forced x264 fallback for encoder change', {
         requestedEncoder: encoder,
         appliedFallbackEncoderId: appliedFallback ? 'obs_x264' : null,
         reason: decision.reason,
+        forceCpuFallback: this.forceCpuFallback,
       });
     } catch (error) {
       console.error('[OBSRecorder] Failed to set encoder:', error);
@@ -502,6 +520,40 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
       this.config.encoder = encoder;
       this.settingsManager.updateConfig({ encoder });
     }
+  }
+
+  private armCpuFallbackFromStopSignal(
+    errorReason: 'write_error' | 'stop_error',
+    sessionStatus: RecordingSessionStatus,
+    obsSignal: OBSOutputSignal
+  ): void {
+    if (errorReason !== 'stop_error' || sessionStatus !== 'starting' || this.forceCpuFallback) {
+      return;
+    }
+
+    const currentEncoderId = this.settingsManager.getRecordingEncoderId();
+    const currentEncoderFamily = inferEncoderTypeFromId(currentEncoderId);
+    if (currentEncoderFamily !== 'nvenc') {
+      return;
+    }
+
+    const normalizedError = obsSignal.error?.toLowerCase().trim() ?? '';
+    const hasObservedNvencDriverMessage = normalizedError.includes(
+      'does not support this nvenc version'
+    );
+    // OBS has also surfaced this NVENC incompatibility as code -4 with an empty error string.
+    const hasObservedEmptyCodePattern = obsSignal.code === -4 && normalizedError === '';
+
+    if (!hasObservedNvencDriverMessage && !hasObservedEmptyCodePattern) {
+      return;
+    }
+
+    this.forceCpuFallback = true;
+    console.warn('[OBSRecorder] Armed CPU fallback after confirmed NVENC runtime failure', {
+      encoderId: currentEncoderId,
+      code: obsSignal.code,
+      error: obsSignal.error,
+    });
   }
 
   /**
@@ -994,6 +1046,7 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
               status: this.currentSession.status,
             });
 
+            this.armCpuFallbackFromStopSignal(errorReason, this.currentSession.status, obsSignal);
             this.handleRecordingError(errorReason, obsSignal.error);
             return; // handleRecordingError clears session and resolves if stopResolve exists
           }
@@ -1434,6 +1487,7 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
         availableEncoderIds,
         mode: this.config.encoderMode || 'auto',
         preferredEncoder: this.config.encoder || 'x264',
+        forceCpuFallback: this.forceCpuFallback,
       });
 
       console.info('[OBSRecorder] Encoder probe result:', {
@@ -1458,13 +1512,20 @@ export class OBSRecorder extends EventEmitter implements ObsIpcSupervisor {
         }
         this.settingsManager.configureOutput({ encoderId: encoderDecision.encoderId });
       } else if (encoderDecision.reason === 'no_supported_h264') {
+        if (this.forceCpuFallback) {
+          throw new Error(
+            'CPU fallback is active but x264 is unavailable; cannot safely initialize recorder output'
+          );
+        }
+
         console.warn(
           '[OBSRecorder] No supported H.264 encoder found in probe list; preserving OBS RecEncoder'
         );
         this.settingsManager.configureOutput({ preserveCurrentEncoder: true });
       } else {
-        console.warn('[OBSRecorder] Encoder probe unavailable; forcing x264 fallback', {
+        console.warn('[OBSRecorder] Forcing x264 fallback during initialization', {
           reason: encoderDecision.reason,
+          forceCpuFallback: this.forceCpuFallback,
         });
         this.settingsManager.configureOutput({ encoderId: 'obs_x264' });
       }
